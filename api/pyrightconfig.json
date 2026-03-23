@@ -1,0 +1,18 @@
+{
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Windows",
+  "venvPath": ".",
+  "venv": "venv",
+  "include": [
+    "."
+  ],
+  "exclude": [
+    "venv",
+    "**/node_modules",
+    "**/__pycache__",
+    "**/.*",
+    "**/*.pyc"
+  ],
+  "reportMissingImports": "warning",
+  "reportMissingModuleSource": "none"
+}

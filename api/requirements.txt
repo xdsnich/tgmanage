@@ -1,0 +1,27 @@
+# GramGPT API — зависимости
+# Установка: pip install -r requirements.txt
+
+# FastAPI
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+
+# База данных
+sqlalchemy==2.0.30
+asyncpg==0.29.0
+alembic==1.13.1
+
+# Авторизация
+python-jose[cryptography]==3.3.0
+bcrypt==4.0.1
+
+# Pydantic — версия с готовыми wheels для Windows
+pydantic==2.7.1
+pydantic[email]==2.7.1
+python-dotenv==1.0.1
+
+# HTTP
+httpx==0.27.0
+
+# Celery + Redis
+celery==5.3.6
+redis==5.0.8

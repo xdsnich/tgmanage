@@ -1,0 +1,15 @@
+# Окружение
+.env
+venv/
+__pycache__/
+*.pyc
+
+# Данные и сессии — не коммитим, это приватное
+sessions/
+data/
+logs/
+
+# Но шаблоны данных коммитим
+!data/.gitkeep
+!sessions/.gitkeep
+!logs/.gitkeep
