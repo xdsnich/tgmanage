@@ -13,6 +13,10 @@ import random
 import logging
 import importlib.util
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
+
+# Загружаем .env из api/ директории
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
 from celery_app import celery_app
 
@@ -49,6 +53,8 @@ def call_llm(provider: str, system_prompt: str, post_text: str) -> str:
         return _call_claude(system_prompt, post_text)
     elif provider == "openai":
         return _call_openai(system_prompt, post_text)
+    elif provider == "gemini":
+        return _call_gemini(system_prompt, post_text)
     else:
         return _call_claude(system_prompt, post_text)
 
@@ -116,6 +122,35 @@ def _call_openai(system_prompt: str, post_text: str) -> str:
     return ""
 
 
+def _call_gemini(system_prompt: str, post_text: str) -> str:
+    import httpx
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    if not api_key:
+        logger.error("GEMINI_API_KEY не задан!")
+        return ""
+
+    try:
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "system_instruction": {"parts": [{"text": system_prompt}]},
+                    "contents": [{"parts": [{"text": post_text}]}],
+                    "generationConfig": {"maxOutputTokens": 300},
+                },
+            )
+            resp.raise_for_status()
+            candidates = resp.json().get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts:
+                    return parts[0].get("text", "")
+    except Exception as e:
+        logger.error(f"Gemini error: {e}")
+    return ""
+
+
 # ── Промпт-билдер ────────────────────────────────────────────
 
 def build_prompt(tone: str, comment_length: str, custom_prompt: str) -> str:
@@ -175,17 +210,18 @@ async def _process_campaign(campaign_row, db):
     from models.campaign import TargetChannel, CampaignStatus
     from models.account import TelegramAccount
     from telethon import TelegramClient
-    from telethon.tl.functions.channels import JoinChannelRequest
-    from telethon.tl.functions.messages import GetDiscussionMessageRequest
 
     cli_config = _get_cli_config()
     c = campaign_row
+    _val = lambda x: x.value if hasattr(x, 'value') else x
+
+    logger.info(f"[{c.name}] Обрабатываю кампанию (комментов: {c.comments_sent}/{c.max_comments})")
 
     # Проверяем лимиты
     if c.comments_sent >= c.max_comments:
         c.status = CampaignStatus.finished
         c.finished_at = datetime.utcnow()
-        logger.info(f"[{c.name}] Лимит комментариев достигнут ({c.max_comments})")
+        logger.info(f"[{c.name}] ⏹ Лимит комментариев достигнут ({c.max_comments})")
         return
 
     if c.started_at:
@@ -193,7 +229,7 @@ async def _process_campaign(campaign_row, db):
         if hours_running >= c.max_hours:
             c.status = CampaignStatus.finished
             c.finished_at = datetime.utcnow()
-            logger.info(f"[{c.name}] Лимит времени достигнут ({c.max_hours}ч)")
+            logger.info(f"[{c.name}] ⏹ Лимит времени достигнут ({c.max_hours}ч)")
             return
 
     # Получаем активные каналы
@@ -202,11 +238,15 @@ async def _process_campaign(campaign_row, db):
     )
     channels = ch_result.scalars().all()
     if not channels:
+        logger.warning(f"[{c.name}] Нет активных каналов")
         return
 
-    # Выбираем случайный аккаунт
+    logger.info(f"[{c.name}] Каналов: {len(channels)}")
+
+    # Выбираем аккаунт
     account_ids = c.account_ids or []
     if not account_ids:
+        logger.warning(f"[{c.name}] Нет аккаунтов в кампании")
         return
 
     acc_id = random.choice(account_ids)
@@ -214,11 +254,16 @@ async def _process_campaign(campaign_row, db):
         select(TelegramAccount).where(TelegramAccount.id == acc_id)
     )
     account = acc_result.scalar_one_or_none()
-    if not account or not account.session_file or account.status != "active":
-        logger.warning(f"[{c.name}] Аккаунт {acc_id} недоступен")
+    if not account or not account.session_file:
+        logger.warning(f"[{c.name}] Аккаунт {acc_id} не найден или без сессии")
+        return
+    if account.status != "active":
+        logger.warning(f"[{c.name}] Аккаунт {account.phone} статус={account.status}, пропускаю")
         return
 
-    # Подключаемся к Telegram
+    logger.info(f"[{c.name}] Использую аккаунт: {account.phone}")
+
+    # Подключаемся
     session_path = account.session_file.replace(".session", "")
     client = TelegramClient(
         session_path, cli_config.API_ID, cli_config.API_HASH,
@@ -232,77 +277,112 @@ async def _process_campaign(campaign_row, db):
             return
 
         # Строим промпт
-        system_prompt = build_prompt(c.tone.value, c.comment_length, c.custom_prompt)
+        system_prompt = build_prompt(_val(c.tone), c.comment_length, c.custom_prompt)
 
         for channel in channels:
             if c.comments_sent >= c.max_comments:
                 break
 
+            logger.info(f"[{c.name}] Проверяю канал @{channel.username} (last_post_id={channel.last_post_id})")
+
             try:
                 # Получаем канал
-                entity = await client.get_entity(channel.username or channel.link)
+                try:
+                    entity = await client.get_entity(channel.username or channel.link)
+                except Exception as e:
+                    logger.error(f"[{c.name}] Не могу найти канал @{channel.username}: {e}")
+                    continue
 
-                # Обновляем инфо
                 channel.title = getattr(entity, 'title', channel.username)
                 channel.channel_id = entity.id
                 if hasattr(entity, 'participants_count'):
                     channel.subscribers = entity.participants_count or 0
 
+                logger.info(f"[{c.name}] Канал найден: {channel.title} (id={entity.id})")
+
                 # Получаем последние посты
                 messages = await client.get_messages(entity, limit=5)
+                logger.info(f"[{c.name}] Получено {len(messages)} постов")
 
+                if not messages:
+                    logger.info(f"[{c.name}] Нет постов в @{channel.username}")
+                    continue
+
+                found_new = False
                 for msg in messages:
-                    if not msg.text or len(msg.text) < 10:
+                    # Логируем каждый пост
+                    msg_text = msg.text or ""
+                    msg_caption = getattr(msg, 'message', '') or ""
+                    post_text = msg_text or msg_caption
+
+                    logger.info(f"[{c.name}] Пост #{msg.id}: текст={len(post_text)} символов, out={msg.out}, media={bool(msg.media)}")
+
+                    # Пропускаем без текста вообще
+                    if not post_text or len(post_text.strip()) < 3:
+                        logger.info(f"[{c.name}] Пост #{msg.id}: пропуск (нет текста)")
                         continue
 
                     # Пропускаем уже обработанные
                     if msg.id <= channel.last_post_id:
                         continue
 
-                    # Решаем комментировать или нет
-                    if not _should_comment(c.trigger_mode.value, c.trigger_percent, c.trigger_keywords or [], msg.text):
+                    found_new = True
+                    logger.info(f"[{c.name}] ★ Новый пост #{msg.id} в @{channel.username}: {post_text[:60]}...")
+
+                    # Решаем комментировать или нет (триггер)
+                    if not _should_comment(_val(c.trigger_mode), c.trigger_percent, c.trigger_keywords or [], post_text):
+                        logger.info(f"[{c.name}] Пост #{msg.id}: не проходит триггер ({_val(c.trigger_mode)})")
                         channel.last_post_id = msg.id
                         continue
 
-                    # Проверяем есть ли комментарии у поста
-                    if not msg.replies or not msg.replies.replies:
+                    # Проверяем комментарии
+                    has_discussion = msg.replies and getattr(msg.replies, 'comments', False)
+                    if not has_discussion:
+                        logger.info(f"[{c.name}] Пост #{msg.id}: комментарии отключены, пропускаю")
                         channel.last_post_id = msg.id
                         continue
 
-                    logger.info(f"[{c.name}] Новый пост в @{channel.username}: {msg.text[:60]}...")
-
-                    # Задержка перед комментарием (имитация чтения)
-                    delay = c.delay_comment + random.randint(-30, 30)
-                    if delay > 0:
+                    # Задержка перед комментарием (имитация чтения), макс 60с за цикл
+                    delay = min(c.delay_comment + random.randint(-30, 30), 60)
+                    if delay > 5:
                         logger.info(f"[{c.name}] Задержка {delay}с перед комментарием...")
-                        await asyncio.sleep(min(delay, 60))  # Макс 60с за один цикл
+                        await asyncio.sleep(delay)
 
                     # Генерируем комментарий через LLM
-                    comment = call_llm(c.llm_provider.value, system_prompt, msg.text)
+                    provider = _val(c.llm_provider)
+                    logger.info(f"[{c.name}] Вызываю LLM ({provider})...")
+                    comment = call_llm(provider, system_prompt, post_text)
+
                     if not comment:
-                        logger.warning(f"[{c.name}] LLM вернул пустой ответ")
+                        logger.warning(f"[{c.name}] LLM ({provider}) вернул пустой ответ для поста #{msg.id}")
                         channel.last_post_id = msg.id
                         continue
+
+                    logger.info(f"[{c.name}] LLM ответ: {comment[:80]}...")
 
                     # Отправляем комментарий
                     try:
                         await client.send_message(entity=entity, message=comment, comment_to=msg.id)
+
                         c.comments_sent += 1
                         channel.comments_sent += 1
                         channel.last_post_id = msg.id
-                        logger.info(f"[{c.name}] ✅ Коммент в @{channel.username}: {comment[:60]}...")
+                        logger.info(f"[{c.name}] ✅ Коммент #{c.comments_sent} в @{channel.username}: {comment[:60]}...")
 
                         # Задержка между комментариями
-                        between = c.delay_between + random.randint(-10, 10)
+                        between = min(c.delay_between + random.randint(-10, 10), 30)
                         if between > 0:
-                            await asyncio.sleep(min(between, 30))
+                            await asyncio.sleep(between)
 
                     except Exception as e:
-                        logger.error(f"[{c.name}] Ошибка отправки коммента в @{channel.username}: {e}")
+                        logger.error(f"[{c.name}] ❌ Ошибка отправки коммента в @{channel.username}: {e}")
                         channel.last_post_id = msg.id
 
                     # Один коммент на канал за цикл
                     break
+
+                if not found_new:
+                    logger.info(f"[{c.name}] Нет новых постов в @{channel.username} (все <= {channel.last_post_id})")
 
             except Exception as e:
                 logger.error(f"[{c.name}] Ошибка в канале @{channel.username}: {e}")

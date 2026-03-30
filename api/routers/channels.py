@@ -4,6 +4,9 @@ GramGPT API — routers/channels.py
 По ТЗ раздел 2.3: создание, закрепление каналов.
 """
 
+import sys
+import os
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +21,25 @@ from models.account import TelegramAccount
 router = APIRouter(prefix="/channels", tags=["channels"])
 
 
+# ── Safe CLI import ──────────────────────────────────────────
+
+def _import_channel_manager():
+    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+    if root_dir not in sys.path:
+        sys.path.insert(0, root_dir)
+
+    api_config_cache = sys.modules.pop('config', None)
+    for mod_name in ['ui', 'trust', 'channel_manager', 'tg_client']:
+        sys.modules.pop(mod_name, None)
+
+    try:
+        import channel_manager as ch
+        return ch
+    finally:
+        if api_config_cache:
+            sys.modules['config'] = api_config_cache
+
+
 # ── Schemas ──────────────────────────────────────────────────
 
 class CreateChannelRequest(BaseModel):
@@ -29,14 +51,14 @@ class CreateChannelRequest(BaseModel):
 
 class BatchCreateRequest(BaseModel):
     account_ids: list[int]
-    title_template: str          # "Канал {name}" или "Канал {n}"
+    title_template: str
     description: str = ""
     delay: float = 4.0
 
 
 class PinChannelRequest(BaseModel):
     account_id: int
-    channel_link: str            # @username или https://t.me/...
+    channel_link: str
 
 
 class PinExistingRequest(BaseModel):
@@ -77,19 +99,19 @@ async def get_my_channels(
     db: AsyncSession = Depends(get_db),
 ):
     """Список каналов которыми владеет аккаунт"""
-    import sys, os
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-    import channel_manager as ch
-
     acc = await _get_account(db, account_id, current_user.id)
-    channels = await ch.get_my_channels(_to_dict(acc))
 
-    # Обновляем в БД
-    if channels:
-        acc.channels = channels
-        await db.flush()
+    try:
+        ch = _import_channel_manager()
+        channels = await ch.get_my_channels(_to_dict(acc))
 
-    return {"account_id": account_id, "channels": channels}
+        if channels:
+            acc.channels = channels
+            await db.flush()
+
+        return {"account_id": account_id, "channels": channels}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
 
 @router.post("/create")
@@ -98,31 +120,26 @@ async def create_channel(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Создать новый канал от имени аккаунта.
-    По ТЗ: создание личных каналов.
-    """
-    import sys, os
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-    import channel_manager as ch
-
+    """Создать новый канал от имени аккаунта"""
     acc = await _get_account(db, body.account_id, current_user.id)
-    acc_dict = _to_dict(acc)
 
-    channel = await ch.create_channel(
-        acc_dict, body.title, body.description, body.username
-    )
+    try:
+        ch = _import_channel_manager()
+        channel = await ch.create_channel(_to_dict(acc), body.title, body.description, body.username)
 
-    if not channel:
-        raise HTTPException(status_code=500, detail="Не удалось создать канал")
+        if not channel:
+            raise HTTPException(status_code=500, detail="Не удалось создать канал")
 
-    # Сохраняем канал в БД
-    channels = acc.channels or []
-    channels.append(channel)
-    acc.channels = channels
-    await db.flush()
+        channels = acc.channels or []
+        channels.append(channel)
+        acc.channels = channels
+        await db.flush()
 
-    return {"success": True, "channel": channel}
+        return {"success": True, "channel": channel}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
 
 @router.post("/batch-create")
@@ -131,10 +148,7 @@ async def batch_create_channels(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Создать каналы для нескольких аккаунтов через Celery.
-    По ТЗ: создание каналов пакетно.
-    """
+    """Создать каналы для нескольких аккаунтов через Celery"""
     result = await db.execute(
         select(TelegramAccount).where(
             TelegramAccount.user_id == current_user.id,
@@ -142,21 +156,18 @@ async def batch_create_channels(
         )
     )
     accounts = result.scalars().all()
-
     accounts_data = [_to_dict(a) for a in accounts]
 
-    from celery import current_app
-    task = current_app.send_task(
-        "tasks.bulk_tasks.create_channels_bulk",
-        args=[accounts_data, body.title_template, body.description, body.delay],
-        queue="bulk_actions",
-    )
-
-    return {
-        "task_id": task.id,
-        "total": len(accounts_data),
-        "message": f"Создание каналов для {len(accounts_data)} аккаунтов запущено"
-    }
+    try:
+        from celery import current_app
+        task = current_app.send_task(
+            "tasks.bulk_tasks.create_channels_bulk",
+            args=[accounts_data, body.title_template, body.description, body.delay],
+            queue="bulk_actions",
+        )
+        return {"task_id": task.id, "total": len(accounts_data), "message": f"Создание каналов для {len(accounts_data)} аккаунтов запущено"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Celery недоступен: {str(e)}")
 
 
 @router.post("/pin")
@@ -165,22 +176,15 @@ async def pin_channel(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Закрепить канал в профиле аккаунта.
-    По ТЗ: закрепление личных каналов в профиле.
-    """
-    import sys, os
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-    import channel_manager as ch
-
+    """Закрепить канал в профиле аккаунта"""
     acc = await _get_account(db, body.account_id, current_user.id)
-    ok = await ch.pin_channel_to_profile(_to_dict(acc), body.channel_link)
 
-    return {
-        "success": ok,
-        "account_id": body.account_id,
-        "channel_link": body.channel_link,
-    }
+    try:
+        ch = _import_channel_manager()
+        ok = await ch.pin_channel_to_profile(_to_dict(acc), body.channel_link)
+        return {"success": ok, "account_id": body.account_id, "channel_link": body.channel_link}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
 
 
 @router.post("/pin-existing")
@@ -189,14 +193,7 @@ async def pin_existing_channel(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Закрепить существующий канал на несколько аккаунтов.
-    По ТЗ: закрепление существующих каналов без создания новых.
-    """
-    import sys, os
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
-    import channel_manager as ch
-
+    """Закрепить существующий канал на несколько аккаунтов"""
     result = await db.execute(
         select(TelegramAccount).where(
             TelegramAccount.user_id == current_user.id,
@@ -205,13 +202,13 @@ async def pin_existing_channel(
     )
     accounts = result.scalars().all()
 
-    results = []
-    for acc in accounts:
-        ok = await ch.pin_existing_channel(_to_dict(acc), body.channel_link)
-        results.append({"phone": acc.phone, "success": ok})
+    try:
+        ch = _import_channel_manager()
+        results = []
+        for acc in accounts:
+            ok = await ch.pin_existing_channel(_to_dict(acc), body.channel_link)
+            results.append({"phone": acc.phone, "success": ok})
 
-    return {
-        "channel_link": body.channel_link,
-        "results": results,
-        "success_count": sum(1 for r in results if r["success"]),
-    }
+        return {"channel_link": body.channel_link, "results": results, "success_count": sum(1 for r in results if r["success"])}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")

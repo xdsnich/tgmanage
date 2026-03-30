@@ -33,6 +33,7 @@ class SendMessageRequest(BaseModel):
 class AIConfigRequest(BaseModel):
     system_prompt: str = ""
     is_active: bool = False
+    llm_provider: str = "claude"
 
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -259,11 +260,12 @@ async def get_ai_config(
     ai = result.scalar_one_or_none()
 
     if not ai:
-        return {"system_prompt": "", "is_active": False}
+        return {"system_prompt": "", "is_active": False, "llm_provider": "claude"}
 
     return {
         "system_prompt": ai.system_prompt,
         "is_active": ai.is_active,
+        "llm_provider": getattr(ai, 'llm_provider', 'claude') or 'claude',
     }
 
 
@@ -292,6 +294,7 @@ async def set_ai_config(
     if ai:
         ai.system_prompt = body.system_prompt
         ai.is_active = body.is_active
+        ai.llm_provider = body.llm_provider
         ai.updated_at = datetime.utcnow()
     else:
         ai = AIDialog(
@@ -299,6 +302,7 @@ async def set_ai_config(
             contact_id=contact_id,
             system_prompt=body.system_prompt,
             is_active=body.is_active,
+            llm_provider=body.llm_provider,
         )
         db.add(ai)
 
@@ -308,4 +312,5 @@ async def set_ai_config(
         "success": True,
         "system_prompt": ai.system_prompt,
         "is_active": ai.is_active,
+        "llm_provider": ai.llm_provider,
     }

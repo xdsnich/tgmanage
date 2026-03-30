@@ -1,50 +1,67 @@
 """
-Одноразовый скрипт: пересоздаёт FK constraints с ON DELETE CASCADE.
-Запускать из папки api/:
-  python fix_cascade.py
-"""
+Конвертирует колонку llm_provider из PostgreSQL enum в VARCHAR.
+Это раз и навсегда убирает проблему с добавлением новых провайдеров.
 
+cd api && python fix_enum_to_varchar.py
+"""
 import asyncio
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy import text
-from config import DATABASE_URL
+import asyncpg
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://gramgpt:gramgpt@localhost:5432/gramgpt")
+# Извлекаем чистый URL для asyncpg (без +asyncpg)
+PG_URL = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
 
 
 async def fix():
-    engine = create_async_engine(DATABASE_URL)
-    async with engine.begin() as conn:
-        # ai_dialogs: пересоздаём FK
+    conn = await asyncpg.connect(PG_URL)
+    try:
+        # 1. campaigns.llm_provider: enum → varchar
         try:
-            await conn.execute(text("""
-                ALTER TABLE ai_dialogs
-                DROP CONSTRAINT IF EXISTS ai_dialogs_account_id_fkey
-            """))
-            await conn.execute(text("""
-                ALTER TABLE ai_dialogs
-                ADD CONSTRAINT ai_dialogs_account_id_fkey
-                FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
-            """))
-            print("✅ ai_dialogs FK fixed")
+            await conn.execute("ALTER TABLE campaigns ALTER COLUMN llm_provider TYPE VARCHAR(32) USING llm_provider::text")
+            print("✅ campaigns.llm_provider → VARCHAR(32)")
         except Exception as e:
-            print(f"❌ ai_dialogs: {e}")
+            if "already" in str(e).lower() or "type" in str(e).lower():
+                print(f"⚠ campaigns.llm_provider: {e}")
+            else:
+                print(f"❌ campaigns.llm_provider: {e}")
 
-        # actions_log: пересоздаём FK
+        # 2. campaigns.tone: enum → varchar
         try:
-            await conn.execute(text("""
-                ALTER TABLE actions_log
-                DROP CONSTRAINT IF EXISTS actions_log_account_id_fkey
-            """))
-            await conn.execute(text("""
-                ALTER TABLE actions_log
-                ADD CONSTRAINT actions_log_account_id_fkey
-                FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
-            """))
-            print("✅ actions_log FK fixed")
+            await conn.execute("ALTER TABLE campaigns ALTER COLUMN tone TYPE VARCHAR(32) USING tone::text")
+            print("✅ campaigns.tone → VARCHAR(32)")
         except Exception as e:
-            print(f"❌ actions_log: {e}")
+            print(f"⚠ campaigns.tone: {e}")
 
-    await engine.dispose()
-    print("Done!")
+        # 3. campaigns.trigger_mode: enum → varchar
+        try:
+            await conn.execute("ALTER TABLE campaigns ALTER COLUMN trigger_mode TYPE VARCHAR(32) USING trigger_mode::text")
+            print("✅ campaigns.trigger_mode → VARCHAR(32)")
+        except Exception as e:
+            print(f"⚠ campaigns.trigger_mode: {e}")
+
+        # 4. campaigns.status: enum → varchar
+        try:
+            await conn.execute("ALTER TABLE campaigns ALTER COLUMN status TYPE VARCHAR(32) USING status::text")
+            print("✅ campaigns.status → VARCHAR(32)")
+        except Exception as e:
+            print(f"⚠ campaigns.status: {e}")
+
+        # 5. Удаляем старые enum типы
+        for enum_name in ['llmprovider', 'commenttone', 'triggermode', 'campaignstatus']:
+            try:
+                await conn.execute(f"DROP TYPE IF EXISTS {enum_name}")
+                print(f"✅ DROP TYPE {enum_name}")
+            except Exception as e:
+                print(f"⚠ DROP {enum_name}: {e}")
+
+        print("\nГотово! Теперь llm_provider принимает любые значения: claude, openai, gemini, и т.д.")
+
+    finally:
+        await conn.close()
 
 
 asyncio.run(fix())

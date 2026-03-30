@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Optional, TYPE_CHECKING
 from sqlalchemy import (
     String, Boolean, DateTime, ForeignKey, Integer,
-    BigInteger, Text, JSON, Enum, Float,
+    BigInteger, Text, JSON, Float,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 import enum
@@ -40,6 +40,7 @@ class TriggerMode(str, enum.Enum):
 class LLMProvider(str, enum.Enum):
     claude = "claude"
     openai = "openai"
+    gemini = "gemini"
 
 
 class CommentTone(str, enum.Enum):
@@ -59,29 +60,29 @@ class Campaign(Base):
     id:              Mapped[int]              = mapped_column(Integer, primary_key=True)
     user_id:         Mapped[int]              = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     name:            Mapped[str]              = mapped_column(String(128), nullable=False)
-    status:          Mapped[CampaignStatus]   = mapped_column(Enum(CampaignStatus), default=CampaignStatus.draft)
+    status:          Mapped[str]              = mapped_column(String(32), default="draft")
 
     # Какие аккаунты используются (JSON list of account IDs)
     account_ids:     Mapped[list]             = mapped_column(JSON, default=list)
 
     # ── Триггер ──────────────────────────────────────────
-    trigger_mode:    Mapped[TriggerMode]      = mapped_column(Enum(TriggerMode), default=TriggerMode.all)
-    trigger_percent: Mapped[int]              = mapped_column(Integer, default=50)         # Для random: % постов
-    trigger_keywords:Mapped[list]             = mapped_column(JSON, default=list)           # Для keywords: ["крипта", "блокчейн"]
+    trigger_mode:    Mapped[str]              = mapped_column(String(32), default="all")
+    trigger_percent: Mapped[int]              = mapped_column(Integer, default=50)
+    trigger_keywords:Mapped[list]             = mapped_column(JSON, default=list)
 
     # ── LLM ──────────────────────────────────────────────
-    llm_provider:    Mapped[LLMProvider]      = mapped_column(Enum(LLMProvider), default=LLMProvider.claude)
-    tone:            Mapped[CommentTone]      = mapped_column(Enum(CommentTone), default=CommentTone.positive)
+    llm_provider:    Mapped[str]              = mapped_column(String(32), default="claude")
+    tone:            Mapped[str]              = mapped_column(String(32), default="positive")
     custom_prompt:   Mapped[str]              = mapped_column(Text, default="")
-    comment_length:  Mapped[str]              = mapped_column(String(32), default="medium")  # short | medium | long
+    comment_length:  Mapped[str]              = mapped_column(String(32), default="medium")
 
     # ── Лимиты ───────────────────────────────────────────
-    max_comments:    Mapped[int]              = mapped_column(Integer, default=100)          # Стоп после N комментов
-    max_hours:       Mapped[int]              = mapped_column(Integer, default=24)            # Стоп после N часов
-    comments_sent:   Mapped[int]              = mapped_column(Integer, default=0)             # Счётчик отправленных
+    max_comments:    Mapped[int]              = mapped_column(Integer, default=100)
+    max_hours:       Mapped[int]              = mapped_column(Integer, default=24)
+    comments_sent:   Mapped[int]              = mapped_column(Integer, default=0)
 
     # ── Тайминги ─────────────────────────────────────────
-    delay_join:      Mapped[int]              = mapped_column(Integer, default=10)            # Задержка входа в канал (сек)
+    delay_join:      Mapped[int]              = mapped_column(Integer, default=10)
     delay_comment:   Mapped[int]              = mapped_column(Integer, default=250)           # Задержка перед комментом (сек)
     delay_between:   Mapped[int]              = mapped_column(Integer, default=60)            # Между комментами (сек)
 

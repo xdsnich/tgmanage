@@ -16,6 +16,10 @@ import sys
 import os
 import logging
 from datetime import datetime
+from dotenv import load_dotenv
+
+# Загружаем .env из api/ директории
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
 from celery_app import celery_app
 
@@ -53,23 +57,26 @@ def _get_cli_config():
     return cli_config
 
 
-# ── Claude API ───────────────────────────────────────────────
+# ── LLM Providers (для диалогов) ─────────────────────────────
 
-def call_claude(system_prompt: str, messages_history: list[dict]) -> str:
-    """
-    Вызывает Claude API для генерации ответа.
-    messages_history: [{role: "user"/"assistant", content: "..."}]
-    """
+def call_llm_dialog(provider: str, system_prompt: str, messages_history: list[dict]) -> str:
+    """Вызывает выбранный LLM для генерации ответа в диалоге"""
+    if provider == "openai":
+        return _call_openai_dialog(system_prompt, messages_history)
+    elif provider == "gemini":
+        return _call_gemini_dialog(system_prompt, messages_history)
+    else:
+        return _call_claude_dialog(system_prompt, messages_history)
+
+
+def _call_claude_dialog(system_prompt: str, messages_history: list[dict]) -> str:
     import httpx
-
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
     if not api_key:
         logger.error("ANTHROPIC_API_KEY не задан в .env!")
         return ""
 
-    # Берём последние 20 сообщений для контекста (чтобы не перегружать)
     recent = messages_history[-20:]
-
     try:
         with httpx.Client(timeout=30) as client:
             response = client.post(
@@ -87,24 +94,80 @@ def call_claude(system_prompt: str, messages_history: list[dict]) -> str:
                 },
             )
             response.raise_for_status()
-            data = response.json()
-
-            # Извлекаем текст из ответа
-            for block in data.get("content", []):
+            for block in response.json().get("content", []):
                 if block.get("type") == "text":
                     return block["text"]
-
-            return ""
-
     except Exception as e:
         logger.error(f"Claude API error: {e}")
+    return ""
+
+
+def _call_openai_dialog(system_prompt: str, messages_history: list[dict]) -> str:
+    import httpx
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        logger.error("OPENAI_API_KEY не задан!")
         return ""
+
+    recent = messages_history[-20:]
+    msgs = [{"role": "system", "content": system_prompt}] + recent
+    try:
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model": "gpt-4o", "max_tokens": 1024, "messages": msgs},
+            )
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.error(f"OpenAI error: {e}")
+    return ""
+
+
+def _call_gemini_dialog(system_prompt: str, messages_history: list[dict]) -> str:
+    import httpx
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    if not api_key:
+        logger.error("GEMINI_API_KEY не задан!")
+        return ""
+
+    recent = messages_history[-20:]
+    conversation = "\n".join([f"{'Я' if m['role']=='assistant' else 'Собеседник'}: {m['content']}" for m in recent])
+
+    try:
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "system_instruction": {"parts": [{"text": system_prompt}]},
+                    "contents": [{"parts": [{"text": conversation}]}],
+                    "generationConfig": {"maxOutputTokens": 1024},
+                },
+            )
+            resp.raise_for_status()
+            candidates = resp.json().get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts:
+                    return parts[0].get("text", "")
+    except Exception as e:
+        logger.error(f"Gemini error: {e}")
+    return ""
 
 
 # ── Основная логика ──────────────────────────────────────────
 
 async def _process_single_dialog(account_row, ai_dialog_row, db_session):
-    """Обрабатывает один ИИ-диалог: проверяет новые входящие, отвечает через Claude"""
+    """
+    Обрабатывает один ИИ-диалог.
+    Логика:
+    1. Получаем последнее входящее сообщение
+    2. Если его ID == last_msg_id в БД → уже обработано, пропускаем
+    3. Если последнее сообщение наше (out) → мы уже ответили, пропускаем
+    4. Новое входящее → вызываем LLM ОДИН РАЗ → отправляем ответ → сохраняем ID
+    """
     from telethon import TelegramClient
 
     cli_config = _get_cli_config()
@@ -114,7 +177,6 @@ async def _process_single_dialog(account_row, ai_dialog_row, db_session):
     session_file = account_row.session_file
 
     if not session_file or not os.path.exists(session_file):
-        logger.warning(f"[{phone}] Файл сессии не найден: {session_file}")
         return
 
     session_path = session_file.replace(".session", "")
@@ -130,58 +192,55 @@ async def _process_single_dialog(account_row, ai_dialog_row, db_session):
     try:
         await client.connect()
         if not await client.is_user_authorized():
-            logger.warning(f"[{phone}] Сессия не активна")
             return
 
-        # Получаем последние сообщения с контактом
+        # Получаем последние сообщения
         messages = await client.get_messages(contact_id, limit=30)
-
         if not messages:
             return
 
-        # Проверяем — последнее сообщение от контакта (не от нас)?
         last_msg = messages[0]
+
+        # Последнее сообщение наше → мы уже ответили → ничего не делаем
         if last_msg.out:
-            # Последнее сообщение наше — значит мы уже ответили, пропускаем
             return
 
+        # Нет текста → пропускаем
         if not last_msg.text:
             return
 
-        # Проверяем не отвечали ли мы уже на это сообщение
-        # Простая проверка: если last_message в БД совпадает — пропускаем
-        last_text = last_msg.text.strip()
-        if ai_dialog_row.last_message == last_text:
+        # Уже обработали это сообщение (проверяем по ID) → пропускаем
+        saved_id = getattr(ai_dialog_row, 'last_msg_id', 0) or 0
+        if last_msg.id <= saved_id:
             return
 
-        logger.info(f"[{phone}] Новое сообщение от {contact_id}: {last_text[:50]}...")
+        logger.info(f"[{phone}] Новое сообщение #{last_msg.id} от {contact_id}: {last_msg.text[:50]}...")
 
-        # Собираем историю для Claude
+        # Сразу запоминаем ID чтобы не обрабатывать повторно (даже если LLM упадёт)
+        ai_dialog_row.last_msg_id = last_msg.id
+        ai_dialog_row.last_message = last_msg.text.strip()
+
+        # Собираем историю
         history = []
         for m in reversed(messages):
             if not m.text:
                 continue
-            role = "assistant" if m.out else "user"
-            history.append({"role": role, "content": m.text})
+            history.append({"role": "assistant" if m.out else "user", "content": m.text})
 
-        # Вызываем Claude API
-        reply = call_claude(system_prompt, history)
+        # Вызываем LLM — ОДИН раз
+        provider = getattr(ai_dialog_row, 'llm_provider', 'claude') or 'claude'
+        reply = call_llm_dialog(provider, system_prompt, history)
 
         if not reply:
-            logger.warning(f"[{phone}] Claude вернул пустой ответ")
+            logger.warning(f"[{phone}] LLM ({provider}) вернул пустой ответ для msg #{last_msg.id}")
             return
 
-        # Отправляем ответ контакту
+        # Отправляем ответ
         await client.send_message(contact_id, reply)
         logger.info(f"[{phone}] Ответ отправлен ({len(reply)} символов)")
 
-        # Обновляем last_message и счётчик в БД
-        ai_dialog_row.last_message = last_text
         ai_dialog_row.messages_count = (ai_dialog_row.messages_count or 0) + 1
         ai_dialog_row.updated_at = datetime.utcnow()
-
-        # Добавляем задержку чтобы не нагружать API
-        await asyncio.sleep(2)
 
     except Exception as e:
         logger.error(f"[{phone}] Ошибка в ИИ-диалоге с {contact_id}: {e}")
