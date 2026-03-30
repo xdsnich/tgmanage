@@ -16,11 +16,11 @@ const inboxAPI = {
   sendMessage: (accountId, contactId, text) =>
     api.post(`/inbox/accounts/${accountId}/dialogs/${contactId}/send`, { text }),
 
-  setPrompt: (accountId, contactId, prompt, isActive) =>
-    api.post(`/inbox/accounts/${accountId}/dialogs/${contactId}/ai-config`, { system_prompt: prompt, is_active: isActive }),
+  setPrompt: (accountId, contactId, prompt, isActive, llmProvider = 'claude') =>
+    api.post(`/inbox/accounts/${accountId}/dialogs/${contactId}/ai-config`, { system_prompt: prompt, is_active: isActive, llm_provider: llmProvider }),
 
   getAIConfig: (accountId, contactId) =>
-    api.get(`/inbox/accounts/${accountId}/dialogs/${contactId}/ai-config`).catch(() => ({ data: { system_prompt: '', is_active: false } })),
+    api.get(`/inbox/accounts/${accountId}/dialogs/${contactId}/ai-config`).catch(() => ({ data: { system_prompt: '', is_active: false, llm_provider: 'claude' } })),
 }
 
 
@@ -38,6 +38,7 @@ export default function InboxPage() {
   const [aiModal, setAiModal] = useState(false)
   const [aiPrompt, setAiPrompt] = useState('')
   const [aiActive, setAiActive] = useState(false)
+  const [aiProvider, setAiProvider] = useState('claude')
   const [aiSaving, setAiSaving] = useState(false)
   const [toast, setToast] = useState(null)
   const msgsEndRef = useRef(null)
@@ -51,7 +52,7 @@ export default function InboxPage() {
   useEffect(() => {
     (async () => {
       try { const { data } = await accountsAPI.list(); setAccounts(data.filter(a => a.status === 'active')) }
-      catch {}
+      catch { }
       setLoading(false)
     })()
   }, [])
@@ -102,14 +103,15 @@ export default function InboxPage() {
       const { data } = await inboxAPI.getAIConfig(selectedAccount.id, selectedDialog.contact_id || selectedDialog.id)
       setAiPrompt(data.system_prompt || '')
       setAiActive(data.is_active || false)
-    } catch {}
+      setAiProvider(data.llm_provider || 'claude')
+    } catch { }
     setAiModal(true)
   }
 
   const saveAIConfig = async () => {
     setAiSaving(true)
     try {
-      await inboxAPI.setPrompt(selectedAccount.id, selectedDialog.contact_id || selectedDialog.id, aiPrompt, aiActive)
+      await inboxAPI.setPrompt(selectedAccount.id, selectedDialog.contact_id || selectedDialog.id, aiPrompt, aiActive, aiProvider)
       setAiModal(false)
       showToast('ИИ-конфигурация сохранена')
     } catch (err) { showToast(err.response?.data?.detail || 'Ошибка', 'error') }
@@ -158,8 +160,8 @@ export default function InboxPage() {
               border: selectedAccount?.id === acc.id ? '1px solid rgba(124,77,255,0.25)' : '1px solid transparent',
               transition: 'all 0.15s',
             }}
-            onMouseEnter={e => { if (selectedAccount?.id !== acc.id) e.currentTarget.style.background = 'rgba(255,255,255,0.04)' }}
-            onMouseLeave={e => { if (selectedAccount?.id !== acc.id) e.currentTarget.style.background = 'transparent' }}>
+              onMouseEnter={e => { if (selectedAccount?.id !== acc.id) e.currentTarget.style.background = 'rgba(255,255,255,0.04)' }}
+              onMouseLeave={e => { if (selectedAccount?.id !== acc.id) e.currentTarget.style.background = 'transparent' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                 <div style={{
                   width: 30, height: 30, borderRadius: 8, flexShrink: 0,
@@ -216,8 +218,8 @@ export default function InboxPage() {
               background: (selectedDialog?.contact_id || selectedDialog?.id) === (d.contact_id || d.id) ? 'rgba(124,77,255,0.1)' : 'transparent',
               transition: 'background 0.12s',
             }}
-            onMouseEnter={e => e.currentTarget.style.background = 'rgba(255,255,255,0.03)'}
-            onMouseLeave={e => e.currentTarget.style.background = (selectedDialog?.contact_id || selectedDialog?.id) === (d.contact_id || d.id) ? 'rgba(124,77,255,0.1)' : 'transparent'}>
+              onMouseEnter={e => e.currentTarget.style.background = 'rgba(255,255,255,0.03)'}
+              onMouseLeave={e => e.currentTarget.style.background = (selectedDialog?.contact_id || selectedDialog?.id) === (d.contact_id || d.id) ? 'rgba(124,77,255,0.1)' : 'transparent'}>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
                 <span style={{ fontWeight: 600, fontSize: 13 }}>{d.name || d.contact_name || 'Контакт'}</span>
                 {d.unread_count > 0 && (
@@ -338,6 +340,16 @@ export default function InboxPage() {
           <div style={{ padding: '12px 14px', background: 'rgba(124,77,255,0.06)', border: '1px solid rgba(124,77,255,0.15)', borderRadius: 10, fontSize: 12, color: 'var(--text-2)', lineHeight: 1.6 }}>
             ИИ будет вести переписку от имени аккаунта по заданному системному промпту.
             Вы можете вмешаться вручную в любой момент.
+          </div>
+
+          <div>
+            <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>LLM провайдер</label>
+            <select value={aiProvider} onChange={e => setAiProvider(e.target.value)} style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 14, outline: 'none' }}>
+              <option value="claude">Claude (Anthropic)</option>
+              <option value="openai">GPT-4o (OpenAI)</option>
+              <option value="gemini">Gemini (Google)</option>
+              <option value="groq">Llama 3.3 70B (Groq)</option>
+            </select>
           </div>
 
           <div>

@@ -7,8 +7,10 @@ const NAV = [
   { to: '/proxies', emoji: '◎', label: 'Прокси', color: '#00c2b2' },
   { to: '/inbox', emoji: '◆', label: 'Входящие', color: '#ff3d9a' },
   { to: '/commenting', emoji: '🧠', label: 'Комментинг', color: '#ff6b35' },
+  { to: '/warmup', emoji: '🔥', label: 'Прогрев', color: '#3dd68c' },
+  { to: '/parser', emoji: '🔍', label: 'Парсер', color: '#3d8bff' },
   { to: '/tasks', emoji: '◇', label: 'Задачи', color: '#e3a13f' },
-  { to: '/analytics', emoji: '◈', label: 'Аналитика', color: '#3dd68c' },
+  { to: '/analytics', emoji: '◈', label: 'Аналитика', color: '#00c2b2' },
   { to: '/settings', emoji: '◐', label: 'Настройки', color: '#888' },
 ]
 

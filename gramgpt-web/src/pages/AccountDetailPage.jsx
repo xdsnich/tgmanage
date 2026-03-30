@@ -42,6 +42,7 @@ export default function AccountDetailPage() {
   const [authMsg, setAuthMsg] = useState('')
   const [channelTitle, setChannelTitle] = useState('')
   const [channelDesc, setChannelDesc] = useState('')
+  const [channelUsername, setChannelUsername] = useState('')
   const [exportData, setExportData] = useState(null)
 
   const [saving, setSaving] = useState(false)
@@ -165,8 +166,8 @@ export default function AccountDetailPage() {
   const handleCreateChannel = async (e) => {
     e.preventDefault(); setSaving(true)
     try {
-      await channelsAPI.create(parseInt(id), channelTitle, channelDesc)
-      setChannelModal(false); setChannelTitle(''); setChannelDesc('')
+      await channelsAPI.create(parseInt(id), channelTitle, channelDesc, channelUsername)
+      setChannelModal(false); setChannelTitle(''); setChannelDesc(''); setChannelUsername('')
       showToast('Канал создан'); await loadChannels()
     } catch (err) { showToast(err.response?.data?.detail || 'Ошибка', 'error') }
     setSaving(false)
@@ -518,7 +519,11 @@ export default function AccountDetailPage() {
       <Modal open={channelModal} onClose={() => setChannelModal(false)} title="Создать канал" width={440}>
         <form onSubmit={handleCreateChannel} style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
           <Input label="Название канала" value={channelTitle} onChange={e => setChannelTitle(e.target.value)} required placeholder="Мой канал" />
+          <Input label="Username (опционально)" value={channelUsername} onChange={e => setChannelUsername(e.target.value)} placeholder="my_channel (без @)" />
           <Input label="Описание (опционально)" value={channelDesc} onChange={e => setChannelDesc(e.target.value)} placeholder="О чём канал" />
+          <div style={{ fontSize: 11, color: 'var(--text-3)', padding: '0 2px' }}>
+            Если указать username — канал станет публичным (t.me/username). Без username — приватный.
+          </div>
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
             <Button variant="ghost" type="button" onClick={() => setChannelModal(false)}>Отмена</Button>
             <Button variant="primary" type="submit" loading={saving}>Создать</Button>

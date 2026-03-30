@@ -55,7 +55,7 @@ export default function CommentingPage() {
     try {
       const [c, a] = await Promise.all([commentingAPI.list(), accountsAPI.list()])
       setCampaigns(c.data); setAccounts(a.data.filter(acc => acc.status === 'active'))
-    } catch {}
+    } catch { }
     setLoading(false)
   }
 
@@ -103,7 +103,7 @@ export default function CommentingPage() {
 
   const handleRemoveChannel = async (campaignId, channelId) => {
     try { await commentingAPI.removeChannel(campaignId, channelId); showToast('Канал удалён'); await load() }
-    catch {}
+    catch { }
   }
 
   const openDetail = (c) => { setSelected(c); setDetailModal(true) }
@@ -148,7 +148,7 @@ export default function CommentingPage() {
                   <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
                     <span style={{ fontWeight: 700, fontSize: 15, letterSpacing: '-0.02em' }}>{c.name}</span>
                     <Badge color={STATUS_COLORS[c.status]}>{STATUS_LABELS[c.status]}</Badge>
-                    <Badge color="violet">{c.llm_provider === 'claude' ? 'Claude' : 'GPT-4o'}</Badge>
+                    <Badge color="violet">{{ 'claude': 'Claude', 'openai': 'GPT-4o', 'gemini': 'Gemini', 'groq': 'Groq' }[c.llm_provider] || c.llm_provider}</Badge>
                     <Badge color="default">{TONES.find(t => t.value === c.tone)?.label || c.tone}</Badge>
                   </div>
                   <div style={{ display: 'flex', gap: 16, fontSize: 12, color: 'var(--text-3)' }}>
@@ -208,6 +208,8 @@ export default function CommentingPage() {
               <select value={form.llm_provider} onChange={e => setForm(f => ({ ...f, llm_provider: e.target.value }))} style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 14, outline: 'none' }}>
                 <option value="claude">Claude (Anthropic)</option>
                 <option value="openai">GPT-4o (OpenAI)</option>
+                <option value="gemini">Gemini (Google)</option>
+                <option value="groq">Llama 3.3 70B (Groq)</option>
               </select>
             </div>
             <div>
@@ -288,7 +290,7 @@ export default function CommentingPage() {
           <div style={{ display: 'flex', flexDirection: 'column', gap: 14, maxHeight: '70vh', overflow: 'auto' }}>
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
               <Badge color={STATUS_COLORS[selected.status]}>{STATUS_LABELS[selected.status]}</Badge>
-              <Badge color="violet">{selected.llm_provider === 'claude' ? 'Claude' : 'GPT-4o'}</Badge>
+              <Badge color="violet">{{ 'claude': 'Claude', 'openai': 'GPT-4o', 'gemini': 'Gemini', 'groq': 'Groq' }[selected.llm_provider] || selected.llm_provider}</Badge>
               <Badge color="default">{TONES.find(t => t.value === selected.tone)?.label}</Badge>
               <Badge color="blue">💬 {selected.comments_sent}/{selected.max_comments}</Badge>
             </div>

@@ -57,14 +57,38 @@ def _get_cli_config():
     return cli_config
 
 
+# ── Rate Limiter (защита от 429) ─────────────────────────────
+
+import threading
+
+_llm_lock = threading.Lock()
+_llm_calls = []
+LLM_MAX_PER_MINUTE = 10
+
+def _check_rate_limit() -> bool:
+    import time as _time
+    with _llm_lock:
+        now = _time.time()
+        _llm_calls[:] = [t for t in _llm_calls if now - t < 60]
+        if len(_llm_calls) >= LLM_MAX_PER_MINUTE:
+            logger.warning(f"Rate limit: {len(_llm_calls)}/{LLM_MAX_PER_MINUTE} запросов/мин — пропускаю")
+            return False
+        _llm_calls.append(now)
+        return True
+
+
 # ── LLM Providers (для диалогов) ─────────────────────────────
 
 def call_llm_dialog(provider: str, system_prompt: str, messages_history: list[dict]) -> str:
-    """Вызывает выбранный LLM для генерации ответа в диалоге"""
+    """Вызывает выбранный LLM с проверкой rate limit"""
+    if not _check_rate_limit():
+        return ""
     if provider == "openai":
         return _call_openai_dialog(system_prompt, messages_history)
     elif provider == "gemini":
         return _call_gemini_dialog(system_prompt, messages_history)
+    elif provider == "groq":
+        return _call_groq_dialog(system_prompt, messages_history)
     else:
         return _call_claude_dialog(system_prompt, messages_history)
 
@@ -138,7 +162,7 @@ def _call_gemini_dialog(system_prompt: str, messages_history: list[dict]) -> str
     try:
         with httpx.Client(timeout=30) as client:
             resp = client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}",
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key={api_key}",
                 headers={"Content-Type": "application/json"},
                 json={
                     "system_instruction": {"parts": [{"text": system_prompt}]},
@@ -154,6 +178,29 @@ def _call_gemini_dialog(system_prompt: str, messages_history: list[dict]) -> str
                     return parts[0].get("text", "")
     except Exception as e:
         logger.error(f"Gemini error: {e}")
+    return ""
+
+
+def _call_groq_dialog(system_prompt: str, messages_history: list[dict]) -> str:
+    import httpx
+    api_key = os.getenv("GROQ_API_KEY", "")
+    if not api_key:
+        logger.error("GROQ_API_KEY не задан!")
+        return ""
+
+    recent = messages_history[-20:]
+    msgs = [{"role": "system", "content": system_prompt}] + recent
+    try:
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model": "llama-3.3-70b-versatile", "max_tokens": 1024, "messages": msgs},
+            )
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.error(f"Groq error: {e}")
     return ""
 
 

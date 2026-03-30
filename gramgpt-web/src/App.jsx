@@ -13,6 +13,8 @@ import InboxPage from './pages/InboxPage'
 import TasksPage from './pages/TasksPage'
 import AnalyticsPage from './pages/AnalyticsPage'
 import CommentingPage from './pages/CommentingPage'
+import WarmupPage from './pages/WarmupPage'
+import ParserPage from './pages/ParserPage'
 import SettingsPage from './pages/SettingsPage'
 import { Spinner } from './components/ui'
 
@@ -54,6 +56,8 @@ export default function App() {
               <Route path="/tasks" element={<TasksPage />} />
               <Route path="/analytics" element={<AnalyticsPage />} />
               <Route path="/commenting" element={<CommentingPage />} />
+              <Route path="/warmup" element={<WarmupPage />} />
+              <Route path="/parser" element={<ParserPage />} />
               <Route path="/settings" element={<SettingsPage />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>

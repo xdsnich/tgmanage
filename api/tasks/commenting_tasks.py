@@ -43,11 +43,51 @@ def _get_cli_config():
     return cli_config
 
 
+# ── Rate Limiter (защита от 429) ─────────────────────────────
+
+import threading
+import time
+
+_llm_lock = threading.Lock()
+_llm_calls = []  # timestamps последних вызовов
+LLM_MAX_PER_MINUTE = 10  # максимум 10 запросов в минуту
+_last_call_time = 0.0    # Время самого последнего запроса
+
+def _check_rate_limit() -> bool:
+    """Проверяет не превышен ли лимит и делает обязательную паузу между запросами."""
+    global _last_call_time
+    with _llm_lock:
+        now = time.time()
+        
+        # 1. Отсекаем старые вызовы
+        _llm_calls[:] = [t for t in _llm_calls if now - t < 60]
+        
+        # 2. Проверяем общий лимит в минуту
+        if len(_llm_calls) >= LLM_MAX_PER_MINUTE:
+            logger.warning(f"Rate limit: {len(_llm_calls)}/{LLM_MAX_PER_MINUTE} запросов/мин — пропускаю")
+            return False
+            
+        # 3. АНТИ-СПАМ ЗАЩИТА (BURST LIMIT)
+        # Если с прошлого вызова прошло меньше 4 секунд, скрипт принудительно подождет
+        time_since_last = now - _last_call_time
+        if time_since_last < 4.0:
+            sleep_time = 4.0 - time_since_last
+            logger.info(f"Защита API от спама: жду {sleep_time:.1f} сек...")
+            time.sleep(sleep_time)
+            
+        # Обновляем тайминги после паузы
+        current_time = time.time()
+        _llm_calls.append(current_time)
+        _last_call_time = current_time
+        
+        return True
+
 # ── LLM Providers ────────────────────────────────────────────
 
 def call_llm(provider: str, system_prompt: str, post_text: str) -> str:
-    """Вызывает Claude или OpenAI для генерации комментария"""
-    import httpx
+    """Вызывает LLM с проверкой rate limit"""
+    if not _check_rate_limit():
+        return ""
 
     if provider == "claude":
         return _call_claude(system_prompt, post_text)
@@ -55,8 +95,41 @@ def call_llm(provider: str, system_prompt: str, post_text: str) -> str:
         return _call_openai(system_prompt, post_text)
     elif provider == "gemini":
         return _call_gemini(system_prompt, post_text)
+    elif provider == "groq":
+        return _call_groq(system_prompt, post_text)
     else:
         return _call_claude(system_prompt, post_text)
+
+
+def _call_groq(system_prompt: str, post_text: str) -> str:
+    import httpx
+    api_key = os.getenv("GROQ_API_KEY", "")
+    if not api_key:
+        logger.error("GROQ_API_KEY не задан!")
+        return ""
+
+    try:
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "max_tokens": 300,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": post_text},
+                    ],
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.error(f"Groq error: {e}")
+    return ""
 
 
 def _call_claude(system_prompt: str, post_text: str) -> str:
@@ -132,7 +205,7 @@ def _call_gemini(system_prompt: str, post_text: str) -> str:
     try:
         with httpx.Client(timeout=30) as client:
             resp = client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}",
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key={api_key}",
                 headers={"Content-Type": "application/json"},
                 json={
                     "system_instruction": {"parts": [{"text": system_prompt}]},
@@ -329,17 +402,20 @@ async def _process_campaign(campaign_row, db):
                     found_new = True
                     logger.info(f"[{c.name}] ★ Новый пост #{msg.id} в @{channel.username}: {post_text[:60]}...")
 
+                    # ФИКС: Сразу записываем в базу, что мы увидели этот пост,
+                    # чтобы следующий Celery-воркер (через 45 сек) его проигнорировал!
+                    channel.last_post_id = msg.id
+                    await db.commit()
+
                     # Решаем комментировать или нет (триггер)
                     if not _should_comment(_val(c.trigger_mode), c.trigger_percent, c.trigger_keywords or [], post_text):
                         logger.info(f"[{c.name}] Пост #{msg.id}: не проходит триггер ({_val(c.trigger_mode)})")
-                        channel.last_post_id = msg.id
                         continue
 
                     # Проверяем комментарии
                     has_discussion = msg.replies and getattr(msg.replies, 'comments', False)
                     if not has_discussion:
                         logger.info(f"[{c.name}] Пост #{msg.id}: комментарии отключены, пропускаю")
-                        channel.last_post_id = msg.id
                         continue
 
                     # Задержка перед комментарием (имитация чтения), макс 60с за цикл
@@ -355,7 +431,6 @@ async def _process_campaign(campaign_row, db):
 
                     if not comment:
                         logger.warning(f"[{c.name}] LLM ({provider}) вернул пустой ответ для поста #{msg.id}")
-                        channel.last_post_id = msg.id
                         continue
 
                     logger.info(f"[{c.name}] LLM ответ: {comment[:80]}...")

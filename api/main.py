@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from config import APP_NAME, APP_VERSION, DEBUG, CORS_ORIGINS
 from database import create_tables
 from routers import auth, accounts, proxies, tasks
-from routers import tg_auth, analytics, security, channels, actions, inbox, tdata, commenting
+from routers import tg_auth, analytics, security, channels, actions, inbox, tdata, commenting, warmup, parser
 
 
 # ── Lifespan (старт / стоп) ──────────────────────────────────
@@ -63,6 +63,8 @@ app.include_router(actions.router,   prefix=PREFIX)   # Быстрые дейс�
 app.include_router(inbox.router,     prefix=PREFIX)   # Входящие / ИИ-диалоги
 app.include_router(tdata.router,     prefix=PREFIX)   # TData / Session импорт
 app.include_router(commenting.router, prefix=PREFIX)  # Нейрокомментинг
+app.include_router(warmup.router,    prefix=PREFIX)  # Прогрев аккаунтов
+app.include_router(parser.router,    prefix=PREFIX)  # Парсер каналов
 
 
 # ── Healthcheck ──────────────────────────────────────────────
@@ -90,7 +92,6 @@ async def root():
             "inbox":      f"{PREFIX}/inbox",
         }
     }
-
 
 # Запуск:
 # cd api && venv\Scripts\activate

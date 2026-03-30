@@ -25,6 +25,7 @@ celery_app = Celery(
         "tasks.bulk_tasks",
         "tasks.ai_tasks",
         "tasks.commenting_tasks",
+        "tasks.warmup_tasks",
     ]
 )
 
