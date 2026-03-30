@@ -1,0 +1,122 @@
+"""
+GramGPT API — models/campaign.py
+Модели кампаний нейрокомментинга.
+По ТЗ раздел 3.6: режимы, лимиты, промпты, тайминги.
+"""
+
+from __future__ import annotations
+from datetime import datetime
+from typing import Optional, TYPE_CHECKING
+from sqlalchemy import (
+    String, Boolean, DateTime, ForeignKey, Integer,
+    BigInteger, Text, JSON, Enum, Float,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+import enum
+
+from database import Base
+
+if TYPE_CHECKING:
+    from models.user import User
+    from models.account import TelegramAccount
+
+
+# ── Enums ────────────────────────────────────────────────────
+
+class CampaignStatus(str, enum.Enum):
+    draft    = "draft"       # Черновик — не запущена
+    active   = "active"      # Работает
+    paused   = "paused"      # На паузе
+    stopped  = "stopped"     # Остановлена
+    finished = "finished"    # Завершена (лимит/время)
+
+
+class TriggerMode(str, enum.Enum):
+    all      = "all"         # Каждый пост
+    random   = "random"      # Случайный % постов
+    keywords = "keywords"    # По ключевым словам
+
+
+class LLMProvider(str, enum.Enum):
+    claude = "claude"
+    openai = "openai"
+
+
+class CommentTone(str, enum.Enum):
+    positive   = "positive"     # Позитивный
+    negative   = "negative"     # Негативный
+    question   = "question"     # Вопрос автору
+    analytical = "analytical"   # Аналитический
+    short      = "short"        # Краткий (2-3 слова)
+    custom     = "custom"       # Кастомный промпт
+
+
+# ── Campaign ─────────────────────────────────────────────────
+
+class Campaign(Base):
+    __tablename__ = "campaigns"
+
+    id:              Mapped[int]              = mapped_column(Integer, primary_key=True)
+    user_id:         Mapped[int]              = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    name:            Mapped[str]              = mapped_column(String(128), nullable=False)
+    status:          Mapped[CampaignStatus]   = mapped_column(Enum(CampaignStatus), default=CampaignStatus.draft)
+
+    # Какие аккаунты используются (JSON list of account IDs)
+    account_ids:     Mapped[list]             = mapped_column(JSON, default=list)
+
+    # ── Триггер ──────────────────────────────────────────
+    trigger_mode:    Mapped[TriggerMode]      = mapped_column(Enum(TriggerMode), default=TriggerMode.all)
+    trigger_percent: Mapped[int]              = mapped_column(Integer, default=50)         # Для random: % постов
+    trigger_keywords:Mapped[list]             = mapped_column(JSON, default=list)           # Для keywords: ["крипта", "блокчейн"]
+
+    # ── LLM ──────────────────────────────────────────────
+    llm_provider:    Mapped[LLMProvider]      = mapped_column(Enum(LLMProvider), default=LLMProvider.claude)
+    tone:            Mapped[CommentTone]      = mapped_column(Enum(CommentTone), default=CommentTone.positive)
+    custom_prompt:   Mapped[str]              = mapped_column(Text, default="")
+    comment_length:  Mapped[str]              = mapped_column(String(32), default="medium")  # short | medium | long
+
+    # ── Лимиты ───────────────────────────────────────────
+    max_comments:    Mapped[int]              = mapped_column(Integer, default=100)          # Стоп после N комментов
+    max_hours:       Mapped[int]              = mapped_column(Integer, default=24)            # Стоп после N часов
+    comments_sent:   Mapped[int]              = mapped_column(Integer, default=0)             # Счётчик отправленных
+
+    # ── Тайминги ─────────────────────────────────────────
+    delay_join:      Mapped[int]              = mapped_column(Integer, default=10)            # Задержка входа в канал (сек)
+    delay_comment:   Mapped[int]              = mapped_column(Integer, default=250)           # Задержка перед комментом (сек)
+    delay_between:   Mapped[int]              = mapped_column(Integer, default=60)            # Между комментами (сек)
+
+    # ── Метаданные ───────────────────────────────────────
+    started_at:      Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    finished_at:     Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at:      Mapped[datetime]           = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at:      Mapped[datetime]           = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # ── Relationships ────────────────────────────────────
+    target_channels: Mapped[list[TargetChannel]] = relationship("TargetChannel", back_populates="campaign", cascade="all, delete-orphan")
+
+    def __repr__(self):
+        return f"<Campaign '{self.name}' [{self.status}] comments={self.comments_sent}/{self.max_comments}>"
+
+
+# ── Target Channel ───────────────────────────────────────────
+
+class TargetChannel(Base):
+    __tablename__ = "target_channels"
+
+    id:             Mapped[int]              = mapped_column(Integer, primary_key=True)
+    campaign_id:    Mapped[int]              = mapped_column(ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True)
+    channel_id:     Mapped[Optional[int]]    = mapped_column(BigInteger, nullable=True)
+    username:       Mapped[str]              = mapped_column(String(128), default="")
+    title:          Mapped[str]              = mapped_column(String(256), default="")
+    link:           Mapped[str]              = mapped_column(String(256), default="")
+    subscribers:    Mapped[int]              = mapped_column(Integer, default=0)
+    has_comments:   Mapped[bool]             = mapped_column(Boolean, default=True)
+    last_post_id:   Mapped[int]              = mapped_column(Integer, default=0)        # ID последнего обработанного поста
+    comments_sent:  Mapped[int]              = mapped_column(Integer, default=0)
+    is_active:      Mapped[bool]             = mapped_column(Boolean, default=True)
+    added_at:       Mapped[datetime]         = mapped_column(DateTime, default=datetime.utcnow)
+
+    campaign: Mapped[Campaign] = relationship("Campaign", back_populates="target_channels")
+
+    def __repr__(self):
+        return f"<TargetChannel @{self.username} in campaign={self.campaign_id}>"

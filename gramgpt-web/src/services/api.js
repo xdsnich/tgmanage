@@ -100,4 +100,150 @@ export const tasksAPI = {
     api.delete(`/tasks/${taskId}`),
 }
 
+// ── ANALYTICS ────────────────────────────────────────────────
+export const analyticsAPI = {
+  dashboard: () =>
+    api.get('/analytics/dashboard'),
+
+  search: (q) =>
+    api.get('/analytics/search', { params: { q } }),
+}
+
+// ── SECURITY (сессии, 2FA) ──────────────────────────────────
+export const securityAPI = {
+  listSessions: (accountId) =>
+    api.get(`/security/accounts/${accountId}/sessions`),
+
+  terminateSessions: (accountId) =>
+    api.post(`/security/accounts/${accountId}/terminate-sessions`),
+
+  set2FA: (accountId, password, hint = '') =>
+    api.post(`/security/accounts/${accountId}/set-2fa`, { password, hint }),
+
+  remove2FA: (accountId) =>
+    api.post(`/security/accounts/${accountId}/remove-2fa`),
+
+  reauthorize: (accountId) =>
+    api.post(`/security/accounts/${accountId}/reauthorize`),
+
+  exportSession: (accountId) =>
+    api.get(`/security/accounts/${accountId}/export-session`),
+}
+
+// ── CHANNELS ─────────────────────────────────────────────────
+export const channelsAPI = {
+  list: (accountId) =>
+    api.get(`/channels/accounts/${accountId}`),
+
+  create: (accountId, title, description = '', username = '') =>
+    api.post('/channels/create', { account_id: accountId, title, description, username }),
+
+  pin: (accountId, channelLink) =>
+    api.post('/channels/pin', { account_id: accountId, channel_link: channelLink }),
+}
+
+// ── ACTIONS (быстрые действия) ──────────────────────────────
+export const actionsAPI = {
+  leaveChats: (accountIds) =>
+    api.post('/actions/leave-chats', { account_ids: accountIds }),
+
+  leaveChannels: (accountIds) =>
+    api.post('/actions/leave-channels', { account_ids: accountIds }),
+
+  deleteDialogs: (accountIds) =>
+    api.post('/actions/delete-dialogs', { account_ids: accountIds }),
+
+  readAll: (accountIds) =>
+    api.post('/actions/read-all', { account_ids: accountIds }),
+
+  clearCache: (accountIds) =>
+    api.post('/actions/clear-cache', { account_ids: accountIds }),
+
+  unpinFolders: (accountIds) =>
+    api.post('/actions/unpin-folders', { account_ids: accountIds }),
+}
+
+// ── TG AUTH (веб-авторизация Telegram) ───────────────────────
+export const tgAuthAPI = {
+  sendCode: (phone) =>
+    api.post('/tg-auth/send-code', { phone }),
+
+  confirm: (phone, code) =>
+    api.post('/tg-auth/confirm', { phone, code }),
+
+  confirm2FA: (phone, password) =>
+    api.post('/tg-auth/confirm-2fa', { phone, password }),
+}
+
+// ── IMPORT (TData + Session файлы) ───────────────────────────
+export const importAPI = {
+  // Загрузка одного .session файла
+  uploadSession: (file, phone = '') => {
+    const form = new FormData()
+    form.append('file', file)
+    if (phone) form.append('phone', phone)
+    return api.post('/import/session', form, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 60000,
+    })
+  },
+
+  // Пакетная загрузка .session файлов
+  uploadSessionsBatch: (files) => {
+    const form = new FormData()
+    files.forEach(f => form.append('files', f))
+    return api.post('/import/sessions-batch', form, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 120000,
+    })
+  },
+
+  // Загрузка TData архива (ZIP)
+  uploadTData: (file, phone = '') => {
+    const form = new FormData()
+    form.append('file', file)
+    if (phone) form.append('phone', phone)
+    return api.post('/import/tdata', form, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 120000,
+    })
+  },
+}
+
+// ── COMMENTING (нейрокомментинг) ─────────────────────────────
+export const commentingAPI = {
+  list: () =>
+    api.get('/commenting/campaigns'),
+
+  get: (id) =>
+    api.get(`/commenting/campaigns/${id}`),
+
+  create: (data) =>
+    api.post('/commenting/campaigns', data),
+
+  update: (id, data) =>
+    api.patch(`/commenting/campaigns/${id}`, data),
+
+  delete: (id) =>
+    api.delete(`/commenting/campaigns/${id}`),
+
+  start: (id) =>
+    api.post(`/commenting/campaigns/${id}/start`),
+
+  pause: (id) =>
+    api.post(`/commenting/campaigns/${id}/pause`),
+
+  stop: (id) =>
+    api.post(`/commenting/campaigns/${id}/stop`),
+
+  addChannels: (id, channels) =>
+    api.post(`/commenting/campaigns/${id}/channels`, { channels }),
+
+  removeChannel: (campaignId, channelId) =>
+    api.delete(`/commenting/campaigns/${campaignId}/channels/${channelId}`),
+
+  stats: (id) =>
+    api.get(`/commenting/campaigns/${id}/stats`),
+}
+
 export default api

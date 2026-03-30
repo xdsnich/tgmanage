@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from config import APP_NAME, APP_VERSION, DEBUG, CORS_ORIGINS
 from database import create_tables
 from routers import auth, accounts, proxies, tasks
-from routers import tg_auth, analytics, security, channels, actions
+from routers import tg_auth, analytics, security, channels, actions, inbox, tdata, commenting
 
 
 # ── Lifespan (старт / стоп) ──────────────────────────────────
@@ -60,6 +60,9 @@ app.include_router(analytics.router, prefix=PREFIX)   # Dashboard / аналит
 app.include_router(security.router,  prefix=PREFIX)   # Сессии, 2FA
 app.include_router(channels.router,  prefix=PREFIX)   # Каналы
 app.include_router(actions.router,   prefix=PREFIX)   # Быстрые действия
+app.include_router(inbox.router,     prefix=PREFIX)   # Входящие / ИИ-диалоги
+app.include_router(tdata.router,     prefix=PREFIX)   # TData / Session импорт
+app.include_router(commenting.router, prefix=PREFIX)  # Нейрокомментинг
 
 
 # ── Healthcheck ──────────────────────────────────────────────
@@ -79,10 +82,12 @@ async def root():
             "accounts":   f"{PREFIX}/accounts",
             "proxies":    f"{PREFIX}/proxies",
             "tasks":      f"{PREFIX}/tasks",
-            "tg_auth":    f"{PREFIX}/tg-auth",      # ← Веб-авторизация TG
-            "analytics":  f"{PREFIX}/analytics",    # ← Dashboard
-            "security":   f"{PREFIX}/security",     # ← Сессии, 2FA
-            "channels":   f"{PREFIX}/channels",     # ← Каналы
+            "tg_auth":    f"{PREFIX}/tg-auth",
+            "analytics":  f"{PREFIX}/analytics",
+            "security":   f"{PREFIX}/security",
+            "channels":   f"{PREFIX}/channels",
+            "actions":    f"{PREFIX}/actions",
+            "inbox":      f"{PREFIX}/inbox",
         }
     }
 
@@ -91,3 +96,8 @@ async def root():
 # cd api && venv\Scripts\activate
 # uvicorn main:app --reload --port 8000
 # python -m celery -A celery_app worker -Q high_priority,bulk_actions --loglevel=info -P solo
+
+# Терминал 1 (API):      cd api → uvicorn main:app --reload --port 8000
+# Терминал 2 (Worker):   cd api → celery -A celery_app worker -Q high_priority,bulk_actions,ai_dialogs --loglevel=info -P solo
+# Терминал 3 (Beat):     cd api → celery -A celery_app beat --loglevel=info
+# Терминал 4 (Frontend): cd gramgpt-web → npm run dev

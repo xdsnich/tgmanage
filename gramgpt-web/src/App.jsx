@@ -7,8 +7,12 @@ import LoginPage from './pages/LoginPage'
 import RegisterPage from './pages/RegisterPage'
 import DashboardPage from './pages/DashboardPage'
 import AccountsPage from './pages/AccountsPage'
+import AccountDetailPage from './pages/AccountDetailPage'
 import ProxiesPage from './pages/ProxiesPage'
+import InboxPage from './pages/InboxPage'
 import TasksPage from './pages/TasksPage'
+import AnalyticsPage from './pages/AnalyticsPage'
+import CommentingPage from './pages/CommentingPage'
 import SettingsPage from './pages/SettingsPage'
 import { Spinner } from './components/ui'
 
@@ -34,7 +38,7 @@ export default function App() {
   return (
     <Routes>
       {/* Public */}
-      <Route path="/login"    element={<LoginPage />} />
+      <Route path="/login" element={<LoginPage />} />
       <Route path="/register" element={<RegisterPage />} />
 
       {/* Protected — всё внутри Layout */}
@@ -42,12 +46,16 @@ export default function App() {
         <PrivateRoute>
           <Layout>
             <Routes>
-              <Route path="/"         element={<DashboardPage />} />
+              <Route path="/" element={<DashboardPage />} />
               <Route path="/accounts" element={<AccountsPage />} />
-              <Route path="/proxies"  element={<ProxiesPage />} />
-              <Route path="/tasks"    element={<TasksPage />} />
+              <Route path="/accounts/:id" element={<AccountDetailPage />} />
+              <Route path="/proxies" element={<ProxiesPage />} />
+              <Route path="/inbox" element={<InboxPage />} />
+              <Route path="/tasks" element={<TasksPage />} />
+              <Route path="/analytics" element={<AnalyticsPage />} />
+              <Route path="/commenting" element={<CommentingPage />} />
               <Route path="/settings" element={<SettingsPage />} />
-              <Route path="*"         element={<Navigate to="/" replace />} />
+              <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </Layout>
         </PrivateRoute>

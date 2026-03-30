@@ -1,0 +1,391 @@
+"""
+GramGPT API — routers/commenting.py
+Нейрокомментинг: CRUD кампаний, целевые каналы, старт/стоп.
+По ТЗ раздел 3.6.
+"""
+
+from datetime import datetime
+from typing import Optional, List
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+from database import get_db
+from routers.deps import get_current_user
+from models.user import User
+from models.campaign import (
+    Campaign, TargetChannel, CampaignStatus,
+    TriggerMode, LLMProvider, CommentTone,
+)
+
+router = APIRouter(prefix="/commenting", tags=["commenting"])
+
+
+# ── Schemas ──────────────────────────────────────────────────
+
+class CampaignCreate(BaseModel):
+    name: str
+    account_ids: list[int] = []
+    trigger_mode: str = "all"
+    trigger_percent: int = 50
+    trigger_keywords: list[str] = []
+    llm_provider: str = "claude"
+    tone: str = "positive"
+    custom_prompt: str = ""
+    comment_length: str = "medium"
+    max_comments: int = 100
+    max_hours: int = 24
+    delay_join: int = 10
+    delay_comment: int = 250
+    delay_between: int = 60
+
+
+class CampaignUpdate(BaseModel):
+    name: Optional[str] = None
+    account_ids: Optional[list[int]] = None
+    trigger_mode: Optional[str] = None
+    trigger_percent: Optional[int] = None
+    trigger_keywords: Optional[list[str]] = None
+    llm_provider: Optional[str] = None
+    tone: Optional[str] = None
+    custom_prompt: Optional[str] = None
+    comment_length: Optional[str] = None
+    max_comments: Optional[int] = None
+    max_hours: Optional[int] = None
+    delay_join: Optional[int] = None
+    delay_comment: Optional[int] = None
+    delay_between: Optional[int] = None
+
+
+class AddChannelsRequest(BaseModel):
+    channels: list[str]   # Список @username или https://t.me/... ссылок
+
+
+class ChannelOut(BaseModel):
+    id: int
+    username: str
+    title: str
+    link: str
+    subscribers: int
+    has_comments: bool
+    last_post_id: int
+    comments_sent: int
+    is_active: bool
+
+    model_config = {"from_attributes": True}
+
+
+# ── Helpers ──────────────────────────────────────────────────
+
+async def _get_campaign(db, campaign_id: int, user_id: int) -> Campaign:
+    result = await db.execute(
+        select(Campaign).where(Campaign.id == campaign_id, Campaign.user_id == user_id)
+    )
+    c = result.scalar_one_or_none()
+    if not c:
+        raise HTTPException(status_code=404, detail="Кампания не найдена")
+    return c
+
+
+def _val(x):
+    """Безопасно достаёт .value из enum или возвращает строку как есть"""
+    return x.value if hasattr(x, 'value') else x
+
+
+def _campaign_to_dict(c: Campaign, channels: list = None) -> dict:
+    return {
+        "id": c.id,
+        "name": c.name,
+        "status": _val(c.status),
+        "account_ids": c.account_ids or [],
+        "trigger_mode": _val(c.trigger_mode),
+        "trigger_percent": c.trigger_percent,
+        "trigger_keywords": c.trigger_keywords or [],
+        "llm_provider": _val(c.llm_provider),
+        "tone": _val(c.tone),
+        "custom_prompt": c.custom_prompt,
+        "comment_length": c.comment_length,
+        "max_comments": c.max_comments,
+        "max_hours": c.max_hours,
+        "comments_sent": c.comments_sent,
+        "delay_join": c.delay_join,
+        "delay_comment": c.delay_comment,
+        "delay_between": c.delay_between,
+        "started_at": c.started_at.isoformat() if c.started_at else None,
+        "finished_at": c.finished_at.isoformat() if c.finished_at else None,
+        "created_at": c.created_at.isoformat(),
+        "channels": [
+            {
+                "id": ch.id, "username": ch.username, "title": ch.title,
+                "link": ch.link, "subscribers": ch.subscribers,
+                "has_comments": ch.has_comments, "comments_sent": ch.comments_sent,
+                "is_active": ch.is_active, "last_post_id": ch.last_post_id,
+            }
+            for ch in (channels or [])
+        ],
+        "channels_count": len(channels) if channels else 0,
+    }
+
+
+# ── CRUD Campaigns ───────────────────────────────────────────
+
+@router.get("/campaigns")
+async def list_campaigns(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Список всех кампаний пользователя"""
+    result = await db.execute(
+        select(Campaign).where(Campaign.user_id == current_user.id).order_by(Campaign.created_at.desc())
+    )
+    campaigns = result.scalars().all()
+
+    out = []
+    for c in campaigns:
+        ch_result = await db.execute(
+            select(TargetChannel).where(TargetChannel.campaign_id == c.id)
+        )
+        channels = ch_result.scalars().all()
+        out.append(_campaign_to_dict(c, channels))
+
+    return out
+
+
+@router.get("/campaigns/{campaign_id}")
+async def get_campaign(
+    campaign_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Детали кампании"""
+    c = await _get_campaign(db, campaign_id, current_user.id)
+    ch_result = await db.execute(
+        select(TargetChannel).where(TargetChannel.campaign_id == c.id)
+    )
+    channels = ch_result.scalars().all()
+    return _campaign_to_dict(c, channels)
+
+
+@router.post("/campaigns")
+async def create_campaign(
+    body: CampaignCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Создать новую кампанию"""
+    c = Campaign(
+        user_id=current_user.id,
+        name=body.name,
+        account_ids=body.account_ids,
+        trigger_mode=body.trigger_mode,
+        trigger_percent=body.trigger_percent,
+        trigger_keywords=body.trigger_keywords,
+        llm_provider=body.llm_provider,
+        tone=body.tone,
+        custom_prompt=body.custom_prompt,
+        comment_length=body.comment_length,
+        max_comments=body.max_comments,
+        max_hours=body.max_hours,
+        delay_join=body.delay_join,
+        delay_comment=body.delay_comment,
+        delay_between=body.delay_between,
+    )
+    db.add(c)
+    await db.flush()
+    return _campaign_to_dict(c, [])
+
+
+@router.patch("/campaigns/{campaign_id}")
+async def update_campaign(
+    campaign_id: int,
+    body: CampaignUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Обновить настройки кампании"""
+    c = await _get_campaign(db, campaign_id, current_user.id)
+
+    update_data = body.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(c, key, value)
+    c.updated_at = datetime.utcnow()
+    await db.flush()
+
+    ch_result = await db.execute(select(TargetChannel).where(TargetChannel.campaign_id == c.id))
+    return _campaign_to_dict(c, ch_result.scalars().all())
+
+
+@router.delete("/campaigns/{campaign_id}", status_code=204)
+async def delete_campaign(
+    campaign_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Удалить кампанию"""
+    c = await _get_campaign(db, campaign_id, current_user.id)
+    await db.delete(c)
+    await db.flush()
+
+
+# ── Start / Stop / Pause ─────────────────────────────────────
+
+@router.post("/campaigns/{campaign_id}/start")
+async def start_campaign(
+    campaign_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Запустить кампанию"""
+    c = await _get_campaign(db, campaign_id, current_user.id)
+
+    # Проверяем есть ли каналы
+    ch_result = await db.execute(
+        select(TargetChannel).where(TargetChannel.campaign_id == c.id, TargetChannel.is_active == True)
+    )
+    channels = ch_result.scalars().all()
+    if not channels:
+        raise HTTPException(status_code=400, detail="Добавьте целевые каналы перед запуском")
+
+    if not c.account_ids:
+        raise HTTPException(status_code=400, detail="Выберите аккаунты для комментинга")
+
+    c.status = CampaignStatus.active
+    c.started_at = datetime.utcnow()
+    c.finished_at = None
+    await db.flush()
+
+    return {"success": True, "status": "active", "message": "Кампания запущена"}
+
+
+@router.post("/campaigns/{campaign_id}/pause")
+async def pause_campaign(
+    campaign_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Поставить на паузу"""
+    c = await _get_campaign(db, campaign_id, current_user.id)
+    c.status = CampaignStatus.paused
+    await db.flush()
+    return {"success": True, "status": "paused"}
+
+
+@router.post("/campaigns/{campaign_id}/stop")
+async def stop_campaign(
+    campaign_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Остановить кампанию"""
+    c = await _get_campaign(db, campaign_id, current_user.id)
+    c.status = CampaignStatus.stopped
+    c.finished_at = datetime.utcnow()
+    await db.flush()
+    return {"success": True, "status": "stopped"}
+
+
+# ── Target Channels ──────────────────────────────────────────
+
+@router.post("/campaigns/{campaign_id}/channels")
+async def add_channels(
+    campaign_id: int,
+    body: AddChannelsRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Добавить целевые каналы в кампанию"""
+    c = await _get_campaign(db, campaign_id, current_user.id)
+
+    added = 0
+    for raw in body.channels:
+        link = raw.strip()
+        if not link:
+            continue
+
+        # Нормализуем
+        username = ""
+        if link.startswith("@"):
+            username = link[1:]
+            link = f"https://t.me/{username}"
+        elif "t.me/" in link:
+            username = link.split("t.me/")[-1].split("/")[0].replace("@", "")
+        else:
+            username = link.replace("@", "")
+            link = f"https://t.me/{username}"
+
+        # Проверяем дубликат
+        existing = await db.execute(
+            select(TargetChannel).where(
+                TargetChannel.campaign_id == c.id,
+                TargetChannel.username == username,
+            )
+        )
+        if existing.scalar_one_or_none():
+            continue
+
+        ch = TargetChannel(
+            campaign_id=c.id,
+            username=username,
+            link=link,
+            title=username,
+        )
+        db.add(ch)
+        added += 1
+
+    await db.flush()
+    return {"added": added, "message": f"Добавлено {added} каналов"}
+
+
+@router.delete("/campaigns/{campaign_id}/channels/{channel_id}", status_code=204)
+async def remove_channel(
+    campaign_id: int,
+    channel_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Удалить канал из кампании"""
+    await _get_campaign(db, campaign_id, current_user.id)
+    result = await db.execute(
+        select(TargetChannel).where(TargetChannel.id == channel_id, TargetChannel.campaign_id == campaign_id)
+    )
+    ch = result.scalar_one_or_none()
+    if ch:
+        await db.delete(ch)
+        await db.flush()
+
+
+@router.get("/campaigns/{campaign_id}/stats")
+async def campaign_stats(
+    campaign_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Статистика кампании"""
+    c = await _get_campaign(db, campaign_id, current_user.id)
+    ch_result = await db.execute(
+        select(TargetChannel).where(TargetChannel.campaign_id == c.id)
+    )
+    channels = ch_result.scalars().all()
+
+    runtime_hours = 0
+    if c.started_at:
+        end = c.finished_at or datetime.utcnow()
+        runtime_hours = round((end - c.started_at).total_seconds() / 3600, 1)
+
+    return {
+        "campaign_id": c.id,
+        "status": c.status.value,
+        "comments_sent": c.comments_sent,
+        "max_comments": c.max_comments,
+        "progress_pct": min(100, round(c.comments_sent / max(c.max_comments, 1) * 100)),
+        "runtime_hours": runtime_hours,
+        "max_hours": c.max_hours,
+        "channels_total": len(channels),
+        "channels_active": sum(1 for ch in channels if ch.is_active),
+        "per_channel": [
+            {"username": ch.username, "comments": ch.comments_sent}
+            for ch in channels
+        ],
+    }

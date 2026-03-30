@@ -2,11 +2,14 @@ import { NavLink, useNavigate } from 'react-router-dom'
 import { useAuthStore } from '../../store/authStore'
 
 const NAV = [
-  { to: '/',         emoji: '◈',  label: 'Дашборд',   color: '#7c4dff' },
-  { to: '/accounts', emoji: '◉', label: 'Аккаунты',  color: '#3d8bff' },
-  { to: '/proxies',  emoji: '◎', label: 'Прокси',    color: '#00c2b2' },
-  { to: '/tasks',    emoji: '◆', label: 'Задачи',    color: '#ff3d9a' },
-  { to: '/settings', emoji: '◐', label: 'Настройки', color: '#e3a13f' },
+  { to: '/', emoji: '◈', label: 'Дашборд', color: '#7c4dff' },
+  { to: '/accounts', emoji: '◉', label: 'Аккаунты', color: '#3d8bff' },
+  { to: '/proxies', emoji: '◎', label: 'Прокси', color: '#00c2b2' },
+  { to: '/inbox', emoji: '◆', label: 'Входящие', color: '#ff3d9a' },
+  { to: '/commenting', emoji: '🧠', label: 'Комментинг', color: '#ff6b35' },
+  { to: '/tasks', emoji: '◇', label: 'Задачи', color: '#e3a13f' },
+  { to: '/analytics', emoji: '◈', label: 'Аналитика', color: '#3dd68c' },
+  { to: '/settings', emoji: '◐', label: 'Настройки', color: '#888' },
 ]
 
 export default function Layout({ children }) {
@@ -50,7 +53,7 @@ export default function Layout({ children }) {
                 }}>GPT</span>
               </div>
               <div style={{ fontSize: 10, color: 'var(--text-3)', letterSpacing: '0.04em' }}>
-                MANAGER v0.6
+                MANAGER v0.7
               </div>
             </div>
           </div>
@@ -68,16 +71,16 @@ export default function Layout({ children }) {
               transition: 'all 0.15s', textDecoration: 'none',
               border: isActive ? '1px solid rgba(124,77,255,0.25)' : '1px solid transparent',
             })}
-            onMouseEnter={e => {
-              if (!e.currentTarget.style.background.includes('0.18')) {
-                e.currentTarget.style.background = 'rgba(255,255,255,0.04)'
-              }
-            }}
-            onMouseLeave={e => {
-              if (!e.currentTarget.style.background.includes('0.18')) {
-                e.currentTarget.style.background = 'transparent'
-              }
-            }}>
+              onMouseEnter={e => {
+                if (!e.currentTarget.style.background.includes('0.18')) {
+                  e.currentTarget.style.background = 'rgba(255,255,255,0.04)'
+                }
+              }}
+              onMouseLeave={e => {
+                if (!e.currentTarget.style.background.includes('0.18')) {
+                  e.currentTarget.style.background = 'transparent'
+                }
+              }}>
               <span style={{ fontSize: 16, lineHeight: 1, color }}>{emoji}</span>
               {label}
             </NavLink>
@@ -110,8 +113,8 @@ export default function Layout({ children }) {
               padding: 0, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4,
               opacity: 0.7, transition: 'opacity 0.15s',
             }}
-            onMouseEnter={e => e.currentTarget.style.opacity = 1}
-            onMouseLeave={e => e.currentTarget.style.opacity = 0.7}>
+              onMouseEnter={e => e.currentTarget.style.opacity = 1}
+              onMouseLeave={e => e.currentTarget.style.opacity = 0.7}>
               Выйти →
             </button>
           </div>
