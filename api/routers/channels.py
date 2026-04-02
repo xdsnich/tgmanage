@@ -1,11 +1,11 @@
 """
 GramGPT API — routers/channels.py
-Управление каналами через веб.
-По ТЗ раздел 2.3: создание, закрепление каналов.
+Управление каналами. Все подключения через make_telethon_client (с прокси).
 """
 
 import sys
 import os
+import asyncio
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -17,27 +17,9 @@ from database import get_db
 from routers.deps import get_current_user
 from models.user import User
 from models.account import TelegramAccount
+from models.proxy import Proxy
 
 router = APIRouter(prefix="/channels", tags=["channels"])
-
-
-# ── Safe CLI import ──────────────────────────────────────────
-
-def _import_channel_manager():
-    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-    if root_dir not in sys.path:
-        sys.path.insert(0, root_dir)
-
-    api_config_cache = sys.modules.pop('config', None)
-    for mod_name in ['ui', 'trust', 'channel_manager', 'tg_client']:
-        sys.modules.pop(mod_name, None)
-
-    try:
-        import channel_manager as ch
-        return ch
-    finally:
-        if api_config_cache:
-            sys.modules['config'] = api_config_cache
 
 
 # ── Schemas ──────────────────────────────────────────────────
@@ -48,21 +30,14 @@ class CreateChannelRequest(BaseModel):
     description: str = ""
     username: str = ""
 
-
 class BatchCreateRequest(BaseModel):
     account_ids: list[int]
     title_template: str
     description: str = ""
     delay: float = 4.0
 
-
 class PinChannelRequest(BaseModel):
     account_id: int
-    channel_link: str
-
-
-class PinExistingRequest(BaseModel):
-    account_ids: list[int]
     channel_link: str
 
 
@@ -81,13 +56,22 @@ async def _get_account(db, account_id, user_id) -> TelegramAccount:
     return acc
 
 
-def _to_dict(a: TelegramAccount) -> dict:
-    return {
-        "phone": a.phone,
-        "session_file": a.session_file,
-        "channels": a.channels or [],
-        "first_name": a.first_name or "",
-    }
+async def _get_client(acc, db):
+    """Создаёт TelegramClient С ПРОКСИ"""
+    api_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if api_dir not in sys.path:
+        sys.path.insert(0, api_dir)
+    from utils.telegram import make_telethon_client
+
+    proxy = None
+    if acc.proxy_id:
+        proxy_r = await db.execute(select(Proxy).where(Proxy.id == acc.proxy_id))
+        proxy = proxy_r.scalar_one_or_none()
+
+    client = make_telethon_client(acc, proxy)
+    if not client:
+        raise HTTPException(status_code=400, detail="Файл сессии не найден")
+    return client
 
 
 # ── Endpoints ────────────────────────────────────────────────
@@ -100,18 +84,41 @@ async def get_my_channels(
 ):
     """Список каналов которыми владеет аккаунт"""
     acc = await _get_account(db, account_id, current_user.id)
+    client = await _get_client(acc, db)
 
+    channels = []
     try:
-        ch = _import_channel_manager()
-        channels = await ch.get_my_channels(_to_dict(acc))
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            return {"account_id": account_id, "channels": []}
+
+        from telethon.tl.types import Channel
+        dialogs = await client.get_dialogs()
+
+        for dialog in dialogs:
+            entity = dialog.entity
+            if isinstance(entity, Channel) and entity.broadcast and entity.creator:
+                link = f"https://t.me/{entity.username}" if entity.username else f"id{entity.id}"
+                channels.append({
+                    "id": entity.id,
+                    "title": entity.title,
+                    "username": entity.username or "",
+                    "link": link,
+                    "members": getattr(entity, "participants_count", 0),
+                })
 
         if channels:
             acc.channels = channels
             await db.flush()
 
+        await client.disconnect()
         return {"account_id": account_id, "channels": channels}
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
+        try: await client.disconnect()
+        except: pass
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)[:200]}")
 
 
 @router.post("/create")
@@ -120,26 +127,95 @@ async def create_channel(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Создать новый канал от имени аккаунта"""
+    """Создать канал от имени аккаунта"""
     acc = await _get_account(db, body.account_id, current_user.id)
+    client = await _get_client(acc, db)
 
     try:
-        ch = _import_channel_manager()
-        channel = await ch.create_channel(_to_dict(acc), body.title, body.description, body.username)
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            raise HTTPException(status_code=400, detail="Сессия не активна")
 
-        if not channel:
-            raise HTTPException(status_code=500, detail="Не удалось создать канал")
+        from telethon.tl.functions.channels import CreateChannelRequest as TgCreateChannel, UpdateUsernameRequest
+        from telethon import errors
+
+        result = await client(TgCreateChannel(
+            title=body.title, about=body.description,
+            broadcast=True, megagroup=False,
+        ))
+
+        channel = result.chats[0]
+        channel_link = f"https://t.me/{channel.username}" if channel.username else f"id{channel.id}"
+
+        if body.username:
+            try:
+                await client(UpdateUsernameRequest(channel=channel, username=body.username))
+                channel_link = f"https://t.me/{body.username}"
+            except errors.UsernameInvalidError:
+                pass
+
+        channel_data = {
+            "id": channel.id, "title": body.title,
+            "username": body.username, "link": channel_link,
+            "description": body.description,
+        }
 
         channels = acc.channels or []
-        channels.append(channel)
+        channels.append(channel_data)
         acc.channels = channels
         await db.flush()
+        await client.disconnect()
 
-        return {"success": True, "channel": channel}
-    except HTTPException:
-        raise
+        return {"success": True, "channel": channel_data}
+
+    except HTTPException: raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
+        try: await client.disconnect()
+        except: pass
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)[:200]}")
+
+
+@router.post("/pin")
+async def pin_channel(
+    body: PinChannelRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Закрепить канал в профиле"""
+    acc = await _get_account(db, body.account_id, current_user.id)
+    client = await _get_client(acc, db)
+
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            raise HTTPException(status_code=400, detail="Сессия не активна")
+
+        link = body.channel_link
+        if link.startswith("@"): link = f"https://t.me/{link[1:]}"
+        elif not link.startswith("http"): link = f"https://t.me/{link}"
+
+        entity = await client.get_entity(link)
+
+        from telethon.tl.functions.account import UpdatePersonalChannelRequest
+        await client(UpdatePersonalChannelRequest(channel=entity))
+
+        channels = acc.channels or []
+        existing = next((c for c in channels if c.get("link") == link), None)
+        if not existing:
+            channels.append({"id": entity.id, "title": getattr(entity, 'title', ''), "link": link})
+            acc.channels = channels
+            await db.flush()
+
+        await client.disconnect()
+        return {"success": True, "message": f"Канал {link} закреплён"}
+
+    except HTTPException: raise
+    except Exception as e:
+        try: await client.disconnect()
+        except: pass
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)[:200]}")
 
 
 @router.post("/batch-create")
@@ -156,59 +232,13 @@ async def batch_create_channels(
         )
     )
     accounts = result.scalars().all()
-    accounts_data = [_to_dict(a) for a in accounts]
 
-    try:
-        from celery import current_app
-        task = current_app.send_task(
-            "tasks.bulk_tasks.create_channels_bulk",
-            args=[accounts_data, body.title_template, body.description, body.delay],
-            queue="bulk_actions",
-        )
-        return {"task_id": task.id, "total": len(accounts_data), "message": f"Создание каналов для {len(accounts_data)} аккаунтов запущено"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Celery недоступен: {str(e)}")
+    from celery import current_app
+    accounts_data = [{"phone": a.phone, "session_file": a.session_file, "channels": a.channels or [], "first_name": a.first_name or ""} for a in accounts]
 
-
-@router.post("/pin")
-async def pin_channel(
-    body: PinChannelRequest,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Закрепить канал в профиле аккаунта"""
-    acc = await _get_account(db, body.account_id, current_user.id)
-
-    try:
-        ch = _import_channel_manager()
-        ok = await ch.pin_channel_to_profile(_to_dict(acc), body.channel_link)
-        return {"success": ok, "account_id": body.account_id, "channel_link": body.channel_link}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
-
-
-@router.post("/pin-existing")
-async def pin_existing_channel(
-    body: PinExistingRequest,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Закрепить существующий канал на несколько аккаунтов"""
-    result = await db.execute(
-        select(TelegramAccount).where(
-            TelegramAccount.user_id == current_user.id,
-            TelegramAccount.id.in_(body.account_ids),
-        )
+    task = current_app.send_task(
+        "tasks.bulk_tasks.create_channels_bulk",
+        args=[accounts_data, body.title_template, body.description, body.delay],
+        queue="bulk_actions",
     )
-    accounts = result.scalars().all()
-
-    try:
-        ch = _import_channel_manager()
-        results = []
-        for acc in accounts:
-            ok = await ch.pin_existing_channel(_to_dict(acc), body.channel_link)
-            results.append({"phone": acc.phone, "success": ok})
-
-        return {"channel_link": body.channel_link, "results": results, "success_count": sum(1 for r in results if r["success"])}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
+    return {"task_id": task.id, "total": len(accounts_data)}

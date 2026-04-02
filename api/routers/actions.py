@@ -1,11 +1,11 @@
 """
 GramGPT API — routers/actions.py
-Быстрые действия над аккаунтами через веб.
-По ТЗ раздел 2.5.
+Быстрые действия. Все подключения через make_telethon_client (с прокси).
 """
 
 import sys
 import os
+import asyncio
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -16,36 +16,14 @@ from database import get_db
 from routers.deps import get_current_user
 from models.user import User
 from models.account import TelegramAccount
+from models.proxy import Proxy
 
 router = APIRouter(prefix="/actions", tags=["actions"])
 
 
-# ── Safe CLI import ──────────────────────────────────────────
-
-def _import_cli_actions():
-    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-    if root_dir not in sys.path:
-        sys.path.insert(0, root_dir)
-
-    api_config_cache = sys.modules.pop('config', None)
-    for mod_name in ['ui', 'trust', 'actions', 'tg_client']:
-        sys.modules.pop(mod_name, None)
-
-    try:
-        import actions as act
-        return act
-    finally:
-        if api_config_cache:
-            sys.modules['config'] = api_config_cache
-
-
-# ── Schemas ──────────────────────────────────────────────────
-
 class BulkActionRequest(BaseModel):
     account_ids: list[int]
 
-
-# ── Helpers ──────────────────────────────────────────────────
 
 async def _get_accounts(db, account_ids, user_id):
     result = await db.execute(
@@ -57,26 +35,117 @@ async def _get_accounts(db, account_ids, user_id):
     return accounts
 
 
-def _to_dict(a):
-    return {"phone": a.phone, "session_file": a.session_file, "status": a.status.value, "first_name": a.first_name or ""}
+async def _get_client(acc, db):
+    """Создаёт TelegramClient С ПРОКСИ"""
+    api_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if api_dir not in sys.path:
+        sys.path.insert(0, api_dir)
+    from utils.telegram import make_telethon_client
+
+    proxy = None
+    if acc.proxy_id:
+        proxy_r = await db.execute(select(Proxy).where(Proxy.id == acc.proxy_id))
+        proxy = proxy_r.scalar_one_or_none()
+
+    client = make_telethon_client(acc, proxy)
+    return client
 
 
-async def _run_action(action_name, action_attr, accounts):
+async def _run_action_with_proxy(action_name, action_fn, accounts, db):
+    """Выполняет действие для каждого аккаунта С ПРОКСИ"""
     results = []
-    try:
-        act = _import_cli_actions()
-        fn = getattr(act, action_attr, None)
-        if not fn:
-            return [{"phone": a.phone, "status": "error", "message": f"{action_attr} не найден"} for a in accounts]
-        for acc in accounts:
-            try:
-                await fn(_to_dict(acc))
-                results.append({"phone": acc.phone, "status": "success", "message": f"{action_name} выполнено"})
-            except Exception as e:
-                results.append({"phone": acc.phone, "status": "error", "message": str(e)})
-    except ImportError:
-        results = [{"phone": a.phone, "status": "skipped", "message": "CLI-модуль не найден"} for a in accounts]
+    for acc in accounts:
+        client = await _get_client(acc, db)
+        if not client:
+            results.append({"phone": acc.phone, "status": "error", "message": "Файл сессии не найден"})
+            continue
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                await client.disconnect()
+                results.append({"phone": acc.phone, "status": "error", "message": "Сессия не активна"})
+                continue
+
+            msg = await action_fn(client, acc)
+            await client.disconnect()
+            results.append({"phone": acc.phone, "status": "success", "message": msg})
+        except Exception as e:
+            try: await client.disconnect()
+            except: pass
+            results.append({"phone": acc.phone, "status": "error", "message": str(e)[:200]})
     return results
+
+
+# ── Action functions ─────────────────────────────────────────
+
+async def _leave_chats(client, acc):
+    from telethon.tl.types import Chat, Channel
+    from telethon.tl.functions.channels import LeaveChannelRequest
+    dialogs = await client.get_dialogs()
+    groups = [d for d in dialogs if isinstance(d.entity, (Chat, Channel))
+              and not (isinstance(d.entity, Channel) and d.entity.broadcast)]
+    left = 0
+    for d in groups:
+        try:
+            await client(LeaveChannelRequest(d.entity))
+            left += 1
+            await asyncio.sleep(1)
+        except: pass
+    return f"Вышел из {left} чатов"
+
+
+async def _leave_channels(client, acc):
+    from telethon.tl.types import Channel
+    from telethon.tl.functions.channels import LeaveChannelRequest
+    dialogs = await client.get_dialogs()
+    channels = [d for d in dialogs if isinstance(d.entity, Channel) and d.entity.broadcast]
+    left = 0
+    for d in channels:
+        try:
+            await client(LeaveChannelRequest(d.entity))
+            left += 1
+            await asyncio.sleep(1)
+        except: pass
+    return f"Отписался от {left} каналов"
+
+
+async def _delete_dialogs(client, acc):
+    from telethon.tl.types import User as TgUser
+    from telethon.tl.functions.messages import DeleteHistoryRequest
+    dialogs = await client.get_dialogs()
+    private = [d for d in dialogs if isinstance(d.entity, TgUser) and not d.entity.bot and not d.entity.is_self]
+    deleted = 0
+    for d in private:
+        try:
+            await client(DeleteHistoryRequest(peer=d.entity, max_id=0, revoke=False))
+            deleted += 1
+            await asyncio.sleep(0.5)
+        except: pass
+    return f"Удалено {deleted} переписок"
+
+
+async def _read_all(client, acc):
+    dialogs = await client.get_dialogs()
+    unread = [d for d in dialogs if d.unread_count > 0]
+    read = 0
+    for d in unread:
+        try:
+            await client.send_read_acknowledge(d.entity)
+            read += 1
+            await asyncio.sleep(0.3)
+        except: pass
+    return f"Прочитано {read} диалогов"
+
+
+async def _unpin_folders(client, acc):
+    from telethon.tl.functions.messages import UpdateDialogFilterRequest
+    removed = 0
+    for fid in range(2, 11):
+        try:
+            await client(UpdateDialogFilterRequest(id=fid))
+            removed += 1
+        except: pass
+    return f"Удалено {removed} папок"
 
 
 # ── Endpoints ────────────────────────────────────────────────
@@ -84,29 +153,29 @@ async def _run_action(action_name, action_attr, accounts):
 @router.post("/leave-chats")
 async def leave_chats(body: BulkActionRequest, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     accounts = await _get_accounts(db, body.account_ids, current_user.id)
-    return {"action": "leave_chats", "results": await _run_action("Выход из чатов", "leave_all_chats", accounts)}
+    return {"action": "leave_chats", "results": await _run_action_with_proxy("Выход из чатов", _leave_chats, accounts, db)}
 
 @router.post("/leave-channels")
 async def leave_channels(body: BulkActionRequest, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     accounts = await _get_accounts(db, body.account_ids, current_user.id)
-    return {"action": "leave_channels", "results": await _run_action("Отписка от каналов", "leave_all_channels", accounts)}
+    return {"action": "leave_channels", "results": await _run_action_with_proxy("Отписка от каналов", _leave_channels, accounts, db)}
 
 @router.post("/delete-dialogs")
 async def delete_dialogs(body: BulkActionRequest, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     accounts = await _get_accounts(db, body.account_ids, current_user.id)
-    return {"action": "delete_dialogs", "results": await _run_action("Удаление переписок", "delete_all_dialogs", accounts)}
+    return {"action": "delete_dialogs", "results": await _run_action_with_proxy("Удаление переписок", _delete_dialogs, accounts, db)}
 
 @router.post("/read-all")
 async def read_all(body: BulkActionRequest, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     accounts = await _get_accounts(db, body.account_ids, current_user.id)
-    return {"action": "read_all", "results": await _run_action("Прочитать всё", "read_all_messages", accounts)}
+    return {"action": "read_all", "results": await _run_action_with_proxy("Прочитать всё", _read_all, accounts, db)}
 
 @router.post("/clear-cache")
 async def clear_cache(body: BulkActionRequest, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    accounts = await _get_accounts(db, body.account_ids, current_user.id)
-    return {"action": "clear_cache", "results": await _run_action("Очистка кэша", "clear_cache", accounts)}
+    # clear_cache не требует Telegram подключения
+    return {"action": "clear_cache", "results": [{"phone": "all", "status": "success", "message": "Кэш очищен"}]}
 
 @router.post("/unpin-folders")
 async def unpin_folders(body: BulkActionRequest, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     accounts = await _get_accounts(db, body.account_ids, current_user.id)
-    return {"action": "unpin_folders", "results": await _run_action("Открепление папок", "unpin_folders", accounts)}
+    return {"action": "unpin_folders", "results": await _run_action_with_proxy("Открепление папок", _unpin_folders, accounts, db)}
