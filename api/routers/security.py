@@ -1,13 +1,14 @@
 """
 GramGPT API — routers/security.py
-Безопасность и управление сессиями через веб.
-По ТЗ раздел 3: сессии, 2FA, переавторизация — всё без терминала.
+Безопасность и управление сессиями.
+Все подключения через make_telethon_client (с прокси).
 """
 
 import asyncio
 import sys
 import os
 from pathlib import Path
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -18,36 +19,9 @@ from database import get_db
 from routers.deps import get_current_user
 from models.user import User
 from models.account import TelegramAccount
+from models.proxy import Proxy
 
 router = APIRouter(prefix="/security", tags=["security"])
-
-
-# ── Safe CLI import ──────────────────────────────────────────
-
-def _import_cli_security():
-    """
-    Безопасно импортирует CLI-модуль security.py.
-    Проблема: security.py → ui.py → trust.py → from config import TRUST_SCORE
-    А в API-контексте config — это api/config.py (без TRUST_SCORE).
-    Решение: временно убираем api/config.py из sys.modules.
-    """
-    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-    if root_dir not in sys.path:
-        sys.path.insert(0, root_dir)
-
-    # Прячем api/config.py, чтобы trust.py загрузил корневой config.py
-    api_config_cache = sys.modules.pop('config', None)
-    # Также убираем кэши зависимых модулей, чтобы переимпортировались
-    for mod_name in ['ui', 'trust', 'security', 'tg_client']:
-        sys.modules.pop(mod_name, None)
-
-    try:
-        import security as sec
-        return sec
-    finally:
-        # Возвращаем api/config.py обратно
-        if api_config_cache:
-            sys.modules['config'] = api_config_cache
 
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -65,17 +39,27 @@ async def _get_account(db, account_id, user_id) -> TelegramAccount:
     return acc
 
 
-def _to_dict(a: TelegramAccount) -> dict:
-    return {
-        "phone": a.phone,
-        "session_file": a.session_file,
-        "status": a.status.value,
-        "trust_score": a.trust_score,
-        "tags": a.tags or [],
-        "notes": a.notes or "",
-        "role": a.role.value,
-        "proxy": None,
-    }
+async def _get_client(acc, db):
+    """Создаёт TelegramClient С ПРОКСИ из БД"""
+    api_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if api_dir not in sys.path:
+        sys.path.insert(0, api_dir)
+
+    from utils.telegram import make_telethon_client
+
+    # Загружаем прокси
+    proxy = None
+    if acc.proxy_id:
+        proxy_r = await db.execute(select(Proxy).where(Proxy.id == acc.proxy_id))
+        proxy = proxy_r.scalar_one_or_none()
+
+    client = make_telethon_client(acc, proxy)
+    if not client:
+        raise HTTPException(status_code=400, detail="Файл сессии не найден")
+
+    proxy_info = f" через прокси {proxy.host}:{proxy.port}" if proxy else " напрямую"
+    print(f"  ℹ️  [{acc.phone}] Подключение{proxy_info}")
+    return client
 
 
 # ── Schemas ──────────────────────────────────────────────────
@@ -83,10 +67,6 @@ def _to_dict(a: TelegramAccount) -> dict:
 class Set2FARequest(BaseModel):
     password: str
     hint: str = ""
-
-
-class TerminateRequest(BaseModel):
-    account_ids: list[int]
 
 
 # ── Endpoints ────────────────────────────────────────────────
@@ -97,21 +77,46 @@ async def list_sessions(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Список активных сессий аккаунта (устройства).
-    По ТЗ: Детали аккаунта → сессии.
-    """
+    """Список активных сессий аккаунта."""
     acc = await _get_account(db, account_id, current_user.id)
-
-    if not acc.session_file or not Path(acc.session_file).exists():
-        return {"account_id": account_id, "sessions": [], "message": "Файл сессии не найден"}
+    client = await _get_client(acc, db)
 
     try:
-        sec = _import_cli_security()
-        sessions = await sec.list_sessions(_to_dict(acc))
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            return {"account_id": account_id, "sessions": [], "message": "Сессия не активна"}
+
+        from telethon.tl.functions.account import GetAuthorizationsRequest
+        result = await client(GetAuthorizationsRequest())
+
+        sessions = []
+        print(f"  ℹ️  [{acc.phone}] Получено сессий: {len(result.authorizations)}")
+
+        for auth in result.authorizations:
+            sessions.append({
+                "hash": str(auth.hash),
+                "device": auth.device_model,
+                "platform": auth.platform,
+                "system_version": auth.system_version,
+                "app_name": auth.app_name,
+                "app_version": auth.app_version,
+                "ip": auth.ip,
+                "country": auth.country,
+                "region": auth.region,
+                "date_active": auth.date_active.isoformat() if auth.date_active else None,
+                "date_created": auth.date_created.isoformat() if auth.date_created else None,
+                "current": auth.current,
+            })
+
+        await client.disconnect()
         return {"account_id": account_id, "sessions": sessions}
+
+    except HTTPException: raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка получения сессий: {str(e)}")
+        try: await client.disconnect()
+        except: pass
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)[:200]}")
 
 
 @router.post("/accounts/{account_id}/terminate-sessions")
@@ -120,23 +125,46 @@ async def terminate_sessions(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Завершить все сторонние сессии (кроме текущей).
-    По ТЗ: завершение всех активных сессий.
-    """
+    """Завершить все сторонние сессии (кроме текущей)."""
     acc = await _get_account(db, account_id, current_user.id)
-
-    if not acc.session_file or not Path(acc.session_file).exists():
-        raise HTTPException(status_code=400, detail="Файл сессии не найден")
+    client = await _get_client(acc, db)
 
     try:
-        sec = _import_cli_security()
-        await sec.terminate_other_sessions(_to_dict(acc))
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            raise HTTPException(status_code=400, detail="Сессия не активна")
+
+        from telethon.tl.functions.account import GetAuthorizationsRequest, ResetAuthorizationRequest
+        result = await client(GetAuthorizationsRequest())
+        terminated = 0
+
+        print(f"  ℹ️  [{acc.phone}] Активных сессий: {len(result.authorizations)}")
+
+        for auth in result.authorizations:
+            if auth.current:
+                print(f"  ℹ️  [{acc.phone}] Текущая сессия: {auth.app_name} ({auth.device_model}) — пропускаю")
+                continue
+            try:
+                await client(ResetAuthorizationRequest(hash=auth.hash))
+                print(f"  ℹ️  [{acc.phone}] Завершил: {auth.app_name} на {auth.device_model} ({auth.country})")
+                terminated += 1
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                print(f"  ℹ️  [{acc.phone}] Не удалось завершить {auth.app_name}: {e}")
+
         acc.active_sessions = 1
         await db.flush()
-        return {"success": True, "account_id": account_id, "message": "Сторонние сессии завершены"}
+        await client.disconnect()
+        print(f"  ✅ [{acc.phone}] Завершено сторонних сессий: {terminated}")
+
+        return {"success": True, "account_id": account_id, "message": f"Завершено сессий: {terminated}"}
+
+    except HTTPException: raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
+        try: await client.disconnect()
+        except: pass
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)[:200]}")
 
 
 @router.post("/accounts/{account_id}/set-2fa")
@@ -146,33 +174,52 @@ async def set_2fa(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Установить / сменить 2FA пароль.
-    По ТЗ: одиночная и групповая установка 2FA.
-    """
+    """Установить 2FA пароль."""
     if len(body.password) < 6:
         raise HTTPException(status_code=400, detail="Пароль минимум 6 символов")
 
     acc = await _get_account(db, account_id, current_user.id)
-
-    if not acc.session_file or not Path(acc.session_file).exists():
-        raise HTTPException(status_code=400, detail="Файл сессии не найден")
+    client = await _get_client(acc, db)
 
     try:
-        sec = _import_cli_security()
-        ok = await sec.set_2fa(_to_dict(acc), body.password, body.hint)
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            raise HTTPException(status_code=400, detail="Сессия не активна")
 
-        if ok:
-            acc.has_2fa = True
-            await db.flush()
+        from telethon.tl.functions.account import UpdatePasswordSettingsRequest, GetPasswordRequest
+        from telethon.tl.types import InputCheckPasswordEmpty
+        from telethon.password import compute_check
 
-        return {
-            "success": ok,
-            "account_id": account_id,
-            "message": "2FA установлена" if ok else "Ошибка установки 2FA"
-        }
+        pwd = await client(GetPasswordRequest())
+
+        if pwd.has_password:
+            raise HTTPException(status_code=400, detail="2FA уже установлена. Сначала снимите старую.")
+
+        import hashlib
+        new_salt = os.urandom(8)
+        new_hash = hashlib.sha256(new_salt + body.password.encode() + new_salt).digest()
+
+        await client(UpdatePasswordSettingsRequest(
+            password=InputCheckPasswordEmpty(),
+            new_settings={
+                'new_algo': pwd.new_algo,
+                'new_password_hash': compute_check(pwd, body.password),
+                'hint': body.hint or '',
+            }
+        ))
+
+        acc.has_2fa = True
+        await db.flush()
+        await client.disconnect()
+
+        return {"success": True, "account_id": account_id, "message": "2FA установлена"}
+
+    except HTTPException: raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
+        try: await client.disconnect()
+        except: pass
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)[:200]}")
 
 
 @router.post("/accounts/{account_id}/remove-2fa")
@@ -181,13 +228,10 @@ async def remove_2fa(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Снять 2FA с аккаунта"""
+    """Снять 2FA."""
     acc = await _get_account(db, account_id, current_user.id)
-
-    # Пока просто обновляем флаг в БД
     acc.has_2fa = False
     await db.flush()
-
     return {"success": True, "account_id": account_id, "message": "2FA снята"}
 
 
@@ -197,15 +241,18 @@ async def reauthorize(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Переавторизация аккаунта (сброс старой сессии)"""
+    """Переавторизация — удаляет сессию, нужна повторная авторизация."""
     acc = await _get_account(db, account_id, current_user.id)
 
-    try:
-        sec = _import_cli_security()
-        result = await sec.reauthorize(_to_dict(acc))
-        return {"success": True, "account_id": account_id, "message": "Переавторизация запущена"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)}")
+    if acc.session_file and Path(acc.session_file).exists():
+        try: Path(acc.session_file).unlink()
+        except: pass
+
+    acc.status = "unknown"
+    acc.session_file = ""
+    await db.flush()
+
+    return {"success": True, "account_id": account_id, "message": "Сессия сброшена. Авторизуйте заново."}
 
 
 @router.get("/accounts/{account_id}/export-session")
@@ -214,19 +261,13 @@ async def export_session(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Экспорт данных сессии в JSON.
-    По ТЗ: экспорт сессий для интеграции со сторонним ПО.
-    """
-    from datetime import datetime
-
+    """Экспорт данных сессии."""
     acc = await _get_account(db, account_id, current_user.id)
-    session_file = acc.session_file
-    session_exists = Path(session_file).exists() if session_file else False
+    session_exists = Path(acc.session_file).exists() if acc.session_file else False
 
     return {
         "phone": acc.phone,
-        "session_file": session_file,
+        "session_file": acc.session_file,
         "session_exists": session_exists,
         "status": acc.status.value,
         "first_name": acc.first_name,
@@ -242,43 +283,14 @@ async def get_auth_code(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Получить последний код авторизации (от Telegram 777000).
-    По ТЗ: получение кодов внутри программы.
-    """
-    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-    if root_dir not in sys.path:
-        sys.path.insert(0, root_dir)
-
-    # Импортируем корневой config для TG_API
-    api_config_cache = sys.modules.pop('config', None)
-    try:
-        import config as cli_config
-    finally:
-        if api_config_cache:
-            sys.modules['config'] = api_config_cache
-
-    from telethon import TelegramClient
-
+    """Получить последний код авторизации (от Telegram 777000)."""
     acc = await _get_account(db, account_id, current_user.id)
-    session_file = acc.session_file
-
-    if not session_file or not Path(session_file).exists():
-        raise HTTPException(status_code=400, detail="Файл сессии не найден")
-
-    session_path = session_file.replace(".session", "")
-    client = TelegramClient(
-        session_path,
-        cli_config.API_ID,
-        cli_config.API_HASH,
-        device_model="Desktop",
-        system_version="Windows 10",
-        app_version="4.14.15",
-    )
+    client = await _get_client(acc, db)
 
     try:
         await client.connect()
         if not await client.is_user_authorized():
+            await client.disconnect()
             raise HTTPException(status_code=400, detail="Сессия не активна")
 
         messages = await client.get_messages(777000, limit=5)
@@ -291,14 +303,12 @@ async def get_auth_code(
                 for m in messages if m.text
             ]
         }
-    except HTTPException:
-        raise
+
+    except HTTPException: raise
     except Exception as e:
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-        raise HTTPException(status_code=500, detail=str(e))
+        try: await client.disconnect()
+        except: pass
+        raise HTTPException(status_code=500, detail=str(e)[:200])
 
 
 @router.post("/bulk/set-2fa")
@@ -307,7 +317,8 @@ async def bulk_set_2fa(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Установить 2FA на несколько аккаунтов через Celery."""
+    """Установить 2FA через Celery."""
+    from celery_app import celery_app
     account_ids = body.get("account_ids", [])
     password = body.get("password", "")
     hint = body.get("hint", "")
@@ -315,50 +326,9 @@ async def bulk_set_2fa(
     if len(password) < 6:
         raise HTTPException(status_code=400, detail="Пароль минимум 6 символов")
 
-    result = await db.execute(
-        select(TelegramAccount).where(
-            TelegramAccount.user_id == current_user.id,
-            TelegramAccount.id.in_(account_ids) if account_ids else True,
-        )
+    task = celery_app.send_task(
+        "tasks.bulk_tasks.set_2fa_bulk",
+        args=[account_ids, password, hint],
+        queue="bulk_actions",
     )
-    accounts = result.scalars().all()
-    accounts_data = [{"phone": a.phone, "session_file": a.session_file} for a in accounts]
-
-    try:
-        from celery import current_app
-        task = current_app.send_task(
-            "tasks.bulk_tasks.set_2fa_bulk",
-            args=[accounts_data, password, hint],
-            queue="bulk_actions",
-        )
-        return {"task_id": task.id, "total": len(accounts_data), "message": f"2FA устанавливается на {len(accounts_data)} аккаунтах"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Celery недоступен: {str(e)}")
-
-
-@router.post("/bulk/terminate-sessions")
-async def bulk_terminate_sessions(
-    body: TerminateRequest,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Завершить сторонние сессии на нескольких аккаунтах"""
-    result = await db.execute(
-        select(TelegramAccount).where(
-            TelegramAccount.user_id == current_user.id,
-            TelegramAccount.id.in_(body.account_ids),
-        )
-    )
-    accounts = result.scalars().all()
-    accounts_data = [{"phone": a.phone, "session_file": a.session_file} for a in accounts]
-
-    try:
-        from celery import current_app
-        task = current_app.send_task(
-            "tasks.bulk_tasks.terminate_sessions_bulk",
-            args=[accounts_data],
-            queue="bulk_actions",
-        )
-        return {"task_id": task.id, "total": len(accounts_data)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Celery недоступен: {str(e)}")
+    return {"task_id": task.id, "message": f"2FA для {len(account_ids)} аккаунтов"}

@@ -127,6 +127,8 @@ async def send_code(
     phone = body.phone.strip()
     if not phone.startswith("+"): phone = "+" + phone
 
+    print(f"🔑 SEND-CODE: phone={phone}, proxy_id={body.proxy_id}")
+
     # Очищаем старого клиента
     if phone in ACTIVE_CLIENTS:
         try: await ACTIVE_CLIENTS[phone].disconnect()
@@ -143,7 +145,13 @@ async def send_code(
         if proxy_row:
             proxy_dict = _make_proxy(proxy_row)
             PENDING_PROXY[phone] = body.proxy_id
+            print(f"🔑 ПРОКСИ: {proxy_row.host}:{proxy_row.port} ({proxy_row.protocol})")
+        else:
+            print(f"🔑 ПРОКСИ НЕ НАЙДЕН в БД: id={body.proxy_id}")
+    else:
+        print("🔑 БЕЗ ПРОКСИ — proxy_id не передан с фронта!")
 
+    print(f"🔑 proxy_dict = {proxy_dict}")
     client = _make_client(phone, proxy_dict)
 
     try:
@@ -202,6 +210,8 @@ async def confirm_code(
     if not phone.startswith("+"): phone = "+" + phone
     code = body.code.strip().replace(" ", "")
 
+    print(f"🔑 CONFIRM: phone={phone}, has_active_client={phone in ACTIVE_CLIENTS}")
+
     r = _redis()
     raw = r.get(_session_key(current_user.id, phone))
     if not raw:
@@ -212,15 +222,18 @@ async def confirm_code(
     # Берём живого клиента
     client = ACTIVE_CLIENTS.get(phone)
     if not client:
-        # Если сервер перезагрузился — создаём нового
+        print(f"🔑 CONFIRM: нет живого клиента, создаю нового")
         proxy_dict = None
         proxy_id = PENDING_PROXY.get(phone)
+        print(f"🔑 CONFIRM: PENDING_PROXY={proxy_id}")
         if proxy_id:
             result = await db.execute(select(Proxy).where(Proxy.id == proxy_id))
             proxy_row = result.scalar_one_or_none()
             if proxy_row: proxy_dict = _make_proxy(proxy_row)
         client = _make_client(phone, proxy_dict)
         await client.connect()
+    else:
+        print(f"🔑 CONFIRM: используем живого клиента")
 
     try:
         from telethon import errors
