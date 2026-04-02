@@ -51,33 +51,21 @@ async def _get_account(db, account_id: int, user_id: int) -> TelegramAccount:
     return acc
 
 
-def _get_telethon_client(acc: TelegramAccount):
-    """Создаёт Telethon клиент для аккаунта"""
-    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-    if root_dir not in sys.path:
-        sys.path.insert(0, root_dir)
+def _get_telethon_client(acc):
+    """Создаёт Telethon клиент для аккаунта с прокси"""
+    api_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if api_dir not in sys.path:
+        sys.path.insert(0, api_dir)
 
-    api_config_cache = sys.modules.pop('config', None)
-    try:
-        import config as cli_config
-    finally:
-        if api_config_cache:
-            sys.modules['config'] = api_config_cache
+    from utils.telegram import make_telethon_client, get_cli_config
+    cli_config = get_cli_config()
 
-    from telethon import TelegramClient
+    # Загружаем прокси через relationship (если есть)
+    proxy = None
+    if hasattr(acc, 'proxy') and acc.proxy:
+        proxy = acc.proxy
 
-    session_path = acc.session_file.replace(".session", "") if acc.session_file else ""
-    if not session_path or not Path(acc.session_file).exists():
-        return None, cli_config
-
-    client = TelegramClient(
-        session_path,
-        cli_config.API_ID,
-        cli_config.API_HASH,
-        device_model="Desktop",
-        system_version="Windows 10",
-        app_version="4.14.15",
-    )
+    client = make_telethon_client(acc, proxy)
     return client, cli_config
 
 
@@ -185,7 +173,7 @@ async def get_messages(
                 "message": m.text,
                 "from": "me" if m.out else "them",
                 "is_outgoing": m.out,
-                "is_ai": False,  # TODO: отмечать ИИ-ответы
+                "is_ai": False,
                 "time": m.date.isoformat() if m.date else None,
             })
 

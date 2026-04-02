@@ -121,3 +121,24 @@ class TargetChannel(Base):
 
     def __repr__(self):
         return f"<TargetChannel @{self.username} in campaign={self.campaign_id}>"
+
+
+# ── Comment Log ──────────────────────────────────────────────
+
+class CommentLog(Base):
+    __tablename__ = "comment_logs"
+
+    id:             Mapped[int]              = mapped_column(Integer, primary_key=True)
+    campaign_id:    Mapped[int]              = mapped_column(ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True)
+    account_id:     Mapped[int]              = mapped_column(Integer, nullable=False)
+    account_phone:  Mapped[str]              = mapped_column(String(32), default="")
+    channel_username: Mapped[str]            = mapped_column(String(128), default="")
+    channel_title:  Mapped[str]              = mapped_column(String(256), default="")
+    post_id:        Mapped[int]              = mapped_column(Integer, default=0)
+    post_text:      Mapped[str]              = mapped_column(Text, default="")
+    comment_text:   Mapped[str]              = mapped_column(Text, default="")
+    llm_provider:   Mapped[str]              = mapped_column(String(32), default="")
+    created_at:     Mapped[datetime]         = mapped_column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<CommentLog campaign={self.campaign_id} @{self.channel_username}>"

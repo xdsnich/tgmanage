@@ -389,3 +389,37 @@ async def campaign_stats(
             for ch in channels
         ],
     }
+
+
+# ── Лог комментариев ────────────────────────────────────────
+
+@router.get("/logs")
+async def get_comment_logs(
+    campaign_id: int = None,
+    limit: int = 50,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """История всех комментариев. Можно фильтровать по campaign_id."""
+    from models.campaign import CommentLog
+
+    query = select(CommentLog).join(Campaign).where(Campaign.user_id == current_user.id)
+    if campaign_id:
+        query = query.where(CommentLog.campaign_id == campaign_id)
+    query = query.order_by(CommentLog.created_at.desc()).limit(limit)
+
+    result = await db.execute(query)
+    logs = result.scalars().all()
+
+    return [{
+        "id": l.id,
+        "campaign_id": l.campaign_id,
+        "account_phone": l.account_phone,
+        "channel_username": l.channel_username,
+        "channel_title": l.channel_title,
+        "post_id": l.post_id,
+        "post_text": l.post_text[:200],
+        "comment_text": l.comment_text,
+        "llm_provider": l.llm_provider,
+        "created_at": l.created_at.isoformat(),
+    } for l in logs]

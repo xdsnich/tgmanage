@@ -49,11 +49,10 @@ REACTIONS = ["👍", "❤️", "🔥", "👏", "😂", "😮", "😢", "🎉", "
 
 async def _warmup_account(task_row, account_row):
     """Выполняет одно действие прогрева для аккаунта"""
-    from telethon import TelegramClient
-    from telethon.tl.functions.messages import GetAllStickersRequest
+async def _warmup_account(task_row, account_row, proxy_row=None):
+    """Выполняет одно действие прогрева для аккаунта"""
     from telethon.tl.types import Channel
 
-    cli_config = _get_cli_config()
     phone = account_row.phone
     session_file = account_row.session_file
 
@@ -61,12 +60,12 @@ async def _warmup_account(task_row, account_row):
         return
 
     limits = MODE_LIMITS.get(task_row.mode, MODE_LIMITS["normal"])
-    session_path = session_file.replace(".session", "")
 
-    client = TelegramClient(
-        session_path, cli_config.API_ID, cli_config.API_HASH,
-        device_model="Desktop", system_version="Windows 10", app_version="4.14.15",
-    )
+    sys.path.insert(0, API_DIR)
+    from utils.telegram import make_telethon_client
+    client = make_telethon_client(account_row, proxy_row)
+    if not client:
+        return
 
     try:
         await client.connect()
@@ -203,7 +202,14 @@ async def _process_all_warmups():
                 if not acc or acc.status != "active":
                     continue
 
-                await _warmup_account(t, acc)
+                # Загружаем прокси
+                from models.proxy import Proxy
+                proxy = None
+                if hasattr(acc, 'proxy_id') and acc.proxy_id:
+                    proxy_r = await db.execute(select(Proxy).where(Proxy.id == acc.proxy_id))
+                    proxy = proxy_r.scalar_one_or_none()
+
+                await _warmup_account(t, acc, proxy)
                 processed += 1
 
             await db.commit()

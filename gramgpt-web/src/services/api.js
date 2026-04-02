@@ -83,6 +83,24 @@ export const proxiesAPI = {
 
   delete: (id) =>
     api.delete(`/proxies/${id}`),
+
+  update: (id, data) =>
+    api.patch(`/proxies/${id}`, data),
+
+  assign: (accountId, proxyId) =>
+    api.post('/proxies/assign', { account_id: accountId, proxy_id: proxyId }),
+
+  unassign: (accountId) =>
+    api.post('/proxies/assign', { account_id: accountId, proxy_id: null }),
+
+  autoAssign: () =>
+    api.post('/proxies/auto-assign'),
+
+  check: (id) =>
+    api.post(`/proxies/${id}/check`),
+
+  checkAll: () =>
+    api.post('/proxies/check-all'),
 }
 
 // ── TASKS ────────────────────────────────────────────────────
@@ -165,8 +183,8 @@ export const actionsAPI = {
 
 // ── TG AUTH (веб-авторизация Telegram) ───────────────────────
 export const tgAuthAPI = {
-  sendCode: (phone) =>
-    api.post('/tg-auth/send-code', { phone }),
+  sendCode: (phone, proxyId = null) =>
+    api.post('/tg-auth/send-code', { phone, proxy_id: proxyId }),
 
   confirm: (phone, code) =>
     api.post('/tg-auth/confirm', { phone, code }),
@@ -244,6 +262,9 @@ export const commentingAPI = {
 
   stats: (id) =>
     api.get(`/commenting/campaigns/${id}/stats`),
+
+  logs: (campaignId = null, limit = 50) =>
+    api.get('/commenting/logs', { params: { campaign_id: campaignId, limit } }),
 }
 
 export default api

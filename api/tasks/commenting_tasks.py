@@ -68,7 +68,6 @@ def _check_rate_limit() -> bool:
             return False
             
         # 3. АНТИ-СПАМ ЗАЩИТА (BURST LIMIT)
-        # Если с прошлого вызова прошло меньше 4 секунд, скрипт принудительно подождет
         time_since_last = now - _last_call_time
         if time_since_last < 4.0:
             sleep_time = 4.0 - time_since_last
@@ -282,9 +281,8 @@ async def _process_campaign(campaign_row, db):
     from sqlalchemy import select
     from models.campaign import TargetChannel, CampaignStatus
     from models.account import TelegramAccount
-    from telethon import TelegramClient
+    from models.proxy import Proxy
 
-    cli_config = _get_cli_config()
     c = campaign_row
     _val = lambda x: x.value if hasattr(x, 'value') else x
 
@@ -336,12 +334,28 @@ async def _process_campaign(campaign_row, db):
 
     logger.info(f"[{c.name}] Использую аккаунт: {account.phone}")
 
-    # Подключаемся
-    session_path = account.session_file.replace(".session", "")
-    client = TelegramClient(
-        session_path, cli_config.API_ID, cli_config.API_HASH,
-        device_model="Desktop", system_version="Windows 10", app_version="4.14.15",
-    )
+    # Подключаемся (с прокси если назначен)
+    if API_DIR not in sys.path:
+        sys.path.insert(0, API_DIR)
+    from utils.telegram import make_telethon_client
+
+    proxy = None
+    if hasattr(account, 'proxy_id') and account.proxy_id:
+        proxy_r = await db.execute(select(Proxy).where(Proxy.id == account.proxy_id))
+        proxy = proxy_r.scalar_one_or_none()
+        if proxy:
+            logger.info(f"[{c.name}] Прокси: {proxy.host}:{proxy.port}")
+
+    client = None
+    try:
+        client = make_telethon_client(account, proxy)
+    except Exception as e:
+        logger.error(f"[{c.name}] Ошибка создания клиента: {e}")
+        return
+
+    if not client:
+        logger.warning(f"[{c.name}] Не удалось создать клиент для {account.phone} (session_file={account.session_file})")
+        return
 
     try:
         await client.connect()
@@ -444,6 +458,21 @@ async def _process_campaign(campaign_row, db):
                         channel.last_post_id = msg.id
                         logger.info(f"[{c.name}] ✅ Коммент #{c.comments_sent} в @{channel.username}: {comment[:60]}...")
 
+                        # Сохраняем в лог комментариев
+                        from models.campaign import CommentLog
+                        log = CommentLog(
+                            campaign_id=c.id,
+                            account_id=account.id,
+                            account_phone=account.phone,
+                            channel_username=channel.username or "",
+                            channel_title=channel.title or "",
+                            post_id=msg.id,
+                            post_text=post_text[:500],
+                            comment_text=comment,
+                            llm_provider=provider,
+                        )
+                        db.add(log)
+
                         # Задержка между комментариями
                         between = min(c.delay_between + random.randint(-10, 10), 30)
                         if between > 0:
@@ -467,7 +496,8 @@ async def _process_campaign(campaign_row, db):
         logger.error(f"[{c.name}] Ошибка Telethon: {e}")
     finally:
         try:
-            await client.disconnect()
+            if client:
+                await client.disconnect()
         except:
             pass
 

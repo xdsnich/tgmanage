@@ -28,6 +28,9 @@ export default function CommentingPage() {
   const [campaigns, setCampaigns] = useState([])
   const [accounts, setAccounts] = useState([])
   const [loading, setLoading] = useState(true)
+  const [tab, setTab] = useState('campaigns') // campaigns | logs
+  const [logs, setLogs] = useState([])
+  const [logsLoading, setLogsLoading] = useState(false)
   const [selected, setSelected] = useState(null)
   const [createModal, setCreateModal] = useState(false)
   const [detailModal, setDetailModal] = useState(false)
@@ -60,6 +63,12 @@ export default function CommentingPage() {
   }
 
   useEffect(() => { load() }, [])
+
+  const loadLogs = async () => {
+    setLogsLoading(true)
+    try { const { data } = await commentingAPI.logs(null, 100); setLogs(data) } catch { }
+    setLogsLoading(false)
+  }
 
   const handleCreate = async () => {
     setSaving(true)
@@ -126,58 +135,113 @@ export default function CommentingPage() {
         <Button variant="primary" onClick={() => setCreateModal(true)}>+ Создать кампанию</Button>
       </div>
 
-      {/* Stats */}
-      {campaigns.length > 0 && (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 20 }}>
-          <StatCard label="Всего кампаний" value={campaigns.length} icon="📋" />
-          <StatCard label="Активных" value={campaigns.filter(c => c.status === 'active').length} color="var(--green)" icon="▶" />
-          <StatCard label="Комментариев" value={campaigns.reduce((s, c) => s + (c.comments_sent || 0), 0)} color="var(--violet)" icon="💬" />
-          <StatCard label="Каналов" value={campaigns.reduce((s, c) => s + (c.channels_count || 0), 0)} color="var(--blue)" icon="📢" />
-        </div>
-      )}
+      {/* Tabs */}
+      <div style={{ display: 'flex', gap: 4, marginBottom: 20, background: 'var(--bg-2)', padding: 4, borderRadius: 12, border: '1px solid var(--border)', width: 'fit-content' }}>
+        {[
+          { key: 'campaigns', label: '📋 Кампании' },
+          { key: 'logs', label: '📝 История комментов' },
+        ].map(t => (
+          <button key={t.key} onClick={() => { if (t.key === 'logs' && logs.length === 0) loadLogs(); setTab(t.key) }} style={{
+            padding: '8px 18px', borderRadius: 10, border: 'none', cursor: 'pointer', fontSize: 13, fontWeight: 600,
+            background: tab === t.key ? 'rgba(124,77,255,0.15)' : 'transparent',
+            color: tab === t.key ? 'var(--violet)' : 'var(--text-3)',
+            transition: 'all 0.15s',
+          }}>{t.label}</button>
+        ))}
+      </div>
 
-      {/* Campaign list */}
-      {campaigns.length === 0 ? (
-        <Empty icon="🧠" title="Нет кампаний" subtitle="Создайте первую кампанию нейрокомментинга" action={<Button variant="primary" onClick={() => setCreateModal(true)}>+ Создать</Button>} />
-      ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          {campaigns.map(c => (
-            <Card key={c.id} onClick={() => openDetail(c)} style={{ cursor: 'pointer' }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                <div style={{ flex: 1 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
-                    <span style={{ fontWeight: 700, fontSize: 15, letterSpacing: '-0.02em' }}>{c.name}</span>
-                    <Badge color={STATUS_COLORS[c.status]}>{STATUS_LABELS[c.status]}</Badge>
-                    <Badge color="violet">{{ 'claude': 'Claude', 'openai': 'GPT-4o', 'gemini': 'Gemini', 'groq': 'Groq' }[c.llm_provider] || c.llm_provider}</Badge>
-                    <Badge color="default">{TONES.find(t => t.value === c.tone)?.label || c.tone}</Badge>
-                  </div>
-                  <div style={{ display: 'flex', gap: 16, fontSize: 12, color: 'var(--text-3)' }}>
-                    <span>💬 {c.comments_sent}/{c.max_comments}</span>
-                    <span>📢 {c.channels_count} каналов</span>
-                    <span>👤 {(c.account_ids || []).length} акк.</span>
-                    <span>⏱ {c.trigger_mode === 'all' ? 'Каждый пост' : c.trigger_mode === 'random' ? `${c.trigger_percent}% постов` : 'По ключам'}</span>
-                  </div>
-                  {/* Progress bar */}
-                  <div style={{ marginTop: 8, height: 3, background: 'rgba(255,255,255,0.06)', borderRadius: 2, overflow: 'hidden' }}>
-                    <div style={{ width: `${Math.min(100, c.max_comments > 0 ? (c.comments_sent / c.max_comments) * 100 : 0)}%`, height: '100%', background: 'linear-gradient(90deg, #7c4dff, #3d8bff)', transition: 'width 0.6s' }} />
-                  </div>
-                </div>
-                <div style={{ display: 'flex', gap: 6, marginLeft: 16 }} onClick={e => e.stopPropagation()}>
-                  {c.status === 'draft' || c.status === 'paused' || c.status === 'stopped' ? (
-                    <Button variant="primary" size="sm" onClick={() => handleAction(c.id, 'start')}>▶ Старт</Button>
-                  ) : null}
-                  {c.status === 'active' ? (
-                    <>
-                      <Button variant="ghost" size="sm" onClick={() => handleAction(c.id, 'pause')}>⏸ Пауза</Button>
-                      <Button variant="danger" size="sm" onClick={() => handleAction(c.id, 'stop')}>⏹ Стоп</Button>
-                    </>
-                  ) : null}
-                  <Button variant="ghost" size="sm" onClick={() => handleAction(c.id, 'delete')}>✕</Button>
-                </div>
+      {tab === 'logs' ? (
+        /* ── ИСТОРИЯ КОММЕНТОВ ─────────────────────── */
+        <div>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
+            <Button variant="ghost" size="sm" onClick={loadLogs} loading={logsLoading}>🔄 Обновить</Button>
+          </div>
+          {logsLoading ? <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><Spinner size={24} /></div> :
+            logs.length === 0 ? <Empty icon="📝" title="Нет комментариев" subtitle="Запустите кампанию и дождитесь первого комментария" /> : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {logs.map(l => (
+                  <Card key={l.id} style={{ padding: '14px 18px' }}>
+                    <div style={{ display: 'flex', alignItems: 'flex-start', gap: 14 }}>
+                      <div style={{ fontSize: 24 }}>💬</div>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                          <span style={{ fontWeight: 700, fontSize: 13 }}>@{l.channel_username}</span>
+                          <Badge color="violet">{l.llm_provider}</Badge>
+                          <span style={{ fontSize: 11, color: 'var(--text-3)' }}>{l.account_phone}</span>
+                          <span style={{ fontSize: 11, color: 'var(--text-3)', marginLeft: 'auto' }}>{new Date(l.created_at).toLocaleString('ru')}</span>
+                        </div>
+                        <div style={{ fontSize: 12, color: 'var(--text-3)', marginBottom: 6, padding: '6px 10px', background: 'var(--bg-3)', borderRadius: 8, borderLeft: '3px solid var(--border)' }}>
+                          📄 {l.post_text}
+                        </div>
+                        <div style={{ fontSize: 13, color: 'var(--green)', padding: '6px 10px', background: 'rgba(61,214,140,0.06)', borderRadius: 8, borderLeft: '3px solid var(--green)' }}>
+                          💬 {l.comment_text}
+                        </div>
+                      </div>
+                    </div>
+                  </Card>
+                ))}
               </div>
-            </Card>
-          ))}
+            )}
         </div>
+      ) : (
+        /* ── КАМПАНИИ (оригинальный контент) ─────────── */
+        <>
+
+          {/* Stats */}
+          {campaigns.length > 0 && (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 20 }}>
+              <StatCard label="Всего кампаний" value={campaigns.length} icon="📋" />
+              <StatCard label="Активных" value={campaigns.filter(c => c.status === 'active').length} color="var(--green)" icon="▶" />
+              <StatCard label="Комментариев" value={campaigns.reduce((s, c) => s + (c.comments_sent || 0), 0)} color="var(--violet)" icon="💬" />
+              <StatCard label="Каналов" value={campaigns.reduce((s, c) => s + (c.channels_count || 0), 0)} color="var(--blue)" icon="📢" />
+            </div>
+          )}
+
+          {/* Campaign list */}
+          {campaigns.length === 0 ? (
+            <Empty icon="🧠" title="Нет кампаний" subtitle="Создайте первую кампанию нейрокомментинга" action={<Button variant="primary" onClick={() => setCreateModal(true)}>+ Создать</Button>} />
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              {campaigns.map(c => (
+                <Card key={c.id} onClick={() => openDetail(c)} style={{ cursor: 'pointer' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
+                        <span style={{ fontWeight: 700, fontSize: 15, letterSpacing: '-0.02em' }}>{c.name}</span>
+                        <Badge color={STATUS_COLORS[c.status]}>{STATUS_LABELS[c.status]}</Badge>
+                        <Badge color="violet">{{ 'claude': 'Claude', 'openai': 'GPT-4o', 'gemini': 'Gemini', 'groq': 'Groq' }[c.llm_provider] || c.llm_provider}</Badge>
+                        <Badge color="default">{TONES.find(t => t.value === c.tone)?.label || c.tone}</Badge>
+                      </div>
+                      <div style={{ display: 'flex', gap: 16, fontSize: 12, color: 'var(--text-3)' }}>
+                        <span>💬 {c.comments_sent}/{c.max_comments}</span>
+                        <span>📢 {c.channels_count} каналов</span>
+                        <span>👤 {(c.account_ids || []).length} акк.</span>
+                        <span>⏱ {c.trigger_mode === 'all' ? 'Каждый пост' : c.trigger_mode === 'random' ? `${c.trigger_percent}% постов` : 'По ключам'}</span>
+                      </div>
+                      {/* Progress bar */}
+                      <div style={{ marginTop: 8, height: 3, background: 'rgba(255,255,255,0.06)', borderRadius: 2, overflow: 'hidden' }}>
+                        <div style={{ width: `${Math.min(100, c.max_comments > 0 ? (c.comments_sent / c.max_comments) * 100 : 0)}%`, height: '100%', background: 'linear-gradient(90deg, #7c4dff, #3d8bff)', transition: 'width 0.6s' }} />
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', gap: 6, marginLeft: 16 }} onClick={e => e.stopPropagation()}>
+                      {c.status === 'draft' || c.status === 'paused' || c.status === 'stopped' ? (
+                        <Button variant="primary" size="sm" onClick={() => handleAction(c.id, 'start')}>▶ Старт</Button>
+                      ) : null}
+                      {c.status === 'active' ? (
+                        <>
+                          <Button variant="ghost" size="sm" onClick={() => handleAction(c.id, 'pause')}>⏸ Пауза</Button>
+                          <Button variant="danger" size="sm" onClick={() => handleAction(c.id, 'stop')}>⏹ Стоп</Button>
+                        </>
+                      ) : null}
+                      <Button variant="ghost" size="sm" onClick={() => handleAction(c.id, 'delete')}>✕</Button>
+                    </div>
+                  </div>
+                </Card>
+              ))}
+            </div>
+          )}
+
+        </>
       )}
 
       {/* ── Create Campaign Modal ──────────────────────── */}

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { accountsAPI, securityAPI, channelsAPI, actionsAPI, tgAuthAPI } from '../services/api'
+import { accountsAPI, securityAPI, channelsAPI, actionsAPI, tgAuthAPI, proxiesAPI } from '../services/api'
 import { Card, Button, Input, Modal, TrustBar, StatusBadge, Badge, Spinner, Empty } from '../components/ui'
 
 const ROLES = ['default', 'продавец', 'прогреватель', 'читатель', 'консультант']
@@ -30,14 +30,18 @@ export default function AccountDetailPage() {
   const [twoFAModal, setTwoFAModal] = useState(false)
   const [authModal, setAuthModal] = useState(false)
   const [channelModal, setChannelModal] = useState(false)
+  const [proxyModal, setProxyModal] = useState(false)
   const [exportModal, setExportModal] = useState(false)
 
   // Forms
   const [editData, setEditData] = useState({})
+  const [proxies, setProxies] = useState([])
+  const [selectedProxyId, setSelectedProxyId] = useState(null)
   const [twoFAPass, setTwoFAPass] = useState('')
   const [twoFAHint, setTwoFAHint] = useState('')
   const [authPhone, setAuthPhone] = useState('')
   const [authCode, setAuthCode] = useState('')
+  const [authProxyId, setAuthProxyId] = useState(null)
   const [authStep, setAuthStep] = useState('idle') // idle | code_sent | needs_2fa
   const [authMsg, setAuthMsg] = useState('')
   const [channelTitle, setChannelTitle] = useState('')
@@ -132,7 +136,11 @@ export default function AccountDetailPage() {
   const handleSendCode = async () => {
     setSaving(true); setAuthMsg('')
     try {
-      const { data } = await tgAuthAPI.sendCode(authPhone)
+      // Загружаем прокси для выбора если ещё не загрузили
+      if (proxies.length === 0) {
+        try { const { data } = await proxiesAPI.list(); setProxies(data) } catch { }
+      }
+      const { data } = await tgAuthAPI.sendCode(authPhone, authProxyId || null)
       setAuthStep('code_sent')
       setAuthMsg(data.message)
     } catch (err) { setAuthMsg(err.response?.data?.detail || 'Ошибка') }
@@ -264,7 +272,7 @@ export default function AccountDetailPage() {
           {/* Actions */}
           <div style={{ display: 'flex', gap: 8 }}>
             <Button variant="outline" size="sm" onClick={() => setEditModal(true)}>Редактировать</Button>
-            <Button variant="ghost" size="sm" onClick={() => { setAuthStep('idle'); setAuthMsg(''); setAuthModal(true) }}>Авторизовать</Button>
+            <Button variant="ghost" size="sm" onClick={async () => { setAuthStep('idle'); setAuthMsg(''); try { const { data } = await proxiesAPI.list(); setProxies(data) } catch { }; setAuthModal(true) }}>Авторизовать</Button>
           </div>
         </div>
       </Card>
@@ -316,7 +324,7 @@ export default function AccountDetailPage() {
               ['Фото', a.has_photo ? '✅ Есть' : '❌ Нет'],
               ['2FA', a.has_2fa ? '✅ Включена' : '❌ Отключена'],
               ['Активных сессий', a.active_sessions],
-              ['Прокси', a.proxy_id ? `#${a.proxy_id}` : '❌ Не назначен'],
+              ['Прокси', a.proxy_id ? `🟢 #${a.proxy_id}` : '❌ Не назначен'],
               ['Добавлен', a.added_at ? new Date(a.added_at).toLocaleDateString('ru') : '—'],
               ['Последняя проверка', a.last_checked ? new Date(a.last_checked).toLocaleString('ru') : '— не проверялся'],
             ].map(([label, val]) => (
@@ -434,6 +442,12 @@ export default function AccountDetailPage() {
                   {icon} {label}
                 </Button>
               ))}
+              <Button variant="ghost" size="sm" onClick={async () => {
+                try { const { data } = await proxiesAPI.list(); setProxies(data); setSelectedProxyId(a.proxy_id); setProxyModal(true) }
+                catch { showToast('Ошибка загрузки прокси', 'error') }
+              }} style={{ justifyContent: 'flex-start', fontSize: 12 }}>
+                🔒 {a.proxy_id ? 'Сменить прокси' : 'Назначить прокси'}
+              </Button>
             </div>
           </Card>
         </div>
@@ -487,7 +501,19 @@ export default function AccountDetailPage() {
           <Input label="Номер телефона" value={authPhone} onChange={e => setAuthPhone(e.target.value)} placeholder="+380..." disabled={authStep !== 'idle'} />
 
           {authStep === 'idle' && (
-            <Button variant="primary" onClick={handleSendCode} loading={saving}>Запросить код</Button>
+            <>
+              <div>
+                <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Прокси (опционально)</label>
+                <select value={authProxyId || ''} onChange={e => setAuthProxyId(e.target.value ? parseInt(e.target.value) : null)} style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 13, outline: 'none' }}>
+                  <option value="">Без прокси (прямое подключение)</option>
+                  {proxies.filter(p => p.is_valid !== false).map(p => (
+                    <option key={p.id} value={p.id}>{p.host}:{p.port} [{p.protocol}] {p.is_valid ? '✓' : '?'}</option>
+                  ))}
+                </select>
+                <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 4 }}>Авторизация и все действия аккаунта будут через этот прокси</div>
+              </div>
+              <Button variant="primary" onClick={handleSendCode} loading={saving}>Запросить код</Button>
+            </>
           )}
 
           {authStep === 'code_sent' && (
@@ -529,6 +555,48 @@ export default function AccountDetailPage() {
             <Button variant="primary" type="submit" loading={saving}>Создать</Button>
           </div>
         </form>
+      </Modal>
+
+      {/* Proxy */}
+      <Modal open={proxyModal} onClose={() => setProxyModal(false)} title="Назначить прокси" width={480}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <div style={{ padding: '10px 14px', background: 'rgba(124,77,255,0.06)', border: '1px solid rgba(124,77,255,0.15)', borderRadius: 10, fontSize: 12, color: 'var(--text-2)', lineHeight: 1.6 }}>
+            Все подключения аккаунта будут через выбранный прокси.
+            {a.proxy_id && <><br />Текущий прокси: <strong>#{a.proxy_id}</strong></>}
+          </div>
+
+          <div>
+            <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Прокси</label>
+            <select value={selectedProxyId || ''} onChange={e => setSelectedProxyId(e.target.value ? parseInt(e.target.value) : null)} style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 14, outline: 'none' }}>
+              <option value="">❌ Без прокси (прямое подключение)</option>
+              {proxies.map(p => (
+                <option key={p.id} value={p.id}>
+                  {p.host}:{p.port} ({p.protocol}) {p.is_valid === true ? '✅' : p.is_valid === false ? '❌' : '❓'}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {proxies.length === 0 && (
+            <div style={{ fontSize: 12, color: 'var(--text-3)', textAlign: 'center', padding: '8px 0' }}>
+              Нет прокси. Добавьте на странице Прокси.
+            </div>
+          )}
+
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+            <Button variant="ghost" onClick={() => setProxyModal(false)}>Отмена</Button>
+            <Button variant="primary" loading={saving} onClick={async () => {
+              setSaving(true)
+              try {
+                await accountsAPI.update(parseInt(id), { proxy_id: selectedProxyId })
+                setProxyModal(false)
+                showToast(selectedProxyId ? 'Прокси назначен' : 'Прокси убран')
+                await load()
+              } catch (err) { showToast(err.response?.data?.detail || 'Ошибка', 'error') }
+              setSaving(false)
+            }}>Сохранить</Button>
+          </div>
+        </div>
       </Modal>
 
       {/* Export session */}

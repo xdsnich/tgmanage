@@ -206,7 +206,7 @@ def _call_groq_dialog(system_prompt: str, messages_history: list[dict]) -> str:
 
 # ── Основная логика ──────────────────────────────────────────
 
-async def _process_single_dialog(account_row, ai_dialog_row, db_session):
+async def _process_single_dialog(account_row, ai_dialog_row, db_session, proxy_row=None):
     """
     Обрабатывает один ИИ-диалог.
     Логика:
@@ -217,7 +217,6 @@ async def _process_single_dialog(account_row, ai_dialog_row, db_session):
     """
     from telethon import TelegramClient
 
-    cli_config = _get_cli_config()
     phone = account_row.phone
     contact_id = ai_dialog_row.contact_id
     system_prompt = ai_dialog_row.system_prompt
@@ -226,15 +225,11 @@ async def _process_single_dialog(account_row, ai_dialog_row, db_session):
     if not session_file or not os.path.exists(session_file):
         return
 
-    session_path = session_file.replace(".session", "")
-    client = TelegramClient(
-        session_path,
-        cli_config.API_ID,
-        cli_config.API_HASH,
-        device_model="Desktop",
-        system_version="Windows 10",
-        app_version="4.14.15",
-    )
+    # Создаём клиент с прокси (если назначен)
+    from utils.telegram import make_telethon_client
+    client = make_telethon_client(account_row, proxy_row)
+    if not client:
+        return
 
     try:
         await client.connect()
@@ -338,7 +333,14 @@ async def _process_all_dialogs():
                 if not account or account.status != "active":
                     continue
 
-                await _process_single_dialog(account, ai_dialog, db)
+                # Загружаем прокси аккаунта
+                from models.proxy import Proxy
+                proxy = None
+                if hasattr(account, 'proxy_id') and account.proxy_id:
+                    proxy_r = await db.execute(select(Proxy).where(Proxy.id == account.proxy_id))
+                    proxy = proxy_r.scalar_one_or_none()
+
+                await _process_single_dialog(account, ai_dialog, db, proxy)
                 processed += 1
 
             await db.commit()
@@ -408,9 +410,16 @@ def process_single_account_dialogs(self, account_id: int):
                 await task_engine.dispose()
                 return {"error": "Аккаунт не найден"}
 
+            # Загружаем прокси
+            from models.proxy import Proxy
+            proxy = None
+            if hasattr(account, 'proxy_id') and account.proxy_id:
+                proxy_r = await db.execute(select(Proxy).where(Proxy.id == account.proxy_id))
+                proxy = proxy_r.scalar_one_or_none()
+
             processed = 0
             for ai_dialog in dialogs:
-                await _process_single_dialog(account, ai_dialog, db)
+                await _process_single_dialog(account, ai_dialog, db, proxy)
                 processed += 1
 
             await db.commit()

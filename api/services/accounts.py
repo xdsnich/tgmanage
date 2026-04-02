@@ -3,6 +3,9 @@ GramGPT API — services/accounts.py
 Бизнес-логика: аккаунты Telegram
 """
 
+import os
+import logging
+from pathlib import Path
 from typing import Optional
 from datetime import datetime
 
@@ -13,7 +16,8 @@ from fastapi import HTTPException, status
 from models.account import TelegramAccount, AccountStatus
 from models.user import User
 from schemas.account import AccountUpdate
-# trust_score хранится в БД и обновляется через CLI
+
+logger = logging.getLogger(__name__)
 
 
 async def get_accounts(db: AsyncSession, user_id: int) -> list[TelegramAccount]:
@@ -48,6 +52,31 @@ async def get_account_by_phone(db: AsyncSession, phone: str, user_id: int) -> Op
     return result.scalar_one_or_none()
 
 
+async def get_stats(db: AsyncSession, user_id: int) -> dict:
+    """Статистика по аккаунтам"""
+    result = await db.execute(
+        select(TelegramAccount).where(TelegramAccount.user_id == user_id)
+    )
+    accounts = result.scalars().all()
+
+    total = len(accounts)
+    active = sum(1 for a in accounts if a.status == AccountStatus.active)
+    spamblock = sum(1 for a in accounts if a.status == AccountStatus.spamblock)
+    avg_trust = round(sum(a.trust_score for a in accounts) / total) if total > 0 else 0
+
+    return {
+        "total": total,
+        "active": active,
+        "spamblock": spamblock,
+        "frozen": sum(1 for a in accounts if a.status == AccountStatus.frozen),
+        "error": sum(1 for a in accounts if a.status == AccountStatus.error),
+        "avg_trust": avg_trust,
+        "with_2fa": sum(1 for a in accounts if a.has_2fa),
+        "with_photo": sum(1 for a in accounts if a.has_photo),
+        "with_proxy": sum(1 for a in accounts if a.proxy_id),
+    }
+
+
 async def check_limit(db: AsyncSession, user: User):
     """Проверяет не превышен ли лимит аккаунтов по тарифу"""
     result = await db.execute(
@@ -64,7 +93,6 @@ async def check_limit(db: AsyncSession, user: User):
 async def create_account(db: AsyncSession, user: User, phone: str) -> TelegramAccount:
     await check_limit(db, user)
 
-    # Проверяем нет ли уже такого аккаунта
     existing = await get_account_by_phone(db, phone, user.id)
     if existing:
         raise HTTPException(status_code=400, detail=f"Аккаунт {phone} уже добавлен")
@@ -89,6 +117,25 @@ async def update_account(db: AsyncSession, account: TelegramAccount,
 
 
 async def delete_account(db: AsyncSession, account: TelegramAccount):
+    """Удаляет аккаунт из БД + удаляет .session файл с диска"""
+    # Удаляем .session файл если есть
+    if account.session_file:
+        session_path = Path(account.session_file)
+        if session_path.exists():
+            try:
+                session_path.unlink()
+                logger.info(f"Удалён session файл: {session_path}")
+            except Exception as e:
+                logger.warning(f"Не удалось удалить session файл {session_path}: {e}")
+
+        # Также удаляем .session-journal если есть
+        journal_path = Path(str(account.session_file) + "-journal")
+        if journal_path.exists():
+            try:
+                journal_path.unlink()
+            except:
+                pass
+
     await db.delete(account)
     await db.flush()
 
@@ -102,77 +149,36 @@ async def sync_from_dict(db: AsyncSession, user: User, account_dict: dict) -> Te
     existing = await get_account_by_phone(db, phone, user.id)
 
     if existing:
-        acc = existing
-    else:
-        await check_limit(db, user)
-        acc = TelegramAccount(user_id=user.id, phone=phone)
-        db.add(acc)
+        existing.tg_id = account_dict.get("id") or existing.tg_id
+        existing.first_name = account_dict.get("first_name", existing.first_name)
+        existing.last_name = account_dict.get("last_name", existing.last_name)
+        existing.username = account_dict.get("username", existing.username)
+        existing.bio = account_dict.get("bio", existing.bio)
+        existing.has_photo = account_dict.get("has_photo", existing.has_photo)
+        existing.has_2fa = account_dict.get("has_2fa", existing.has_2fa)
+        existing.active_sessions = account_dict.get("active_sessions", existing.active_sessions)
+        existing.session_file = account_dict.get("session_file", existing.session_file)
+        existing.status = account_dict.get("status", existing.status.value)
+        existing.trust_score = account_dict.get("trust_score", existing.trust_score)
+        existing.updated_at = datetime.utcnow()
+        await db.flush()
+        return existing
 
-    # Маппинг полей
-    field_map = {
-        "tg_id":          "id",
-        "first_name":     "first_name",
-        "last_name":      "last_name",
-        "username":       "username",
-        "bio":            "bio",
-        "has_photo":      "has_photo",
-        "has_2fa":        "has_2fa",
-        "active_sessions":"active_sessions",
-        "session_file":   "session_file",
-        "status":         "status",
-        "trust_score":    "trust_score",
-        "role":           "role",
-        "tags":           "tags",
-        "notes":          "notes",
-        "channels":       "channels",
-        "error":          "error",
-    }
-
-    for db_field, dict_key in field_map.items():
-        val = account_dict.get(dict_key)
-        if val is not None:
-            setattr(acc, db_field, val)
-
-    # Даты
-    for date_field in ["added_at", "last_checked"]:
-        val = account_dict.get(date_field)
-        if val:
-            try:
-                setattr(acc, date_field, datetime.fromisoformat(val))
-            except Exception:
-                pass
-
+    account = TelegramAccount(
+        user_id=user.id,
+        phone=phone,
+        tg_id=account_dict.get("id"),
+        first_name=account_dict.get("first_name", ""),
+        last_name=account_dict.get("last_name", ""),
+        username=account_dict.get("username", ""),
+        bio=account_dict.get("bio", ""),
+        has_photo=account_dict.get("has_photo", False),
+        has_2fa=account_dict.get("has_2fa", False),
+        active_sessions=account_dict.get("active_sessions", 0),
+        session_file=account_dict.get("session_file", ""),
+        status=account_dict.get("status", "unknown"),
+        trust_score=account_dict.get("trust_score", 0),
+    )
+    db.add(account)
     await db.flush()
-    return acc
-
-
-async def get_stats(db: AsyncSession, user_id: int) -> dict:
-    """Возвращает статистику по аккаунтам для дашборда"""
-    accounts = await get_accounts(db, user_id)
-
-    if not accounts:
-        return {"total": 0}
-
-    total = len(accounts)
-    by_status = {}
-    scores = []
-
-    for a in accounts:
-        s = a.status.value
-        by_status[s] = by_status.get(s, 0) + 1
-        scores.append(a.trust_score)
-
-    return {
-        "total":       total,
-        "active":      by_status.get("active", 0),
-        "spamblock":   by_status.get("spamblock", 0),
-        "frozen":      by_status.get("frozen", 0),
-        "quarantine":  by_status.get("quarantine", 0),
-        "error":       by_status.get("error", 0),
-        "unknown":     by_status.get("unknown", 0),
-        "avg_trust":   sum(scores) // total if scores else 0,
-        "max_trust":   max(scores) if scores else 0,
-        "min_trust":   min(scores) if scores else 0,
-        "with_proxy":  sum(1 for a in accounts if a.proxy_id),
-        "with_2fa":    sum(1 for a in accounts if a.has_2fa),
-    }
+    return account
