@@ -102,3 +102,17 @@ async def root():
 # Терминал 2 (Worker):   cd api → celery -A celery_app worker -Q high_priority,bulk_actions,ai_dialogs --loglevel=info -P solo
 # Терминал 3 (Beat):     cd api → python run_periodic.py
 # Терминал 4 (Frontend): cd gramgpt-web → npm run dev
+# Терминал 1: API
+# cd api && uvicorn main:app --reload --port 8000
+
+# # Терминал 2: Worker
+# cd api && celery -A celery_app worker -Q high_priority,bulk_actions,ai_dialogs --loglevel=info -P solo
+
+# # Терминал 3: Публичные каналы (веб-парсинг каждые 90с)
+# cd api && python run_periodic.py
+
+# # Терминал 4: Закрытые каналы (event listener)
+# cd api && python run_listener.py
+
+# # Терминал 5: Frontend
+# cd gramgpt-web && npm run dev

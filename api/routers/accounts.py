@@ -370,6 +370,7 @@ async def import_tdata(
                 raise HTTPException(status_code=400, detail="В архиве не найдена папка TData")
 
         print(f"📦 TData найдена: {tdata_path}")
+        print(f"📦 proxy_id получен: {proxy_id}")
 
         # 4. Конвертируем TData → Telethon session
         tdesk = TDesktop(tdata_path)
@@ -711,6 +712,7 @@ async def import_tdata_batch(
             # Определяем прокси
             proxy_id = item.proxy_id
             proxy_dict = None
+            print(f"📦 [{phone}] proxy_id={proxy_id}, proxy_string='{item.proxy_string}'")
 
             # Если передана строка прокси — парсим и создаём в БД
             if item.proxy_string and not proxy_id:
@@ -745,6 +747,7 @@ async def import_tdata_batch(
                     proxy_dict = _build_proxy(proxy_row)
 
             # Копируем session в sessions/
+            print(f"📦 [{phone}] итоговый proxy_id={proxy_id}")
             final_session = str(cli_config.SESSIONS_DIR / phone.replace("+", "")) + ".session"
             shutil.copy2(session_path, final_session)
 
