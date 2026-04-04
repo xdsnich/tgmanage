@@ -188,6 +188,9 @@ async def send_code(
         try: await client.disconnect()
         except: pass
         err = str(e)
+        import traceback
+        print(f"🔑 ❌ SEND-CODE EXCEPTION: {type(e).__name__}: {err}")
+        print(f"🔑 ❌ TRACEBACK:\n{traceback.format_exc()}")
         if "PHONE_NUMBER_INVALID" in err:
             raise HTTPException(status_code=400, detail="Неверный номер телефона")
         if "FLOOD_WAIT" in err:
