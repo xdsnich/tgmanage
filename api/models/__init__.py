@@ -8,11 +8,12 @@ from .campaign import Campaign, TargetChannel, CampaignStatus, TriggerMode, LLMP
 from .warmup import WarmupTask
 from .parsed_channel import ParsedChannel
 from .reaction import ReactionTask
+from .warmup_log import WarmupLog
 __all__ = [
     "User", "RefreshToken", "PlanEnum",
     "TelegramAccount", "AccountStatus", "AccountRole",
     "Proxy", "ProxyProtocol","ApiApp",
     "AIDialog", "ActionLog",
     "Campaign", "TargetChannel", "CampaignStatus", "TriggerMode", "LLMProvider", "CommentTone",
-    "WarmupTask", "ParsedChannel","ReactionTask",
+    "WarmupTask", "ParsedChannel","ReactionTask","WarmupLog"
 ]

@@ -42,6 +42,14 @@ class WarmupTask(Base):
     finished_at:    Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at:     Mapped[datetime]           = mapped_column(DateTime, default=datetime.utcnow)
     updated_at:     Mapped[datetime]           = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
+    # v2 — расписание и дни
+    day:             Mapped[int]              = mapped_column(Integer, default=1)
+    day_started_at:  Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    today_actions:   Mapped[int]              = mapped_column(Integer, default=0)
+    today_limit:     Mapped[int]              = mapped_column(Integer, default=5)
+    is_resting:      Mapped[bool]             = mapped_column(Boolean, default=False)
+    next_action_at:  Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    start_offset_min:Mapped[int]              = mapped_column(Integer, default=0)
+    total_days:      Mapped[int]              = mapped_column(Integer, default=7)
     def __repr__(self):
         return f"<WarmupTask account={self.account_id} mode={self.mode} status={self.status}>"

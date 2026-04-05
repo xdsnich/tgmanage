@@ -24,6 +24,7 @@ except Exception as e:
 AI_INTERVAL = 60
 COMMENTING_INTERVAL = 90  # Веб-парсинг безопаснее, 90с достаточно
 WARMUP_INTERVAL = 300
+WARMUP_V2_INTERVAL = 60
 
 print("=" * 50)
 print("  GramGPT Scheduler (Hybrid)")
@@ -32,8 +33,8 @@ print(f"  AI-диалоги: {AI_INTERVAL}с")
 print(f"  Прогрев:    {WARMUP_INTERVAL}с")
 print("=" * 50)
 
-last_ai = last_commenting = last_warmup = 0
-ai_tid = commenting_tid = warmup_tid = None
+last_ai = last_commenting = last_warmup = last_warmup_v2 = 0
+ai_tid = commenting_tid = warmup_tid = warmup_v2_tid = None
 
 def done(tid):
     if not tid: return True
@@ -62,13 +63,13 @@ try:
                 except Exception as e: print(f"[{ts}] ✗ AI: {e}")
             last_ai = now
 
-        if now - last_warmup >= WARMUP_INTERVAL:
-            if done(warmup_tid):
+        if now - last_warmup_v2 >= WARMUP_V2_INTERVAL:
+            if done(warmup_v2_tid):
                 try:
-                    r = celery_app.send_task("tasks.warmup_tasks.process_warmups", queue="ai_dialogs")
-                    warmup_tid = r.id; print(f"[{ts}] → Прогрев")
-                except Exception as e: print(f"[{ts}] ✗ Прогрев: {e}")
-            last_warmup = now
+                    r = celery_app.send_task("tasks.warmup_v2.process_warmups_v2", queue="ai_dialogs")
+                    warmup_v2_tid = r.id; print(f"[{ts}] → Прогрев v2")
+                except Exception as e: print(f"[{ts}] ✗ Прогрев v2: {e}")
+            last_warmup_v2 = now
 
         time.sleep(5)
 except KeyboardInterrupt:

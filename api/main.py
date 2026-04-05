@@ -119,3 +119,5 @@ async def root():
 
 # # Терминал 5: Frontend
 # cd gramgpt-web && npm run dev
+#python -m uvicorn main:app --reload --port 8000
+#python -m celery -A celery_app worker -Q high_priority,bulk_actions,ai_dialogs --loglevel=info -P solo

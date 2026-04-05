@@ -7,10 +7,25 @@ GramGPT API — celery_app.py
 запускаются через отдельный скрипт run_periodic.py
 """
 
-from celery import Celery
+import sys
 import os
-from dotenv import load_dotenv
 
+# Принудительно: api/ первый в path, корень — убрать
+API_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, API_DIR)
+
+# Убираем родительскую папку (там конфликтующий config.py)
+PARENT_DIR = os.path.dirname(API_DIR)
+while PARENT_DIR in sys.path:
+    sys.path.remove(PARENT_DIR)
+
+# Сбрасываем кеш если загрузился неправильный config
+if 'config' in sys.modules:
+    loaded = getattr(sys.modules['config'], '__file__', '')
+    if 'api' not in loaded:
+        del sys.modules['config']
+from celery import Celery
+from dotenv import load_dotenv        
 load_dotenv()
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -26,6 +41,7 @@ celery_app = Celery(
         "tasks.ai_tasks",
         "tasks.commenting_tasks",
         "tasks.warmup_tasks",
+        "tasks.warmup_v2",
     ]
 )
 
@@ -51,3 +67,24 @@ celery_app.conf.update(
 
     # НЕТ beat_schedule — периодика через run_periodic.py
 )
+from celery.signals import worker_process_init
+
+@worker_process_init.connect
+def fix_path(**kwargs):
+    """При старте каждого воркера — принудительно фиксим path."""
+    api_dir = os.path.dirname(os.path.abspath(__file__))
+    parent_dir = os.path.dirname(api_dir)
+    
+    # api/ первый
+    if api_dir not in sys.path:
+        sys.path.insert(0, api_dir)
+    
+    # Родитель — убрать
+    while parent_dir in sys.path:
+        sys.path.remove(parent_dir)
+    
+    # Сбросить кеш config
+    if 'config' in sys.modules:
+        loaded = getattr(sys.modules['config'], '__file__', '')
+        if 'api' not in loaded:
+            del sys.modules['config']

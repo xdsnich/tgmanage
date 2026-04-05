@@ -187,27 +187,12 @@ async def set_2fa(
             await client.disconnect()
             raise HTTPException(status_code=400, detail="Сессия не активна")
 
-        from telethon.tl.functions.account import UpdatePasswordSettingsRequest, GetPasswordRequest
-        from telethon.tl.types import InputCheckPasswordEmpty
-        from telethon.password import compute_check
-
-        pwd = await client(GetPasswordRequest())
-
-        if pwd.has_password:
-            raise HTTPException(status_code=400, detail="2FA уже установлена. Сначала снимите старую.")
-
-        import hashlib
-        new_salt = os.urandom(8)
-        new_hash = hashlib.sha256(new_salt + body.password.encode() + new_salt).digest()
-
-        await client(UpdatePasswordSettingsRequest(
-            password=InputCheckPasswordEmpty(),
-            new_settings={
-                'new_algo': pwd.new_algo,
-                'new_password_hash': compute_check(pwd, body.password),
-                'hint': body.hint or '',
-            }
-        ))
+        # Telethon встроенный метод — сам обрабатывает алгоритмы
+        await client.edit_2fa(
+            current_password=None,
+            new_password=body.password,
+            hint=body.hint or '',
+        )
 
         acc.has_2fa = True
         await db.flush()
@@ -220,8 +205,6 @@ async def set_2fa(
         try: await client.disconnect()
         except: pass
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)[:200]}")
-
-
 @router.post("/accounts/{account_id}/remove-2fa")
 async def remove_2fa(
     account_id: int,
