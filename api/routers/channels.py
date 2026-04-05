@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.orm import joinedload
 from typing import Optional
 
 from database import get_db
@@ -44,8 +45,9 @@ class PinChannelRequest(BaseModel):
 # ── Helper ───────────────────────────────────────────────────
 
 async def _get_account(db, account_id, user_id) -> TelegramAccount:
+    
     result = await db.execute(
-        select(TelegramAccount).where(
+        select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(
             TelegramAccount.id == account_id,
             TelegramAccount.user_id == user_id,
         )
@@ -226,7 +228,7 @@ async def batch_create_channels(
 ):
     """Создать каналы для нескольких аккаунтов через Celery"""
     result = await db.execute(
-        select(TelegramAccount).where(
+        select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(
             TelegramAccount.user_id == current_user.id,
             TelegramAccount.id.in_(body.account_ids),
         )

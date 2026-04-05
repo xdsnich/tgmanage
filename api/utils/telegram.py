@@ -53,10 +53,12 @@ def _build_proxy(proxy_row):
     return proxy
 
 
-def make_telethon_client(account, proxy_row=None):
-    """Создаёт TelegramClient для аккаунта с прокси."""
+def make_telethon_client(account, proxy_row=None, api_id_override=None, api_hash_override=None):
+    """
+    Создаёт TelegramClient для аккаунта.
+    Приоритет: override → account.api_app → глобальный config
+    """
     from telethon import TelegramClient
-    cli_config = get_cli_config()
 
     session_file = account.session_file if hasattr(account, 'session_file') else account.get('session_file', '')
     if not session_file or not Path(session_file).exists():
@@ -66,8 +68,25 @@ def make_telethon_client(account, proxy_row=None):
     session_path = session_file.replace(".session", "")
     tg_proxy = _build_proxy(proxy_row)
 
+    # Определяем API credentials
+    used_api_id = api_id_override
+    used_api_hash = api_hash_override
+
+    if not used_api_id:
+        if hasattr(account, 'api_app') and account.api_app and account.api_app.is_active:
+            used_api_id = account.api_app.api_id
+            used_api_hash = account.api_app.api_hash
+            logger.info(f"📱 API app: {account.api_app.title} (id={used_api_id})")
+
+    if not used_api_id:
+        cli_config = get_cli_config()
+        used_api_id = cli_config.API_ID
+        used_api_hash = cli_config.API_HASH
+    if not tg_proxy:
+        logger.warning(f"⛔ Аккаунт {session_path} — нет прокси, подключение отменено")
+        return None
     return TelegramClient(
-        session_path, cli_config.API_ID, cli_config.API_HASH,
+        session_path, used_api_id, used_api_hash,
         proxy=tg_proxy,
         device_model="Desktop", system_version="Windows 10", app_version="4.14.15",
         lang_code="ru", system_lang_code="ru",
@@ -77,10 +96,11 @@ def make_telethon_client(account, proxy_row=None):
 
 async def get_account_with_proxy(db, account_id: int):
     from sqlalchemy import select
+    from sqlalchemy.orm import joinedload
     from models.account import TelegramAccount
     from models.proxy import Proxy
 
-    acc_r = await db.execute(select(TelegramAccount).where(TelegramAccount.id == account_id))
+    acc_r = await db.execute(select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(TelegramAccount.id == account_id))
     account = acc_r.scalar_one_or_none()
     if not account:
         return None, None

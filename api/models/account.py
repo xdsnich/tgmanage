@@ -14,7 +14,7 @@ from database import Base
 if TYPE_CHECKING:
     from models.user import User
     from models.proxy import Proxy
-
+    from models.api_app import ApiApp
 
 class AccountStatus(str, enum.Enum):
     unknown    = "unknown"
@@ -55,6 +55,7 @@ class TelegramAccount(Base):
     notes:            Mapped[str]                  = mapped_column(Text, default="")
     channels:         Mapped[list]                 = mapped_column(JSON, default=list)
     proxy_id:         Mapped[Optional[int]]        = mapped_column(ForeignKey("proxies.id", ondelete="SET NULL"), nullable=True)
+    api_app_id:       Mapped[Optional[int]]        = mapped_column(ForeignKey("api_apps.id", ondelete="SET NULL"), nullable=True, index=True)
     geo:              Mapped[str]                  = mapped_column(String(64), default="", server_default="")
     category:         Mapped[str]                  = mapped_column(String(128), default="", server_default="")
     added_at:         Mapped[datetime]             = mapped_column(DateTime, default=datetime.utcnow)
@@ -64,6 +65,7 @@ class TelegramAccount(Base):
 
     user:  Mapped[User]  = relationship("User", back_populates="accounts")
     proxy: Mapped[Optional[Proxy]] = relationship("Proxy", back_populates="accounts")
+    api_app: Mapped[Optional[ApiApp]] = relationship("ApiApp", back_populates="accounts")
 
     def __repr__(self):
         return f"<Account {self.phone} [{self.status}]>"

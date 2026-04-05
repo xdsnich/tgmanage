@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-
+from sqlalchemy.orm import joinedload
 from database import get_db
 from routers.deps import get_current_user
 from models.user import User
@@ -28,7 +28,7 @@ router = APIRouter(prefix="/security", tags=["security"])
 
 async def _get_account(db, account_id, user_id) -> TelegramAccount:
     result = await db.execute(
-        select(TelegramAccount).where(
+        select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(
             TelegramAccount.id == account_id,
             TelegramAccount.user_id == user_id,
         )

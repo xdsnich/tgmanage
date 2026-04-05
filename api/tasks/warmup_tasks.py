@@ -182,6 +182,8 @@ async def _process_all_warmups():
     Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 
     async with Session() as db:
+        from sqlalchemy.orm import joinedload
+
         try:
             result = await db.execute(
                 select(WarmupTask).where(WarmupTask.status == "running")
@@ -196,7 +198,7 @@ async def _process_all_warmups():
             processed = 0
             for t in tasks:
                 acc_r = await db.execute(
-                    select(TelegramAccount).where(TelegramAccount.id == t.account_id)
+                    select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(TelegramAccount.id == t.account_id)
                 )
                 acc = acc_r.scalar_one_or_none()
                 if not acc or acc.status != "active":

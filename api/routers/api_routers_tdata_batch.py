@@ -5,7 +5,7 @@ GramGPT API — Пакетный импорт TData (добавить в api/rou
 Принимает несколько ZIP-файлов с TData + опциональный proxy_id.
 Каждый ZIP обрабатывается последовательно: распаковка → конвертация → сохранение в БД.
 """
-
+from sqlalchemy.orm import joinedload
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Добавить этот эндпоинт в файл: api/routers/tdata.py
 # (после существующего @router.post("/tdata"))
@@ -120,7 +120,7 @@ async def import_tdata_batch(
             phone = account_dict.get("phone", "")
             from sqlalchemy import select as sa_select
             existing = await db.execute(
-                sa_select(TelegramAccount).where(
+                sa_select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(
                     TelegramAccount.phone == phone,
                     TelegramAccount.user_id == current_user.id,
                 )
@@ -147,6 +147,13 @@ async def import_tdata_batch(
             )
             db.add(account)
             await db.flush()
+
+            # Авто-назначение API ключа
+            from services.api_apps import pick_best_app
+            best_app = await pick_best_app(db, current_user.id)
+            if best_app:
+                account.api_app_id = best_app.id
+                await db.flush()
 
             imported += 1
             results.append({

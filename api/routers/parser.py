@@ -16,7 +16,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
-
+from sqlalchemy.orm import joinedload
 from database import get_db
 from routers.deps import get_current_user
 from models.user import User
@@ -89,7 +89,7 @@ async def search_channels(
 ):
     """Поиск каналов через Telegram С ПРОКСИ."""
     acc_r = await db.execute(
-        select(TelegramAccount).where(TelegramAccount.id == body.account_id, TelegramAccount.user_id == current_user.id)
+        select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(TelegramAccount.id == body.account_id, TelegramAccount.user_id == current_user.id)
     )
     acc = acc_r.scalar_one_or_none()
     if not acc or not acc.session_file:

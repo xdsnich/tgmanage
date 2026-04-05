@@ -90,6 +90,7 @@ async def _send_comment_via_telethon(account, proxy, username, post_id, comment,
 async def _process_campaign(c, db):
     """Веб-парсинг публичных каналов. Закрытые → run_listener.py."""
     from sqlalchemy import select
+    from sqlalchemy.orm import joinedload
     from models.campaign import TargetChannel, CampaignStatus, CommentLog
     from models.account import TelegramAccount
     from models.proxy import Proxy
@@ -107,7 +108,7 @@ async def _process_campaign(c, db):
     if not channels or not c.account_ids: return
 
     acc_id = random.choice(c.account_ids)
-    acc_r = await db.execute(select(TelegramAccount).where(TelegramAccount.id == acc_id))
+    acc_r = await db.execute(select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(TelegramAccount.id == acc_id))
     account = acc_r.scalar_one_or_none()
     if not account or not account.session_file: return
 

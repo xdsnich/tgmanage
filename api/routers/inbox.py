@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-
+from sqlalchemy.orm import joinedload
 from database import get_db
 from routers.deps import get_current_user
 from models.user import User
@@ -34,7 +34,7 @@ class AIConfigRequest(BaseModel):
 
 async def _get_account(db, account_id, user_id):
     result = await db.execute(
-        select(TelegramAccount).where(TelegramAccount.id == account_id, TelegramAccount.user_id == user_id)
+        select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(TelegramAccount.id == account_id, TelegramAccount.user_id == user_id)
     )
     acc = result.scalar_one_or_none()
     if not acc:

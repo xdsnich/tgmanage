@@ -310,6 +310,7 @@ async def _process_all_dialogs():
     TaskSession = async_sessionmaker(bind=task_engine, class_=AsyncSession, expire_on_commit=False)
 
     async with TaskSession() as db:
+        from sqlalchemy.orm import joinedload
         try:
             result = await db.execute(
                 select(AIDialog).where(AIDialog.is_active == True)
@@ -320,11 +321,11 @@ async def _process_all_dialogs():
                 return {"processed": 0}
 
             logger.info(f"Активных ИИ-диалогов: {len(active_dialogs)}")
-
+            
             processed = 0
             for ai_dialog in active_dialogs:
                 acc_result = await db.execute(
-                    select(TelegramAccount).where(
+                    select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(
                         TelegramAccount.id == ai_dialog.account_id
                     )
                 )
@@ -388,7 +389,7 @@ def process_single_account_dialogs(self, account_id: int):
         from config import DATABASE_URL
         from models.account import TelegramAccount
         from models.ai_dialog import AIDialog
-
+        from sqlalchemy.orm import joinedload
         task_engine = create_async_engine(DATABASE_URL, pool_size=2, max_overflow=0)
         TaskSession = async_sessionmaker(bind=task_engine, class_=AsyncSession, expire_on_commit=False)
 
@@ -402,7 +403,7 @@ def process_single_account_dialogs(self, account_id: int):
             dialogs = result.scalars().all()
 
             acc_result = await db.execute(
-                select(TelegramAccount).where(TelegramAccount.id == account_id)
+                select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(TelegramAccount.id == account_id)
             )
             account = acc_result.scalar_one_or_none()
 

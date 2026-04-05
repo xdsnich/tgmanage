@@ -11,9 +11,10 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-
+from sqlalchemy.orm import joinedload
 from database import get_db
 from schemas.account import AccountCreate, AccountUpdate, AccountOut, AccountCheckResult
+
 from services import accounts as acc_svc
 from routers.deps import get_current_user
 from models.user import User
@@ -99,7 +100,7 @@ async def import_from_json(current_user: User = Depends(get_current_user), db: A
 async def _get_acc_and_client(account_id: int, user_id: int, db: AsyncSession):
     """Загружает аккаунт + создаёт TelegramClient с прокси."""
     result = await db.execute(
-        select(TelegramAccount).where(TelegramAccount.id == account_id, TelegramAccount.user_id == user_id)
+        select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(TelegramAccount.id == account_id, TelegramAccount.user_id == user_id)
     )
     acc = result.scalar_one_or_none()
     if not acc:
@@ -232,7 +233,7 @@ async def download_session(
     from pathlib import Path
 
     result = await db.execute(
-        select(TelegramAccount).where(TelegramAccount.id == account_id, TelegramAccount.user_id == current_user.id)
+        select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(TelegramAccount.id == account_id, TelegramAccount.user_id == current_user.id)
     )
     acc = result.scalar_one_or_none()
     if not acc:
@@ -256,7 +257,7 @@ async def export_tdata(
     import tempfile, shutil, zipfile
 
     result = await db.execute(
-        select(TelegramAccount).where(TelegramAccount.id == account_id, TelegramAccount.user_id == current_user.id)
+        select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(TelegramAccount.id == account_id, TelegramAccount.user_id == current_user.id)
     )
     acc = result.scalar_one_or_none()
     if not acc:
@@ -804,6 +805,14 @@ async def import_tdata_batch(
                 )
                 db.add(account)
                 await db.flush()
+
+                # Авто-назначение API ключа
+                from services.api_apps import pick_best_app
+                best_app = await pick_best_app(db, current_user.id)
+                if best_app:
+                    account.api_app_id = best_app.id
+                    await db.flush()
+
                 results.append({"index": item.index, "phone": phone, "success": True,
                                 "account_id": account.id, "name": me.first_name or ""})
 

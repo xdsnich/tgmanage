@@ -31,6 +31,7 @@ load_dotenv(os.path.join(API_DIR, '.env'))
 
 
 async def main():
+    from sqlalchemy.orm import joinedload
     from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select
     from config import DATABASE_URL
@@ -79,7 +80,7 @@ async def main():
             # Кэшируем аккаунт
             acc_id = c.account_ids[0]  # Берём первый
             if acc_id not in account_cache:
-                acc_r = await db.execute(select(TelegramAccount).where(TelegramAccount.id == acc_id))
+                acc_r = await db.execute(select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(TelegramAccount.id == acc_id))
                 account = acc_r.scalar_one_or_none()
                 if account and account.session_file:
                     proxy = None

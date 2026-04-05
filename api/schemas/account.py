@@ -49,6 +49,7 @@ class AccountOut(BaseModel):
     added_at:        datetime
     last_checked:    Optional[datetime]
     error:           Optional[str]
+    api_app_id:  Optional[int] = None
 
     model_config = {"from_attributes": True}
 

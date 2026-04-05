@@ -48,8 +48,12 @@ async def _check_account_with_proxy(account_dict: dict, check_spam: bool = False
     try:
         async with Session() as db:
             # Ищем аккаунт в БД по номеру
+            from sqlalchemy.orm import joinedload
+
             acc_r = await db.execute(
-                select(TelegramAccount).where(TelegramAccount.phone == phone)
+                select(TelegramAccount)
+                .options(joinedload(TelegramAccount.api_app))
+                .where(TelegramAccount.phone == phone)
             )
             account = acc_r.scalar_one_or_none()
 

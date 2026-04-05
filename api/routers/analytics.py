@@ -7,6 +7,7 @@ GramGPT API — routers/analytics.py
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
+from sqlalchemy.orm import joinedload
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -28,7 +29,7 @@ async def get_dashboard(
     По ТЗ: Health Dashboard со статусами, Trust Score, проверками.
     """
     result = await db.execute(
-        select(TelegramAccount).where(TelegramAccount.user_id == current_user.id)
+        select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(TelegramAccount.user_id == current_user.id)
     )
     accounts = result.scalars().all()
 
@@ -122,7 +123,7 @@ async def search_accounts(
     По ТЗ: поиск по номеру телефона, username, гео, статусу ограничений.
     """
     result = await db.execute(
-        select(TelegramAccount).where(TelegramAccount.user_id == current_user.id)
+        select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(TelegramAccount.user_id == current_user.id)
     )
     accounts = result.scalars().all()
 
@@ -170,7 +171,7 @@ async def filter_accounts(
     По ТЗ: фильтрация по тегам, роли, Trust Score, дате добавления.
     """
     result = await db.execute(
-        select(TelegramAccount).where(TelegramAccount.user_id == current_user.id)
+        select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(TelegramAccount.user_id == current_user.id)
     )
     accounts = list(result.scalars().all())
 
@@ -228,7 +229,7 @@ async def account_detail(
     По ТЗ: детальный просмотр + подсказки по Trust Score.
     """
     result = await db.execute(
-        select(TelegramAccount).where(
+        select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(
             TelegramAccount.id == account_id,
             TelegramAccount.user_id == current_user.id,
         )

@@ -11,6 +11,7 @@ from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
+from sqlalchemy.orm import joinedload
 from fastapi import HTTPException, status
 
 from models.account import TelegramAccount, AccountStatus
@@ -22,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 async def get_accounts(db: AsyncSession, user_id: int) -> list[TelegramAccount]:
     result = await db.execute(
-        select(TelegramAccount)
+        select(TelegramAccount).options(joinedload(TelegramAccount.api_app))
         .where(TelegramAccount.user_id == user_id)
         .order_by(TelegramAccount.added_at.desc())
     )
@@ -31,7 +32,7 @@ async def get_accounts(db: AsyncSession, user_id: int) -> list[TelegramAccount]:
 
 async def get_account(db: AsyncSession, account_id: int, user_id: int) -> TelegramAccount:
     result = await db.execute(
-        select(TelegramAccount).where(
+        select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(
             TelegramAccount.id == account_id,
             TelegramAccount.user_id == user_id
         )
@@ -44,7 +45,7 @@ async def get_account(db: AsyncSession, account_id: int, user_id: int) -> Telegr
 
 async def get_account_by_phone(db: AsyncSession, phone: str, user_id: int) -> Optional[TelegramAccount]:
     result = await db.execute(
-        select(TelegramAccount).where(
+        select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(
             TelegramAccount.phone == phone,
             TelegramAccount.user_id == user_id
         )
@@ -55,7 +56,7 @@ async def get_account_by_phone(db: AsyncSession, phone: str, user_id: int) -> Op
 async def get_stats(db: AsyncSession, user_id: int) -> dict:
     """Статистика по аккаунтам"""
     result = await db.execute(
-        select(TelegramAccount).where(TelegramAccount.user_id == user_id)
+        select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(TelegramAccount.user_id == user_id)
     )
     accounts = result.scalars().all()
 
@@ -161,6 +162,14 @@ async def sync_from_dict(db: AsyncSession, user: User, account_dict: dict) -> Te
         existing.status = account_dict.get("status", existing.status.value)
         existing.trust_score = account_dict.get("trust_score", existing.trust_score)
         existing.updated_at = datetime.utcnow()
+
+        # Авто-распределение — если ещё не привязан к API-приложению
+        if not existing.api_app_id:
+            from services.api_apps import pick_best_app
+            best_app = await pick_best_app(db, user.id)
+            if best_app:
+                existing.api_app_id = best_app.id
+
         await db.flush()
         return existing
 
@@ -181,4 +190,12 @@ async def sync_from_dict(db: AsyncSession, user: User, account_dict: dict) -> Te
     )
     db.add(account)
     await db.flush()
+
+    # Авто-распределение по API-приложению
+    from services.api_apps import pick_best_app
+    best_app = await pick_best_app(db, user.id)
+    if best_app:
+        account.api_app_id = best_app.id
+        await db.flush()
+
     return account

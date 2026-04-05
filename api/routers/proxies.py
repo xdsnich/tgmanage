@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from typing import Optional
-
+from sqlalchemy.orm import joinedload
 from database import get_db
 from schemas.proxy import ProxyCreate, ProxyOut, ProxyBulkCreate
 from models.proxy import Proxy
@@ -115,7 +115,7 @@ async def delete_proxy(
     proxy = result.scalar_one_or_none()
     if proxy:
         acc_result = await db.execute(
-            select(TelegramAccount).where(TelegramAccount.proxy_id == proxy_id)
+            select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(TelegramAccount.proxy_id == proxy_id)
         )
         for acc in acc_result.scalars().all():
             acc.proxy_id = None
@@ -175,7 +175,7 @@ async def assign_proxy(
     """
     # Проверяем аккаунт
     acc_result = await db.execute(
-        select(TelegramAccount).where(
+        select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(
             TelegramAccount.id == body.account_id,
             TelegramAccount.user_id == current_user.id,
         )
@@ -221,7 +221,7 @@ async def auto_assign_proxies(
     """Автоназначение: распределяет валидные прокси по аккаунтам без прокси."""
     # Аккаунты без прокси
     acc_result = await db.execute(
-        select(TelegramAccount).where(
+        select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(
             TelegramAccount.user_id == current_user.id,
             TelegramAccount.proxy_id.is_(None),
         )

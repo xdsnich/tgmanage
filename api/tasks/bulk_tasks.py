@@ -28,6 +28,7 @@ def run_async(coro):
 
 
 async def _get_client_for_phone(phone: str):
+    from sqlalchemy.orm import joinedload
     """Загружает аккаунт + прокси из БД, возвращает TelegramClient."""
     if API_DIR not in sys.path:
         sys.path.insert(0, API_DIR)
@@ -43,7 +44,7 @@ async def _get_client_for_phone(phone: str):
     Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 
     async with Session() as db:
-        acc_r = await db.execute(select(TelegramAccount).where(TelegramAccount.phone == phone))
+        acc_r = await db.execute(select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(TelegramAccount.phone == phone))
         account = acc_r.scalar_one_or_none()
         if not account:
             await engine.dispose()
