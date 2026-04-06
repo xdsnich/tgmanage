@@ -13,10 +13,12 @@ GramGPT API — tasks/warmup_v2.py
 
 import asyncio
 import random
+import re
 import sys
 import os
 import logging
 from datetime import datetime, timedelta
+from collections import defaultdict
 
 from celery_app import celery_app
 
@@ -79,6 +81,41 @@ SEARCH_WORDS = [
 ]
 
 REST_CHANCE = 0.15  # 15% шанс дня отдыха
+
+# Per-action-type daily limits
+MAX_DAILY_PER_ACTION = {
+    "join_channel": 3,
+    "set_reaction": 30,
+    "send_saved": 15,
+    "reply_dm": 10,
+}
+
+# Track per-account per-action daily counts: {task_id: {action_name: count}}
+_action_daily_counts: dict[int, dict[str, int]] = {}
+_action_daily_date: dict[int, object] = {}
+
+
+def _check_action_daily_limit(task_id: int, action_name: str) -> bool:
+    """Returns True if action is under daily limit for this task."""
+    from datetime import date
+    today = date.today()
+    if _action_daily_date.get(task_id) != today:
+        _action_daily_counts[task_id] = defaultdict(int)
+        _action_daily_date[task_id] = today
+
+    limit = MAX_DAILY_PER_ACTION.get(action_name)
+    if limit is None:
+        return True
+    return _action_daily_counts[task_id][action_name] < limit
+
+
+def _increment_action_daily(task_id: int, action_name: str):
+    from datetime import date
+    today = date.today()
+    if _action_daily_date.get(task_id) != today:
+        _action_daily_counts[task_id] = defaultdict(int)
+        _action_daily_date[task_id] = today
+    _action_daily_counts[task_id][action_name] += 1
 
 # ── Сессии — расписание "живого" человека ────────────────────
 
@@ -457,6 +494,11 @@ async def _run_session(task_row, account, proxy, session_cfg, db):
             if not action_fn:
                 continue
 
+            # Check per-action-type daily limit
+            if not _check_action_daily_limit(task_row.id, action["name"]):
+                logger.info(f"[warmup][{phone}]   {action['label']}: дневной лимит типа достигнут, пропуск")
+                continue
+
             try:
                 detail, channel = await action_fn(client, phone)
 
@@ -479,6 +521,7 @@ async def _run_session(task_row, account, proxy, session_cfg, db):
                 # Обновляем счётчики
                 task_row.actions_done += 1
                 task_row.today_actions += 1
+                _increment_action_daily(task_row.id, action["name"])
                 if action["name"] == "read_feed": task_row.feeds_read += 1
                 elif action["name"] == "set_reaction": task_row.reactions_set += 1
                 elif action["name"] == "view_stories": task_row.stories_viewed += 1
@@ -488,6 +531,22 @@ async def _run_session(task_row, account, proxy, session_cfg, db):
                 logger.info(f"[warmup][{phone}]   [{done}/{num_actions}] {action['label']}: {detail}")
 
             except Exception as e:
+                err = str(e)
+                if "FLOOD_WAIT" in err:
+                    wait = int(re.search(r"(\d+)", err).group(1)) if re.search(r"(\d+)", err) else 60
+                    logger.warning(f"[warmup][{phone}] FLOOD_WAIT_{wait} — sleeping and ending session early")
+                    await asyncio.sleep(wait + random.randint(5, 15))
+                    break
+                elif "AUTH_KEY_UNREGISTERED" in err or "UserDeactivatedBan" in type(e).__name__:
+                    logger.warning(f"[warmup][{phone}] Account frozen: {err[:80]}")
+                    account.status = "frozen"
+                    break
+                elif "PEER_FLOOD" in err:
+                    logger.warning(f"[warmup][{phone}] PEER_FLOOD — pausing for 24h")
+                    now = datetime.utcnow()
+                    task_row.next_action_at = now + timedelta(hours=24)
+                    break
+
                 log = WarmupLog(
                     task_id=task_row.id, account_id=account.id,
                     action=action["name"], detail=str(e)[:200],
