@@ -79,7 +79,8 @@ def _get_device_fingerprint(phone: str) -> dict:
     if not phone:
         return DEVICE_PROFILES[0]
     # Детерминированный выбор по хешу номера
-    h = sum(ord(c) for c in phone)
+    import hashlib
+    h = int(hashlib.md5(phone.encode()).hexdigest(), 16)
     return DEVICE_PROFILES[h % len(DEVICE_PROFILES)]
 
 

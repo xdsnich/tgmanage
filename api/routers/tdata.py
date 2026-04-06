@@ -82,13 +82,37 @@ async def import_session_file(
     # Пробуем подключиться и получить данные
     from telethon import TelegramClient
 
+    # Require proxy for Telegram connection
+    from sqlalchemy import select as _select
+    from models.proxy import Proxy as _Proxy
+    proxy_dict = None
+    # Try to find any proxy for this user
+    _proxy_r = await db.execute(
+        _select(_Proxy).where(_Proxy.user_id == current_user.id).limit(1)
+    )
+    _proxy_row = _proxy_r.scalar_one_or_none()
+    if not _proxy_row:
+        raise HTTPException(status_code=400, detail="Прокси обязателен для импорта сессий. Добавьте прокси.")
+    from routers.tg_auth import _make_proxy
+    proxy_dict = _make_proxy(_proxy_row)
+
+    # Use consistent device fingerprint
+    import sys as _sys
+    _api_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if _api_dir not in _sys.path:
+        _sys.path.insert(0, _api_dir)
+    from utils.telegram import _get_device_fingerprint
+    _phone_for_fp = phone or clean_phone
+    _fp = _get_device_fingerprint(f"+{_phone_for_fp}" if not _phone_for_fp.startswith("+") else _phone_for_fp)
+
     client = TelegramClient(
         str(session_path).replace(".session", ""),
         cli_config.API_ID,
         cli_config.API_HASH,
-        device_model="Desktop",
-        system_version="Windows 10",
-        app_version="4.14.15",
+        proxy=proxy_dict,
+        device_model=_fp["device"],
+        system_version=_fp["system"],
+        app_version=_fp["app_version"],
     )
 
     try:

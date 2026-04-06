@@ -98,14 +98,23 @@ def _make_proxy(proxy_row):
 
 
 def _make_client(phone, proxy_dict=None):
+    if not proxy_dict:
+        raise ValueError("Proxy is required for Telegram connection")
     from telethon import TelegramClient
+    import sys
+    api_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if api_dir not in sys.path:
+        sys.path.insert(0, api_dir)
+    from utils.telegram import _get_device_fingerprint
     cli_config = load_cli_config()
     session_path = str(cli_config.SESSIONS_DIR / phone.replace("+", ""))
+    fingerprint = _get_device_fingerprint(phone)
     return TelegramClient(
         session_path, cli_config.API_ID, cli_config.API_HASH,
         proxy=proxy_dict,
-        device_model="Desktop", system_version="Windows 10", app_version="4.14.15",
-        lang_code="ru", system_lang_code="ru",
+        device_model=fingerprint["device"], system_version=fingerprint["system"],
+        app_version=fingerprint["app_version"],
+        lang_code=fingerprint["lang"], system_lang_code=fingerprint["lang"],
         timeout=30,
     )
 
@@ -150,6 +159,9 @@ async def send_code(
             print(f"🔑 ПРОКСИ НЕ НАЙДЕН в БД: id={body.proxy_id}")
     else:
         print("🔑 БЕЗ ПРОКСИ — proxy_id не передан с фронта!")
+
+    if not proxy_dict:
+        raise HTTPException(status_code=400, detail="Прокси обязателен. Выберите прокси перед авторизацией.")
 
     print(f"🔑 proxy_dict = {proxy_dict}")
     client = _make_client(phone, proxy_dict)

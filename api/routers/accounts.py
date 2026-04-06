@@ -406,12 +406,19 @@ async def import_tdata(
                 proxy_dict = _build_proxy(proxy_row)
                 print(f"📦 Прокси: {proxy_row.host}:{proxy_row.port}")
 
+        if not proxy_dict:
+            raise HTTPException(status_code=400, detail="Прокси обязателен для импорта TData")
+
+        from utils.telegram import _get_device_fingerprint
+        _fp = _get_device_fingerprint(phone if phone else "unknown")
+
         from telethon import TelegramClient as TelethonClient
         client = TelethonClient(
             temp_session, cli_config.API_ID, cli_config.API_HASH,
             proxy=proxy_dict,
-            device_model="Desktop", system_version="Windows 10", app_version="4.14.15",
-            lang_code="ru", system_lang_code="ru", timeout=30,
+            device_model=_fp["device"], system_version=_fp["system"],
+            app_version=_fp["app_version"],
+            lang_code=_fp["lang"], system_lang_code=_fp["lang"], timeout=30,
         )
 
         await client.connect()
@@ -595,21 +602,15 @@ async def detect_tdata(
                         api_hash=cli_config.API_HASH,
                     )
 
-                    # Быстро проверяем — авторизован ли
+                    # Skip connect check — would expose server IP without proxy.
+                    # Session validity will be verified during import_tdata_batch with proxy.
                     phone = ""
                     name = ""
                     username = ""
                     try:
-                        await client.connect()
-                        if await client.is_user_authorized():
-                            me = await client.get_me()
-                            phone = f"+{me.phone}" if me.phone else ""
-                            name = me.first_name or ""
-                            username = me.username or ""
                         await client.disconnect()
                     except:
-                        try: await client.disconnect()
-                        except: pass
+                        pass
 
                     import asyncio as _aio
                     await _aio.sleep(0.3)
@@ -753,13 +754,22 @@ async def import_tdata_batch(
             shutil.copy2(session_path, final_session)
 
             # Подключаемся через прокси
+            if not proxy_dict:
+                results.append({"index": item.index, "phone": phone, "success": False,
+                                "error": "Прокси обязателен для импорта"})
+                continue
+
+            from utils.telegram import _get_device_fingerprint
+            _fp = _get_device_fingerprint(phone)
+
             from telethon import TelegramClient as TelethonClient
             sess = final_session.replace(".session", "")
             client = TelethonClient(
                 sess, cli_config.API_ID, cli_config.API_HASH,
                 proxy=proxy_dict,
-                device_model="Desktop", system_version="Windows 10", app_version="4.14.15",
-                lang_code="ru", system_lang_code="ru", timeout=30,
+                device_model=_fp["device"], system_version=_fp["system"],
+                app_version=_fp["app_version"],
+                lang_code=_fp["lang"], system_lang_code=_fp["lang"], timeout=30,
             )
 
             await client.connect()
