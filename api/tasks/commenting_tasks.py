@@ -8,12 +8,36 @@ GramGPT — tasks/commenting_tasks.py
 (persistent event listener — @client.on(events.NewMessage))
 """
 
-import asyncio, sys, os, random, logging
-from datetime import datetime
+import asyncio, sys, os, random, logging, re
+from datetime import datetime, date
+from collections import defaultdict
 from celery_app import celery_app
 
 logger = logging.getLogger(__name__)
 API_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+# Per-account daily comment limit
+MAX_COMMENTS_PER_ACCOUNT_PER_DAY = 5
+_account_daily_comments: dict[int, dict] = {}  # account_id -> {"date": date, "count": int}
+
+
+def _check_account_daily_limit(account_id: int) -> bool:
+    """Returns True if account is under daily limit."""
+    today = date.today()
+    entry = _account_daily_comments.get(account_id)
+    if not entry or entry["date"] != today:
+        _account_daily_comments[account_id] = {"date": today, "count": 0}
+        return True
+    return entry["count"] < MAX_COMMENTS_PER_ACCOUNT_PER_DAY
+
+
+def _increment_account_daily(account_id: int):
+    today = date.today()
+    entry = _account_daily_comments.get(account_id)
+    if not entry or entry["date"] != today:
+        _account_daily_comments[account_id] = {"date": today, "count": 1}
+    else:
+        entry["count"] += 1
 
 
 def run_async(coro):
@@ -75,7 +99,24 @@ async def _send_comment_via_telethon(account, proxy, username, post_id, comment,
         return True
     except Exception as e:
         err = str(e)
-        if "GetDiscussionMessage" in err or "MESSAGE_ID_INVALID" in err:
+        if "FLOOD_WAIT" in err:
+            wait = int(re.search(r"(\d+)", err).group(1)) if re.search(r"(\d+)", err) else 60
+            logger.warning(f"[{name}] FLOOD_WAIT_{wait} — sleeping and ending early")
+            await asyncio.sleep(wait + random.randint(5, 15))
+            try: await client.disconnect()
+            except: pass
+            return "flood_wait"
+        elif "PEER_FLOOD" in err:
+            logger.warning(f"[{name}] PEER_FLOOD — pausing account for 24h")
+            try: await client.disconnect()
+            except: pass
+            return "peer_flood"
+        elif "AUTH_KEY_UNREGISTERED" in err or "UserDeactivatedBan" in type(e).__name__:
+            logger.warning(f"[{name}] Account frozen: {err[:80]}")
+            try: await client.disconnect()
+            except: pass
+            return "frozen"
+        elif "GetDiscussionMessage" in err or "MESSAGE_ID_INVALID" in err:
             logger.warning(f"[{name}] @{username} #{post_id}: комменты отключены на этом посте")
         elif "private" in err.lower() or "banned" in err.lower() or "CHANNEL_PRIVATE" in err:
             logger.warning(f"[{name}] ⛔ @{username}: нет доступа — деактивирую канал")
@@ -107,7 +148,13 @@ async def _process_campaign(c, db):
     channels = ch_r.scalars().all()
     if not channels or not c.account_ids: return
 
-    acc_id = random.choice(c.account_ids)
+    # Pick an account that hasn't exceeded daily limit
+    eligible_ids = [aid for aid in c.account_ids if _check_account_daily_limit(aid)]
+    if not eligible_ids:
+        logger.info(f"[{c.name}] Все аккаунты достигли дневного лимита ({MAX_COMMENTS_PER_ACCOUNT_PER_DAY}/день)")
+        return
+
+    acc_id = random.choice(eligible_ids)
     acc_r = await db.execute(select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(TelegramAccount.id == acc_id))
     account = acc_r.scalar_one_or_none()
     if not account or not account.session_file: return
@@ -156,7 +203,7 @@ async def _process_campaign(c, db):
             logger.info(f"[{c.name}] Пост #{post.post_id}: не проходит триггер")
             continue
 
-        delay = min(c.delay_comment + random.randint(-30, 30), 60)
+        delay = max(c.delay_comment + random.randint(-30, 30), 30)
         if delay > 5:
             logger.info(f"[{c.name}] Задержка {delay}с...")
             await asyncio.sleep(delay)
@@ -170,8 +217,15 @@ async def _process_campaign(c, db):
             await db.commit()
             logger.warning(f"[{c.name}] ⛔ @{channel.username} деактивирован (нет доступа)")
             continue
-        if ok:
+        if ok == "frozen":
+            account.status = "frozen"
+            await db.commit()
+            return
+        if ok == "peer_flood" or ok == "flood_wait":
+            return
+        if ok is True:
             c.comments_sent += 1; channel.comments_sent += 1
+            _increment_account_daily(account.id)
             db.add(CommentLog(
                 campaign_id=c.id, account_id=account.id, account_phone=account.phone,
                 channel_username=channel.username, channel_title=channel.title or "",
