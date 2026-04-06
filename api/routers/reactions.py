@@ -40,7 +40,7 @@ class ReactionCreate(BaseModel):
     target: str = "post"           # post | comments | both
     comments_limit: int = 5        # сколько комментов реактить
     count: int = 0
-    delay_min: int = 3
+    delay_min: int = 10
     delay_max: int = 15
 
 

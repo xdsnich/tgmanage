@@ -17,7 +17,9 @@ DATABASE_URL = os.getenv(
 )
 
 # ── JWT ─────────────────────────────────────────────────────
-SECRET_KEY     = os.getenv("SECRET_KEY", "change-me-in-production-please")
+SECRET_KEY     = os.getenv("SECRET_KEY", "")
+if not SECRET_KEY or SECRET_KEY == "change-me-in-production-please":
+    raise RuntimeError("Set SECRET_KEY in .env! Default or empty SECRET_KEY is not allowed.")
 ALGORITHM      = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES  = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 60))
 REFRESH_TOKEN_EXPIRE_DAYS    = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", 30))
