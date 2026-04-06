@@ -206,6 +206,53 @@ def _call_groq_dialog(system_prompt: str, messages_history: list[dict]) -> str:
 
 # ── Основная логика ──────────────────────────────────────────
 
+async def _process_dialog_with_client(client, account_row, ai_dialog_row, db_session):
+    """Process a single AI dialog using an already-connected client."""
+    phone = account_row.phone
+    contact_id = ai_dialog_row.contact_id
+    system_prompt = ai_dialog_row.system_prompt
+
+    try:
+        messages = await client.get_messages(contact_id, limit=30)
+        if not messages:
+            return
+
+        last_msg = messages[0]
+        if last_msg.out or not last_msg.text:
+            return
+
+        saved_id = getattr(ai_dialog_row, 'last_msg_id', 0) or 0
+        if last_msg.id <= saved_id:
+            return
+
+        logger.info(f"[{phone}] Новое сообщение #{last_msg.id} от {contact_id}: {last_msg.text[:50]}...")
+
+        ai_dialog_row.last_msg_id = last_msg.id
+        ai_dialog_row.last_message = last_msg.text.strip()
+
+        history = []
+        for m in reversed(messages):
+            if not m.text:
+                continue
+            history.append({"role": "assistant" if m.out else "user", "content": m.text})
+
+        provider = getattr(ai_dialog_row, 'llm_provider', 'claude') or 'claude'
+        reply = call_llm_dialog(provider, system_prompt, history)
+
+        if not reply:
+            logger.warning(f"[{phone}] LLM ({provider}) вернул пустой ответ для msg #{last_msg.id}")
+            return
+
+        await client.send_message(contact_id, reply)
+        logger.info(f"[{phone}] Ответ отправлен ({len(reply)} символов)")
+
+        ai_dialog_row.messages_count = (ai_dialog_row.messages_count or 0) + 1
+        ai_dialog_row.updated_at = datetime.utcnow()
+
+    except Exception as e:
+        logger.error(f"[{phone}] Ошибка в ИИ-диалоге с {contact_id}: {e}")
+
+
 async def _process_single_dialog(account_row, ai_dialog_row, db_session, proxy_row=None):
     """
     Обрабатывает один ИИ-диалог.
@@ -321,12 +368,19 @@ async def _process_all_dialogs():
                 return {"processed": 0}
 
             logger.info(f"Активных ИИ-диалогов: {len(active_dialogs)}")
-            
+
+            # Group dialogs by account to avoid multiple connections per account
+            from collections import defaultdict
+            account_dialogs = defaultdict(list)
+            for d in active_dialogs:
+                account_dialogs[d.account_id].append(d)
+
             processed = 0
-            for ai_dialog in active_dialogs:
+            from models.proxy import Proxy
+            for account_id, dialogs in account_dialogs.items():
                 acc_result = await db.execute(
                     select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(
-                        TelegramAccount.id == ai_dialog.account_id
+                        TelegramAccount.id == account_id
                     )
                 )
                 account = acc_result.scalar_one_or_none()
@@ -334,15 +388,32 @@ async def _process_all_dialogs():
                 if not account or account.status != "active":
                     continue
 
-                # Загружаем прокси аккаунта
-                from models.proxy import Proxy
                 proxy = None
                 if hasattr(account, 'proxy_id') and account.proxy_id:
                     proxy_r = await db.execute(select(Proxy).where(Proxy.id == account.proxy_id))
                     proxy = proxy_r.scalar_one_or_none()
 
-                await _process_single_dialog(account, ai_dialog, db, proxy)
-                processed += 1
+                # ONE connection per account, process all dialogs
+                from utils.telegram import make_telethon_client
+                client = make_telethon_client(account, proxy)
+                if not client:
+                    continue
+
+                try:
+                    await client.connect()
+                    if not await client.is_user_authorized():
+                        continue
+
+                    for ai_dialog in dialogs:
+                        await _process_dialog_with_client(client, account, ai_dialog, db)
+                        processed += 1
+                except Exception as e:
+                    logger.error(f"[{account.phone}] Ошибка подключения: {e}")
+                finally:
+                    try:
+                        await client.disconnect()
+                    except:
+                        pass
 
             await db.commit()
             return {"processed": processed, "total": len(active_dialogs)}
