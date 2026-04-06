@@ -6,8 +6,10 @@ __pycache__/
 
 # Данные и сессии — не коммитим, это приватное
 sessions/
+*.session
 data/
 logs/
+test.py
 
 # Но шаблоны данных коммитим
 !data/.gitkeep
