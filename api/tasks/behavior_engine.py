@@ -148,7 +148,7 @@ ACCOUNT_LIMITS = {
     "max_comments_per_channel_day": 1,
     "cooldown_after_comment_min": 90,    # минуты (1.5 часа)
     "cooldown_after_comment_max": 240,   # минуты (4 часа)
-    "min_account_age_days": 3,
+    "min_account_age_days": 0,  # disabled — user manages warmup manually
 }
 
 

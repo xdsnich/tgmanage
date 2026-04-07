@@ -151,12 +151,6 @@ async def _process_campaign(c, db):
             if not acc or not behavior:
                 continue
 
-            # Проверка возраста прогрева
-            can_warmup, warmup_reason = check_warmup_age(behavior)
-            if not can_warmup:
-                logger.info(f"[{c.name}] Аккаунт {acc.phone}: {warmup_reason}")
-                continue
-
             # Проверка лимитов
             can_comment, limit_reason = check_account_can_comment(behavior, channel.username)
             if not can_comment:
