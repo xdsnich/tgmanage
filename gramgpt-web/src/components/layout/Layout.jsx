@@ -6,12 +6,14 @@ const NAV = [
   { to: '/accounts', emoji: '◉', label: 'Аккаунты', color: '#3d8bff' },
   { to: '/proxies', emoji: '◎', label: 'Прокси', color: '#00c2b2' },
   { to: '/inbox', emoji: '◆', label: 'Входящие', color: '#ff3d9a' },
-  { to: '/commenting', emoji: '🧠', label: 'Комментинг', color: '#ff6b35' },
-  { to: '/warmup', emoji: '🔥', label: 'Прогрев', color: '#3dd68c' },
-  { to: '/parser', emoji: '🔍', label: 'Парсер', color: '#3d8bff' },
-  { to: '/tasks', emoji: '◇', label: 'Задачи', color: '#e3a13f' },
+  { to: '/commenting', emoji: '◇', label: 'Комментинг', color: '#ff6b35' },
+  { to: '/warmup', emoji: '◐', label: 'Прогрев', color: '#3dd68c' },
+  { to: '/reactions', emoji: '◑', label: 'Реакции', color: '#ff3d9a' },
+  { to: '/parser', emoji: '◍', label: 'Парсер', color: '#3d8bff' },
+  { to: '/tasks', emoji: '◌', label: 'Задачи', color: '#e3a13f' },
   { to: '/analytics', emoji: '◈', label: 'Аналитика', color: '#00c2b2' },
-  { to: '/settings', emoji: '◐', label: 'Настройки', color: '#888' },
+  { to: '/api-keys', emoji: '◇', label: 'API ключи', color: '#ff6b35' },
+  { to: '/settings', emoji: '◎', label: 'Настройки', color: '#888' },
 ]
 
 export default function Layout({ children }) {

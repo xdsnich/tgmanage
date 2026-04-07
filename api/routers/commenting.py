@@ -423,3 +423,113 @@ async def get_comment_logs(
         "llm_provider": l.llm_provider,
         "created_at": l.created_at.isoformat(),
     } for l in logs]
+
+
+# ── Comment Queue (v2) ─────────────────────────────────────
+
+@router.get("/queue")
+async def get_comment_queue(
+    status: str = None,
+    limit: int = 50,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Очередь комментариев. Фильтр по status: scheduled/executing/done/failed/aborted."""
+    from models.comment_queue import CommentQueue
+
+    query = (
+        select(CommentQueue)
+        .join(Campaign, CommentQueue.campaign_id == Campaign.id)
+        .where(Campaign.user_id == current_user.id)
+    )
+    if status:
+        query = query.where(CommentQueue.status == status)
+    query = query.order_by(CommentQueue.scheduled_at.desc()).limit(limit)
+
+    result = await db.execute(query)
+    items = result.scalars().all()
+
+    return [{
+        "id": q.id,
+        "campaign_id": q.campaign_id,
+        "account_id": q.account_id,
+        "channel": q.channel,
+        "post_id": q.post_id,
+        "post_text": (q.post_text or "")[:200],
+        "personality": q.personality,
+        "style": q.style,
+        "status": q.status,
+        "scheduled_at": q.scheduled_at.isoformat() if q.scheduled_at else None,
+        "executed_at": q.executed_at.isoformat() if q.executed_at else None,
+        "comment_text": q.comment_text,
+        "error": q.error,
+        "created_at": q.created_at.isoformat() if q.created_at else None,
+    } for q in items]
+
+
+@router.get("/queue/stats")
+async def get_queue_stats(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Статистика очереди комментариев."""
+    from sqlalchemy import func
+    from models.comment_queue import CommentQueue
+
+    base = (
+        select(CommentQueue.status, func.count(CommentQueue.id).label("cnt"))
+        .join(Campaign, CommentQueue.campaign_id == Campaign.id)
+        .where(Campaign.user_id == current_user.id)
+        .group_by(CommentQueue.status)
+    )
+    result = await db.execute(base)
+    rows = result.all()
+
+    stats = {row.status: row.cnt for row in rows}
+    return {
+        "total": sum(stats.values()),
+        "scheduled": stats.get("scheduled", 0),
+        "executing": stats.get("executing", 0),
+        "done": stats.get("done", 0),
+        "failed": stats.get("failed", 0),
+        "aborted": stats.get("aborted", 0),
+    }
+
+
+# ── Account Behavior (v2) ──────────────────────────────────
+
+@router.get("/behavior")
+async def get_account_behaviors(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Профили поведения аккаунтов."""
+    from models.account_behavior import AccountBehavior
+    from models.account import TelegramAccount
+
+    result = await db.execute(
+        select(AccountBehavior)
+        .join(TelegramAccount, AccountBehavior.account_id == TelegramAccount.id)
+        .where(TelegramAccount.user_id == current_user.id)
+    )
+    behaviors = result.scalars().all()
+
+    # Подгружаем phone для отображения
+    out = []
+    for b in behaviors:
+        acc_r = await db.execute(select(TelegramAccount).where(TelegramAccount.id == b.account_id))
+        acc = acc_r.scalar_one_or_none()
+        out.append({
+            "id": b.id,
+            "account_id": b.account_id,
+            "phone": acc.phone if acc else "",
+            "personality": b.personality,
+            "timing_profile": b.timing_profile,
+            "style_profile": b.style_profile,
+            "comments_today": b.comments_today,
+            "last_comment_at": b.last_comment_at.isoformat() if b.last_comment_at else None,
+            "channels_commented_today": b.channels_commented_today or [],
+            "created_at": b.created_at.isoformat() if b.created_at else None,
+        })
+
+    return out

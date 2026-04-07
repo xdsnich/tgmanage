@@ -17,6 +17,8 @@ import WarmupPage from './pages/WarmupPage'
 import ParserPage from './pages/ParserPage'
 import SettingsPage from './pages/SettingsPage'
 import { Spinner } from './components/ui'
+import ApiKeysPage from './pages/ApiKeysPage'
+import ReactionsPage from './pages/ReactionsPage'
 
 // Защищённый роут — редиректит на /login если не авторизован
 function PrivateRoute({ children }) {
@@ -59,7 +61,9 @@ export default function App() {
               <Route path="/warmup" element={<WarmupPage />} />
               <Route path="/parser" element={<ParserPage />} />
               <Route path="/settings" element={<SettingsPage />} />
+              <Route path="/api-keys" element={<ApiKeysPage />} />
               <Route path="*" element={<Navigate to="/" replace />} />
+              <Route path="/reactions" element={<ReactionsPage />} />
             </Routes>
           </Layout>
         </PrivateRoute>

@@ -138,6 +138,65 @@ def _call_openai(system_prompt: str, post_text: str) -> str:
     return ""
 
 
+def build_comment_prompt(post_text: str, style_profile: dict, personality: dict = None) -> str:
+    """Генерирует промпт для LLM с учётом стиля конкретного аккаунта."""
+    base = "Ты — реальный пользователь Telegram. Напиши комментарий к посту."
+
+    rules = []
+
+    # Длина
+    length = style_profile.get("length", "medium")
+    if length == "short":
+        rules.append("Пиши ОЧЕНЬ коротко: 2-5 слов максимум.")
+    elif length == "medium":
+        rules.append("1-2 предложения, 20-80 символов.")
+    else:
+        rules.append("2-3 предложения, развёрнуто.")
+
+    # Эмодзи
+    if style_profile.get("uses_emoji"):
+        rules.append("Можешь использовать 1-2 эмодзи, но не всегда.")
+    else:
+        rules.append("НЕ используй эмодзи.")
+
+    # Ошибки
+    if style_profile.get("makes_typos"):
+        rules.append(
+            "Пиши разговорно, допускай мелкие ошибки "
+            "(пропущенные запятые, 'чо' вместо 'что', 'норм' вместо 'нормально'). "
+            "НЕ делай это в каждом слове — 1-2 ошибки максимум."
+        )
+
+    # Вопрос
+    if style_profile.get("asks_question"):
+        rules.append("Обязательно задай вопрос по теме поста.")
+
+    # Цитирование
+    if style_profile.get("starts_with_reply"):
+        rules.append(
+            "Начни с реакции на конкретную мысль из поста "
+            "('Согласен с тем что...', 'Не уверен насчёт...', 'Интересная мысль про...')."
+        )
+
+    # Общие правила
+    rules.append("Пиши на том же языке что и пост.")
+    rules.append("НЕ начинай с 'Отличный пост', 'Спасибо за информацию' — это шаблонно.")
+    rules.append("Будь естественным. Представь что ты просто листаешь ленту и решил написать.")
+    rules.append("Каждый комментарий должен быть УНИКАЛЬНЫМ. Никаких повторяющихся фраз.")
+
+    prompt = f"""{base}
+
+Правила для ЭТОГО комментария:
+{chr(10).join(f'- {r}' for r in rules)}
+
+Пост:
+{post_text}
+
+Напиши ТОЛЬКО текст комментария, ничего больше."""
+
+    return prompt
+
+
 def _call_gemini(system_prompt: str, post_text: str) -> str:
     import httpx
     api_key = os.getenv("GEMINI_API_KEY", "")

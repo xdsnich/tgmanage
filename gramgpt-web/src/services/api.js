@@ -60,11 +60,57 @@ export const accountsAPI = {
   update: (id, data) =>
     api.patch(`/accounts/${id}`, data),
 
+  updateTelegramProfile: (id, data) =>
+    api.post(`/accounts/${id}/update-telegram-profile`, data, { timeout: 30000 }),
+
+  setAvatar: (id, file) => {
+    const form = new FormData()
+    form.append('file', file)
+    return api.post(`/accounts/${id}/set-avatar`, form, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 30000,
+    })
+  },
+
+  pinChannel: (id, channelLink) =>
+    api.post(`/accounts/${id}/pin-channel`, { channel_link: channelLink }, { timeout: 30000 }),
+
+  downloadSession: (id) =>
+    api.get(`/accounts/${id}/download-session`, { responseType: 'blob', timeout: 30000 }),
+
+  exportTData: (id) =>
+    api.get(`/accounts/${id}/export-tdata`, { responseType: 'blob', timeout: 60000 }),
+
+  importTData: (file, proxyId = null) => {
+    const form = new FormData()
+    form.append('file', file)
+    if (proxyId) form.append('proxy_id', proxyId)
+    return api.post('/accounts/import-tdata', form, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 60000,
+    })
+  },
+
+  detectTData: (file) => {
+    const form = new FormData()
+    form.append('file', file)
+    return api.post('/accounts/detect-tdata', form, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 120000,
+    })
+  },
+
+  importTDataBatch: (sessionId, accounts) =>
+    api.post('/accounts/import-tdata-batch', { session_id: sessionId, accounts }, { timeout: 180000 }),
+
   delete: (id) =>
     api.delete(`/accounts/${id}`),
 
   stats: () =>
     api.get('/accounts/stats'),
+
+  filters: () =>
+    api.get('/accounts/filters'),
 
   importJson: () =>
     api.post('/accounts/import-json'),
@@ -217,15 +263,29 @@ export const importAPI = {
   },
 
   // Загрузка TData архива (ZIP)
-  uploadTData: (file, phone = '') => {
+  uploadTData: (file, proxyId = null) => {
     const form = new FormData()
     form.append('file', file)
-    if (phone) form.append('phone', phone)
-    return api.post('/import/tdata', form, {
+    if (proxyId) form.append('proxy_id', proxyId)
+    return api.post('/accounts/import-tdata', form, {
       headers: { 'Content-Type': 'multipart/form-data' },
       timeout: 120000,
     })
   },
+}
+
+// ── PARSER ───────────────────────────────────────────────────
+export const parserAPI = {
+  list: () => api.get('/parser/channels'),
+  search: (data) => api.post('/parser/search', data, { timeout: 120000 }),
+  delete: (id) => api.delete(`/parser/channels/${id}`),
+  clearAll: () => api.delete('/parser/channels'),
+  exportCSV: () => api.get('/parser/export', { responseType: 'blob' }),
+  importList: (channels) => api.post('/parser/import', { channels }),
+  folders: () => api.get('/parser/folders'),
+  folderChannels: (name) => api.get(`/parser/folders/${encodeURIComponent(name)}/channels`),
+  setFolder: (channelIds, folder) => api.post('/parser/set-folder', { channel_ids: channelIds, folder }),
+  updateChannelFolder: (id, folder) => api.patch(`/parser/channels/${id}/folder`, { folder }),
 }
 
 // ── COMMENTING (нейрокомментинг) ─────────────────────────────
@@ -257,6 +317,13 @@ export const commentingAPI = {
   addChannels: (id, channels) =>
     api.post(`/commenting/campaigns/${id}/channels`, { channels }),
 
+  addChannelsFromFolder: async (campaignId, folderName) => {
+    const { data } = await api.get(`/parser/folders/${encodeURIComponent(folderName)}/channels`)
+    const usernames = data.map(ch => `@${ch.username}`).filter(Boolean)
+    if (!usernames.length) return { data: { added: 0 } }
+    return api.post(`/commenting/campaigns/${campaignId}/channels`, { channels: usernames })
+  },
+
   removeChannel: (campaignId, channelId) =>
     api.delete(`/commenting/campaigns/${campaignId}/channels/${channelId}`),
 
@@ -267,4 +334,42 @@ export const commentingAPI = {
     api.get('/commenting/logs', { params: { campaign_id: campaignId, limit } }),
 }
 
+// ── API APPS (мульти-API ключи) ──────────────────────────────
+export const apiAppsAPI = {
+  list: () => api.get('/api-apps'),
+  get: (id) => api.get(`/api-apps/${id}`),
+  create: (data) => api.post('/api-apps', data),
+  update: (id, data) => api.patch(`/api-apps/${id}`, data),
+  delete: (id) => api.delete(`/api-apps/${id}`),
+  stats: () => api.get('/api-apps/stats/overview'),
+}
+
+// ── REACTIONS (реакции на посты) ──────────────────────────────
+export const reactionsAPI = {
+  list: () => api.get('/reactions/tasks'),
+  create: (data) => api.post('/reactions/tasks', data),
+  run: (id) => api.post(`/reactions/tasks/${id}/run`),
+  delete: (id) => api.delete(`/reactions/tasks/${id}`),
+  emojis: () => api.get('/reactions/emojis'),
+  quick: (data) => api.post('/reactions/quick', data),
+}
+export const warmupAPI = {
+  list: () => api.get('/warmup/tasks'),
+  create: (data) => api.post('/warmup/tasks', data),
+  start: (id) => api.post(`/warmup/tasks/${id}/start`),
+  startAll: () => api.post('/warmup/tasks/start-all'),
+  stop: (id) => api.post(`/warmup/tasks/${id}/stop`),
+  delete: (id) => api.delete(`/warmup/tasks/${id}`),
+  taskLogs: (id, limit = 50) => api.get(`/warmup/tasks/${id}/logs`, { params: { limit } }),
+  liveLogs: (limit = 30) => api.get('/warmup/logs/live', { params: { limit } }),
+  modes: () => api.get('/warmup/modes'),
+  pause: (id) => api.post(`/warmup/tasks/${id}/pause`),
+}
+
+export const subscribeAPI = {
+  list: () => api.get('/subscribe/tasks'),
+  create: (data) => api.post('/subscribe/tasks', data),
+  run: (id) => api.post(`/subscribe/tasks/${id}/run`),
+  delete: (id) => api.delete(`/subscribe/tasks/${id}`),
+}
 export default api

@@ -13,7 +13,7 @@ export default defineConfig({
     port: 3000,
     proxy: {
       // Все запросы /api/* — проксируем на FastAPI
-      '/api': {
+      '/api/': {
         target: 'http://localhost:8000',
         changeOrigin: true,
       },

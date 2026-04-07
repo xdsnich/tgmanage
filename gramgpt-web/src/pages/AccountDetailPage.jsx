@@ -47,9 +47,11 @@ export default function AccountDetailPage() {
   const [channelTitle, setChannelTitle] = useState('')
   const [channelDesc, setChannelDesc] = useState('')
   const [channelUsername, setChannelUsername] = useState('')
+  const [channelLink, setChannelLink] = useState('')
   const [exportData, setExportData] = useState(null)
 
   const [saving, setSaving] = useState(false)
+  const [showPass, setShowPass] = useState(false)
   const [actionLoading, setActionLoading] = useState(null)
   const [toast, setToast] = useState(null)
 
@@ -90,8 +92,38 @@ export default function AccountDetailPage() {
   const handleSaveProfile = async (e) => {
     e.preventDefault(); setSaving(true)
     try {
+      // 1. Обновляем в Telegram (имя, фамилия, био)
+      const tgData = {}
+      if (editData.first_name !== undefined) tgData.first_name = editData.first_name
+      if (editData.last_name !== undefined) tgData.last_name = editData.last_name
+      if (editData.bio !== undefined) tgData.bio = editData.bio
+      if (Object.keys(tgData).length > 0) {
+        await accountsAPI.updateTelegramProfile(id, tgData)
+      }
+      // 2. Обновляем в БД (роль, заметки, теги + имя/фамилия/био)
       await accountsAPI.update(id, editData)
-      setEditModal(false); showToast('Профиль обновлён'); await load()
+      setEditModal(false); showToast('Профиль обновлён в Telegram ✅'); await load()
+    } catch (err) { showToast(err.response?.data?.detail || 'Ошибка', 'error') }
+    setSaving(false)
+  }
+
+  const handleSetAvatar = async (e) => {
+    const file = e.target.files[0]
+    if (!file) return
+    setSaving(true)
+    try {
+      await accountsAPI.setAvatar(id, file)
+      showToast('Аватарка установлена ✅'); await load()
+    } catch (err) { showToast(err.response?.data?.detail || 'Ошибка', 'error') }
+    setSaving(false)
+  }
+
+  const handlePinChannel = async () => {
+    if (!channelLink.trim()) return
+    setSaving(true)
+    try {
+      await accountsAPI.pinChannel(id, channelLink)
+      showToast('Канал закреплён ✅'); setChannelLink('')
     } catch (err) { showToast(err.response?.data?.detail || 'Ошибка', 'error') }
     setSaving(false)
   }
@@ -133,6 +165,34 @@ export default function AccountDetailPage() {
     } catch (err) { showToast(err.response?.data?.detail || 'Ошибка', 'error') }
   }
 
+  const handleDownloadSession = async () => {
+    try {
+      const { data } = await accountsAPI.downloadSession(id)
+      const url = window.URL.createObjectURL(new Blob([data]))
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${account?.phone?.replace('+', '') || 'session'}.session`
+      a.click()
+      window.URL.revokeObjectURL(url)
+      showToast('Файл .session скачан ✅')
+    } catch (err) { showToast(err.response?.data?.detail || 'Ошибка', 'error') }
+  }
+
+  const handleExportTData = async () => {
+    setSaving(true)
+    try {
+      const { data } = await accountsAPI.exportTData(id)
+      const url = window.URL.createObjectURL(new Blob([data]))
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${account?.phone?.replace('+', '') || 'tdata'}_tdata.zip`
+      a.click()
+      window.URL.revokeObjectURL(url)
+      showToast('TData экспортирован ✅')
+    } catch (err) { showToast(err.response?.data?.detail || 'Ошибка экспорта TData', 'error') }
+    setSaving(false)
+  }
+
   const handleSendCode = async () => {
     setSaving(true); setAuthMsg('')
     try {
@@ -150,12 +210,22 @@ export default function AccountDetailPage() {
   const handleConfirmCode = async () => {
     setSaving(true); setAuthMsg('')
     try {
-      await tgAuthAPI.confirm(authPhone, authCode)
+      const { data } = await tgAuthAPI.confirm(authPhone, authCode)
+      // Проверяем нужна ли 2FA
+      if (data.needs_2fa) {
+        setAuthStep('needs_2fa')
+        setAuthMsg('Требуется пароль 2FA')
+        setAuthCode('')
+        setSaving(false)
+        return
+      }
       setAuthModal(false); setAuthStep('idle'); setAuthCode('')
       showToast('Авторизация успешна'); await load()
     } catch (err) {
       const detail = err.response?.data?.detail || ''
-      if (detail.includes('2FA')) { setAuthStep('needs_2fa'); setAuthMsg('Требуется пароль 2FA') }
+      if (detail.includes('2FA') || detail.includes('password') || detail.includes('Password') || detail.includes('пароль')) {
+        setAuthStep('needs_2fa'); setAuthMsg('Требуется пароль 2FA'); setAuthCode('')
+      }
       else { setAuthMsg(detail || 'Ошибка подтверждения') }
     }
     setSaving(false)
@@ -391,6 +461,12 @@ export default function AccountDetailPage() {
               <Button variant="ghost" size="sm" onClick={handleExportSession} style={{ width: '100%' }}>
                 📦 Экспорт сессии (JSON)
               </Button>
+              <Button variant="ghost" size="sm" onClick={handleDownloadSession} style={{ width: '100%' }}>
+                💾 Скачать .session файл
+              </Button>
+              <Button variant="ghost" size="sm" onClick={handleExportTData} loading={saving} style={{ width: '100%' }}>
+                📦 Экспорт TData (ZIP)
+              </Button>
             </div>
           </Card>
 
@@ -470,6 +546,26 @@ export default function AccountDetailPage() {
             </select>
           </div>
           <Input label="Заметки" value={editData.notes || ''} onChange={e => setEditData(d => ({ ...d, notes: e.target.value }))} placeholder="Ваши заметки" />
+
+          {/* Аватарка */}
+          <div>
+            <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Аватарка</label>
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, padding: '8px 16px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, cursor: 'pointer', fontSize: 13, color: 'var(--text-2)', transition: 'all 0.15s' }}>
+              📷 Загрузить фото
+              <input type="file" accept="image/*" onChange={handleSetAvatar} style={{ display: 'none' }} />
+            </label>
+            {account?.has_photo && <span style={{ marginLeft: 10, fontSize: 12, color: 'var(--green)' }}>✅ Фото установлено</span>}
+          </div>
+
+          {/* Канал в профиле */}
+          <div>
+            <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Закрепить канал в профиле</label>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <input value={channelLink} onChange={e => setChannelLink(e.target.value)} placeholder="@username или ссылка" style={{ flex: 1, padding: '8px 12px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 13, outline: 'none' }} />
+              <Button variant="outline" size="sm" type="button" onClick={handlePinChannel} loading={saving}>📌 Закрепить</Button>
+            </div>
+          </div>
+
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
             <Button variant="ghost" type="button" onClick={() => setEditModal(false)}>Отмена</Button>
             <Button variant="primary" type="submit" loading={saving}>Сохранить</Button>
@@ -483,7 +579,13 @@ export default function AccountDetailPage() {
           <div style={{ padding: '10px 14px', background: 'rgba(124,77,255,0.06)', border: '1px solid rgba(124,77,255,0.15)', borderRadius: 10, fontSize: 12, color: 'var(--text-2)' }}>
             Двухфакторная аутентификация защитит аккаунт от несанкционированного доступа.
           </div>
-          <Input label="Пароль 2FA" type="password" value={twoFAPass} onChange={e => setTwoFAPass(e.target.value)} required placeholder="Придумайте пароль" />
+          <div style={{ position: 'relative' }}>
+            <Input label="Пароль 2FA" type={showPass ? 'text' : 'password'} value={twoFAPass} onChange={e => setTwoFAPass(e.target.value)} required placeholder="Придумайте пароль" />
+            <button type="button" onClick={() => setShowPass(p => !p)} style={{
+              position: 'absolute', right: 10, top: 28, background: 'none', border: 'none',
+              color: 'var(--text-3)', cursor: 'pointer', fontSize: 14, padding: '4px',
+            }}>{showPass ? '🙈' : '👁'}</button>
+          </div>
           <Input label="Подсказка (опционально)" value={twoFAHint} onChange={e => setTwoFAHint(e.target.value)} placeholder="Чтобы не забыть" />
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
             <Button variant="ghost" type="button" onClick={() => setTwoFAModal(false)}>Отмена</Button>
@@ -525,7 +627,13 @@ export default function AccountDetailPage() {
 
           {authStep === 'needs_2fa' && (
             <>
-              <Input label="Пароль 2FA" type="password" value={authCode} onChange={e => setAuthCode(e.target.value)} placeholder="Введите пароль 2FA" autoFocus />
+              <div style={{ position: 'relative' }}>
+                <Input label="Пароль 2FA" type={showPass ? 'text' : 'password'} value={authCode} onChange={e => setAuthCode(e.target.value)} placeholder="Введите пароль 2FA" autoFocus />
+                <button type="button" onClick={() => setShowPass(p => !p)} style={{
+                  position: 'absolute', right: 10, top: 28, background: 'none', border: 'none',
+                  color: 'var(--text-3)', cursor: 'pointer', fontSize: 14, padding: '4px',
+                }}>{showPass ? '🙈' : '👁'}</button>
+              </div>
               <Button variant="primary" onClick={handleConfirm2FA} loading={saving}>Подтвердить 2FA</Button>
             </>
           )}

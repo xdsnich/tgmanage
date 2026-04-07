@@ -1,16 +1,6 @@
 import { useEffect, useState } from 'react'
-import { accountsAPI } from '../services/api'
+import { accountsAPI, parserAPI } from '../services/api'
 import { Card, Button, Input, Modal, Badge, Spinner, Empty, StatCard } from '../components/ui'
-import api from '../services/api'
-
-const parserAPI = {
-  list: () => api.get('/parser/channels'),
-  search: (data) => api.post('/parser/search', data),
-  delete: (id) => api.delete(`/parser/channels/${id}`),
-  clearAll: () => api.delete('/parser/channels'),
-  exportCSV: () => api.get('/parser/export', { responseType: 'blob' }),
-  importList: (channels) => api.post('/parser/import', { channels }),
-}
 
 export default function ParserPage() {
   const [channels, setChannels] = useState([])
@@ -20,10 +10,16 @@ export default function ParserPage() {
   const [searchModal, setSearchModal] = useState(false)
   const [importModal, setImportModal] = useState(false)
   const [toast, setToast] = useState(null)
+  const [folders, setFolders] = useState([])
+  const [filterFolder, setFilterFolder] = useState('all')
+  const [newFolderInput, setNewFolderInput] = useState(false)
+  const [selectedChannels, setSelectedChannels] = useState([])
+  const [folderModal, setFolderModal] = useState(false)
+  const [folderName, setFolderName] = useState('')
 
   const [form, setForm] = useState({
     account_id: null, keywords: '', min_subscribers: 1000, max_subscribers: 500000,
-    only_with_comments: true, active_hours: 48,
+    only_with_comments: true, active_hours: 48, source: 'telegram',
   })
   const [importText, setImportText] = useState('')
   const [searchResult, setSearchResult] = useState(null)
@@ -33,13 +29,39 @@ export default function ParserPage() {
   const load = async () => {
     setLoading(true)
     try {
-      const [c, a] = await Promise.all([parserAPI.list(), accountsAPI.list()])
+      const [c, a, f] = await Promise.all([
+        parserAPI.list(), accountsAPI.list(),
+        parserAPI.folders().catch(() => ({ data: [] })),
+      ])
       setChannels(c.data); setAccounts(a.data.filter(acc => acc.status === 'active'))
+      setFolders(f.data || [])
     } catch { }
     setLoading(false)
   }
 
   useEffect(() => { load() }, [])
+
+  const filteredChannels = channels.filter(c =>
+    filterFolder === 'all' || (c.folder || '') === filterFolder
+  )
+
+  const handleSetFolder = async (folder) => {
+    if (!selectedChannels.length) return
+    try {
+      await parserAPI.setFolder(selectedChannels, folder)
+      showToast(`${selectedChannels.length} каналов → "${folder}"`)
+      setSelectedChannels([]); setFolderModal(false); await load()
+    } catch (err) { showToast(err.response?.data?.detail || 'Ошибка', 'error') }
+  }
+
+  const toggleSelect = (id) => {
+    setSelectedChannels(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id])
+  }
+
+  const selectAll = () => {
+    if (selectedChannels.length === filteredChannels.length) setSelectedChannels([])
+    else setSelectedChannels(filteredChannels.map(c => c.id))
+  }
 
   const handleSearch = async () => {
     if (!form.account_id || !form.keywords.trim()) return
@@ -108,21 +130,80 @@ export default function ParserPage() {
         <Empty icon="🔍" title="База каналов пуста" subtitle="Запустите поиск или импортируйте список" action={<Button variant="primary" onClick={() => setSearchModal(true)}>🔍 Поиск</Button>} />
       ) : (
         <>
-          <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 12 }}>
+          {/* Папки — чипы */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginBottom: 12 }}>
+            <span style={{ fontSize: 10, color: 'var(--text-3)', fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', minWidth: 60 }}>📁 Папки</span>
+            <button onClick={() => setFilterFolder('all')} style={{
+              padding: '5px 12px', borderRadius: 20, cursor: 'pointer', fontSize: 11, transition: 'all 0.15s',
+              fontWeight: filterFolder === 'all' ? 600 : 400,
+              border: `1px solid ${filterFolder === 'all' ? 'rgba(124,77,255,0.4)' : 'var(--border)'}`,
+              background: filterFolder === 'all' ? 'rgba(124,77,255,0.15)' : 'transparent',
+              color: filterFolder === 'all' ? 'var(--violet)' : 'var(--text-3)',
+            }}>Все ({channels.length})</button>
+            <button onClick={() => setFilterFolder('')} style={{
+              padding: '5px 12px', borderRadius: 20, cursor: 'pointer', fontSize: 11, transition: 'all 0.15s',
+              fontWeight: filterFolder === '' ? 600 : 400,
+              border: `1px solid ${filterFolder === '' ? 'rgba(255,180,0,0.4)' : 'var(--border)'}`,
+              background: filterFolder === '' ? 'rgba(255,180,0,0.12)' : 'transparent',
+              color: filterFolder === '' ? 'var(--yellow)' : 'var(--text-3)',
+            }}>Без папки ({channels.filter(c => !c.folder).length})</button>
+            {folders.map(f => (
+              <button key={f.name} onClick={() => setFilterFolder(filterFolder === f.name ? 'all' : f.name)} style={{
+                padding: '5px 12px', borderRadius: 20, cursor: 'pointer', fontSize: 11, transition: 'all 0.15s',
+                fontWeight: filterFolder === f.name ? 600 : 400,
+                border: `1px solid ${filterFolder === f.name ? 'rgba(124,77,255,0.4)' : 'var(--border)'}`,
+                background: filterFolder === f.name ? 'rgba(124,77,255,0.15)' : 'transparent',
+                color: filterFolder === f.name ? 'var(--violet)' : 'var(--text-3)',
+              }}>{f.name} ({f.count})</button>
+            ))}
+            {!newFolderInput ? (
+              <button onClick={() => setNewFolderInput(true)} style={{
+                padding: '5px 10px', borderRadius: 20, cursor: 'pointer', fontSize: 11,
+                border: '1px dashed var(--border)', background: 'transparent', color: 'var(--text-3)',
+              }}>+ Создать</button>
+            ) : (
+              <form onSubmit={e => { e.preventDefault(); const v = e.target.fname.value.trim(); if (v) setFolderName(v); setNewFolderInput(false); if (v) setFolderModal(true) }} style={{ display: 'flex', gap: 4 }}>
+                <input name="fname" autoFocus placeholder="Имя папки..." style={{
+                  padding: '4px 10px', borderRadius: 20, border: '1px solid rgba(124,77,255,0.4)', background: 'rgba(124,77,255,0.08)',
+                  color: 'var(--text)', fontSize: 11, outline: 'none', width: 120,
+                }} />
+                <button type="submit" style={{ padding: '4px 8px', borderRadius: 20, border: '1px solid rgba(61,214,140,0.4)', background: 'rgba(61,214,140,0.1)', color: 'var(--green)', fontSize: 11, cursor: 'pointer' }}>✓</button>
+                <button type="button" onClick={() => setNewFolderInput(false)} style={{ padding: '4px 8px', borderRadius: 20, border: '1px solid var(--border)', background: 'transparent', color: 'var(--text-3)', fontSize: 11, cursor: 'pointer' }}>✕</button>
+              </form>
+            )}
+          </div>
+
+          {/* Toolbar */}
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <button onClick={selectAll} style={{ padding: '5px 12px', borderRadius: 8, border: '1px solid var(--border)', background: 'transparent', color: 'var(--text-3)', fontSize: 11, cursor: 'pointer' }}>
+                {selectedChannels.length === filteredChannels.length && filteredChannels.length > 0 ? '☑ Снять всё' : '☐ Выбрать всё'}
+              </button>
+              {selectedChannels.length > 0 && (
+                <Button variant="outline" size="sm" onClick={() => { setFolderName(''); setFolderModal(true) }}>
+                  📁 В папку ({selectedChannels.length})
+                </Button>
+              )}
+            </div>
             <Button variant="ghost" size="sm" onClick={handleClear}>🗑 Очистить всё</Button>
           </div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {channels.map(c => (
-              <Card key={c.id} style={{ padding: '12px 16px' }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+
+          {/* Channels list */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {filteredChannels.map(c => (
+              <Card key={c.id} style={{ padding: '10px 14px', borderLeft: selectedChannels.includes(c.id) ? '3px solid var(--violet)' : '3px solid transparent' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <input type="checkbox" checked={selectedChannels.includes(c.id)} onChange={() => toggleSelect(c.id)}
+                    style={{ accentColor: 'var(--violet)', cursor: 'pointer' }} onClick={e => e.stopPropagation()} />
                   <div style={{ flex: 1 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
-                      <span style={{ fontWeight: 700, fontSize: 14 }}>@{c.username}</span>
-                      <span style={{ fontSize: 12, color: 'var(--text-3)' }}>{c.title}</span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 2 }}>
+                      <span style={{ fontWeight: 700, fontSize: 13 }}>@{c.username}</span>
+                      <span style={{ fontSize: 11, color: 'var(--text-3)' }}>{c.title}</span>
                       {c.has_comments && <Badge color="green">💬</Badge>}
+                      {c.folder && <span style={{ fontSize: 10, padding: '1px 8px', borderRadius: 10, background: 'rgba(124,77,255,0.1)', color: 'rgba(124,77,255,0.8)', border: '1px solid rgba(124,77,255,0.2)' }}>📁 {c.folder}</span>}
                     </div>
-                    <div style={{ display: 'flex', gap: 14, fontSize: 11, color: 'var(--text-3)' }}>
-                      <span>👥 {c.subscribers.toLocaleString()}</span>
+                    <div style={{ display: 'flex', gap: 14, fontSize: 10, color: 'var(--text-3)' }}>
+                      <span>👥 {c.subscribers?.toLocaleString()}</span>
                       {c.last_post_date && <span>📅 {new Date(c.last_post_date).toLocaleDateString('ru')}</span>}
                       <span>🔍 {c.search_query}</span>
                     </div>
@@ -134,6 +215,41 @@ export default function ParserPage() {
           </div>
         </>
       )}
+
+      {/* Folder assignment modal */}
+      <Modal open={folderModal} onClose={() => setFolderModal(false)} title="📁 Назначить папку" width={400}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <div style={{ fontSize: 13, color: 'var(--text-2)' }}>
+            Выбрано каналов: <strong>{selectedChannels.length}</strong>
+          </div>
+          <div>
+            <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, display: 'block', marginBottom: 6 }}>Папка</label>
+            <input list="folder-list" value={folderName} onChange={e => setFolderName(e.target.value)}
+              placeholder="Введи или выбери папку" autoFocus
+              style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 13, outline: 'none' }} />
+            <datalist id="folder-list">{folders.map(f => <option key={f.name} value={f.name} />)}</datalist>
+          </div>
+          {/* Quick buttons for existing folders */}
+          {folders.length > 0 && (
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+              {folders.map(f => (
+                <button key={f.name} onClick={() => setFolderName(f.name)} style={{
+                  padding: '5px 12px', borderRadius: 20, fontSize: 11, cursor: 'pointer',
+                  border: `1px solid ${folderName === f.name ? 'rgba(124,77,255,0.4)' : 'var(--border)'}`,
+                  background: folderName === f.name ? 'rgba(124,77,255,0.15)' : 'transparent',
+                  color: folderName === f.name ? 'var(--violet)' : 'var(--text-3)',
+                }}>{f.name}</button>
+              ))}
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+            <Button variant="ghost" onClick={() => setFolderModal(false)}>Отмена</Button>
+            <Button variant="primary" disabled={!folderName.trim()} onClick={() => handleSetFolder(folderName.trim())}>
+              📁 Назначить
+            </Button>
+          </div>
+        </div>
+      </Modal>
 
       {/* Search Modal */}
       <Modal open={searchModal} onClose={() => setSearchModal(false)} title="Поиск каналов" width={520}>
@@ -159,6 +275,15 @@ export default function ParserPage() {
               Только с комментариями
             </label>
             <Input label="Посты за последние (часов)" type="number" value={form.active_hours} onChange={e => setForm(f => ({ ...f, active_hours: parseInt(e.target.value) || 0 }))} />
+          </div>
+
+          <div>
+            <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Где искать</label>
+            <select value={form.source} onChange={e => setForm(f => ({ ...f, source: e.target.value }))} style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 14, outline: 'none' }}>
+              <option value="telegram">📱 Telegram (через аккаунт)</option>
+              <option value="tgstat">📊 TGStat API</option>
+              <option value="both">🔍 Оба источника</option>
+            </select>
           </div>
 
           {searchResult && (

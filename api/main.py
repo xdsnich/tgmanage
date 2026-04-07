@@ -19,10 +19,10 @@ from routers import tg_auth, analytics, security, channels, actions, inbox, tdat
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await create_tables()
-    print(f"✅ {APP_NAME} v{APP_VERSION} запущен")
-    print(f"📖 Документация: http://localhost:8000/docs")
+    print(f"[OK] {APP_NAME} v{APP_VERSION} started")
+    print(f"[DOCS] http://localhost:8000/docs")
     yield
-    print("👋 API остановлен")
+    print("[STOP] API stopped")
 
 
 # ── Приложение ───────────────────────────────────────────────

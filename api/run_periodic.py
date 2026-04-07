@@ -25,16 +25,18 @@ AI_INTERVAL = 60
 COMMENTING_INTERVAL = 90  # Веб-парсинг безопаснее, 90с достаточно
 WARMUP_INTERVAL = 300
 WARMUP_V2_INTERVAL = 60
+COMMENT_EXECUTOR_INTERVAL = 60  # Обработка очереди комментариев
 
 print("=" * 50)
 print("  GramGPT Scheduler (Hybrid)")
-print(f"  Комментинг: {COMMENTING_INTERVAL}с (веб + Telethon)")
-print(f"  AI-диалоги: {AI_INTERVAL}с")
-print(f"  Прогрев:    {WARMUP_INTERVAL}с")
+print(f"  Комментинг:     {COMMENTING_INTERVAL}с (веб → очередь)")
+print(f"  Executor:        {COMMENT_EXECUTOR_INTERVAL}с (очередь → отправка)")
+print(f"  AI-диалоги:      {AI_INTERVAL}с")
+print(f"  Прогрев v2:      {WARMUP_V2_INTERVAL}с")
 print("=" * 50)
 
-last_ai = last_commenting = last_warmup = last_warmup_v2 = 0
-ai_tid = commenting_tid = warmup_tid = warmup_v2_tid = None
+last_ai = last_commenting = last_warmup = last_warmup_v2 = last_executor = 0
+ai_tid = commenting_tid = warmup_tid = warmup_v2_tid = executor_tid = None
 
 def done(tid):
     if not tid: return True
@@ -62,6 +64,14 @@ try:
                     ai_tid = r.id; print(f"[{ts}] → AI-диалоги")
                 except Exception as e: print(f"[{ts}] ✗ AI: {e}")
             last_ai = now
+
+        if now - last_executor >= COMMENT_EXECUTOR_INTERVAL:
+            if done(executor_tid):
+                try:
+                    r = celery_app.send_task("tasks.comment_executor.process_comment_queue", queue="ai_dialogs")
+                    executor_tid = r.id; print(f"[{ts}] → Executor (очередь)")
+                except Exception as e: print(f"[{ts}] ✗ Executor: {e}")
+            last_executor = now
 
         if now - last_warmup_v2 >= WARMUP_V2_INTERVAL:
             if done(warmup_v2_tid):

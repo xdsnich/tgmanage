@@ -16,9 +16,9 @@ export function Button({ children, variant = 'primary', size = 'md', loading, di
   }
   const variants = {
     primary: { background: 'linear-gradient(135deg, #7c4dff 0%, #3d8bff 100%)', color: '#fff', boxShadow: '0 4px 20px rgba(124,77,255,0.35)' },
-    pink:    { background: 'linear-gradient(135deg, #ff3d9a 0%, #7c4dff 100%)', color: '#fff', boxShadow: '0 4px 20px rgba(255,61,154,0.3)' },
-    ghost:   { background: 'transparent', color: 'var(--text-2)', border: '1px solid var(--border)' },
-    danger:  { background: 'var(--red-dim)', color: 'var(--red)', border: '1px solid rgba(248,81,73,0.25)' },
+    pink: { background: 'linear-gradient(135deg, #ff3d9a 0%, #7c4dff 100%)', color: '#fff', boxShadow: '0 4px 20px rgba(255,61,154,0.3)' },
+    ghost: { background: 'transparent', color: 'var(--text-2)', border: '1px solid var(--border)' },
+    danger: { background: 'var(--red-dim)', color: 'var(--red)', border: '1px solid rgba(248,81,73,0.25)' },
     outline: { background: 'transparent', color: 'var(--violet)', border: '1px solid rgba(124,77,255,0.4)' },
   }
   const handleMouseEnter = (e) => {
@@ -45,13 +45,13 @@ export function Button({ children, variant = 'primary', size = 'md', loading, di
 export function Badge({ children, color = 'default' }) {
   const colors = {
     default: { bg: 'rgba(255,255,255,0.06)', color: 'var(--text-2)', border: 'rgba(255,255,255,0.08)' },
-    green:   { bg: 'var(--green-dim)',  color: 'var(--green)',  border: 'rgba(61,214,140,0.25)' },
-    red:     { bg: 'var(--red-dim)',    color: 'var(--red)',    border: 'rgba(248,81,73,0.25)' },
-    yellow:  { bg: 'var(--yellow-dim)', color: 'var(--yellow)', border: 'rgba(227,161,63,0.25)' },
-    violet:  { bg: 'var(--violet-dim)', color: 'var(--violet)', border: 'rgba(124,77,255,0.25)' },
-    blue:    { bg: 'var(--blue-dim)',   color: 'var(--blue)',   border: 'rgba(61,139,255,0.25)' },
-    pink:    { bg: 'var(--pink-dim)',   color: 'var(--pink)',   border: 'rgba(255,61,154,0.25)' },
-    teal:    { bg: 'var(--teal-dim)',   color: 'var(--teal)',   border: 'rgba(0,194,178,0.25)' },
+    green: { bg: 'var(--green-dim)', color: 'var(--green)', border: 'rgba(61,214,140,0.25)' },
+    red: { bg: 'var(--red-dim)', color: 'var(--red)', border: 'rgba(248,81,73,0.25)' },
+    yellow: { bg: 'var(--yellow-dim)', color: 'var(--yellow)', border: 'rgba(227,161,63,0.25)' },
+    violet: { bg: 'var(--violet-dim)', color: 'var(--violet)', border: 'rgba(124,77,255,0.25)' },
+    blue: { bg: 'var(--blue-dim)', color: 'var(--blue)', border: 'rgba(61,139,255,0.25)' },
+    pink: { bg: 'var(--pink-dim)', color: 'var(--pink)', border: 'rgba(255,61,154,0.25)' },
+    teal: { bg: 'var(--teal-dim)', color: 'var(--teal)', border: 'rgba(0,194,178,0.25)' },
   }
   const c = colors[color] || colors.default
   return (
@@ -120,8 +120,8 @@ export function TrustBar({ score }) {
   const bar = score >= 70
     ? 'linear-gradient(90deg,#3dd68c,#00c2b2)'
     : score >= 40
-    ? 'linear-gradient(90deg,#e3a13f,#ff6b35)'
-    : 'linear-gradient(90deg,#f85149,#ff3d9a)'
+      ? 'linear-gradient(90deg,#e3a13f,#ff6b35)'
+      : 'linear-gradient(90deg,#f85149,#ff3d9a)'
   const color = score >= 70 ? 'var(--green)' : score >= 40 ? 'var(--yellow)' : 'var(--red)'
   const label = score >= 80 ? 'Отлично' : score >= 60 ? 'Хорошо' : score >= 40 ? 'Средне' : 'Слабо'
   return (
@@ -137,12 +137,12 @@ export function TrustBar({ score }) {
 
 export function StatusBadge({ status }) {
   const map = {
-    active:     { label: '● Живой',      color: 'green' },
-    spamblock:  { label: '● Спамблок',   color: 'red' },
-    frozen:     { label: '● Заморожен',  color: 'yellow' },
-    quarantine: { label: '● Карантин',   color: 'pink' },
-    error:      { label: '● Ошибка',     color: 'red' },
-    unknown:    { label: '● Неизвестно', color: 'default' },
+    active: { label: '● Живой', color: 'green' },
+    spamblock: { label: '● Спамблок', color: 'red' },
+    frozen: { label: '● Заморожен', color: 'yellow' },
+    quarantine: { label: '● Карантин', color: 'pink' },
+    error: { label: '● Ошибка', color: 'red' },
+    unknown: { label: '● Неизвестно', color: 'default' },
   }
   const info = map[status] || map.unknown
   return <Badge color={info.color}>{info.label}</Badge>
@@ -159,7 +159,7 @@ export function Empty({ icon, title, subtitle, action }) {
   )
 }
 
-export function Modal({ open, onClose, title, children, width = 480 }) {
+export function Modal({ open = true, onClose, title, children, width = 480 }) {
   if (!open) return null
   return (
     <div onClick={onClose} style={{
@@ -195,8 +195,8 @@ export function StatCard({ label, value, color, icon }) {
       borderRadius: 'var(--radius)', padding: '20px 22px',
       transition: 'transform 0.2s, box-shadow 0.2s, border-color 0.2s',
     }}
-    onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-2px)'; e.currentTarget.style.borderColor = 'rgba(124,77,255,0.3)'; e.currentTarget.style.boxShadow = '0 8px 30px rgba(0,0,0,0.3)' }}
-    onMouseLeave={e => { e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.boxShadow = 'none' }}>
+      onMouseEnter={e => { e.currentTarget.style.transform = 'translateY(-2px)'; e.currentTarget.style.borderColor = 'rgba(124,77,255,0.3)'; e.currentTarget.style.boxShadow = '0 8px 30px rgba(0,0,0,0.3)' }}
+      onMouseLeave={e => { e.currentTarget.style.transform = 'translateY(0)'; e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.boxShadow = 'none' }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
         <span style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase' }}>{label}</span>
         {icon && <span style={{ fontSize: 18 }}>{icon}</span>}

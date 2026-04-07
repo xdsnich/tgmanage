@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { accountsAPI, importAPI } from '../services/api'
+import { accountsAPI, importAPI, proxiesAPI } from '../services/api'
 import { Card, Button, Input, Modal, TrustBar, StatusBadge, Empty, Spinner, Badge } from '../components/ui'
 
 const ROLES = ['default', 'продавец', 'прогреватель', 'читатель', 'консультант']
@@ -17,6 +17,12 @@ export default function AccountsPage() {
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
   const [filterStatus, setFilterStatus] = useState('all')
+  const [filterGeo, setFilterGeo] = useState('all')
+  const [filterCategory, setFilterCategory] = useState('all')
+  const [geoList, setGeoList] = useState([])
+  const [categoryList, setCategoryList] = useState([])
+  const [newGeoInput, setNewGeoInput] = useState(false)
+  const [newCatInput, setNewCatInput] = useState(false)
   const [selected, setSelected] = useState(null)
   const [addModal, setAddModal] = useState(false)
   const [editModal, setEditModal] = useState(false)
@@ -32,11 +38,21 @@ export default function AccountsPage() {
   const [importPhone, setImportPhone] = useState('')
   const [importing, setImporting] = useState(false)
   const [importResult, setImportResult] = useState(null)
+  const [importProxyId, setImportProxyId] = useState(null)
+  const [importProxies, setImportProxies] = useState([])
+  const [tdataDetected, setTdataDetected] = useState([])  // [{index, phone, name, proxy_string}]
+  const [tdataSessionId, setTdataSessionId] = useState(null)
+  const [tdataStep, setTdataStep] = useState('upload')  // upload | assign | importing
   const fileInputRef = useRef(null)
 
   const load = async () => {
     setLoading(true)
-    try { const { data } = await accountsAPI.list(); setAccounts(data) } catch { }
+    try {
+      const [accRes, filRes] = await Promise.all([accountsAPI.list(), accountsAPI.filters().catch(() => ({ data: { geos: [], categories: [] } }))])
+      setAccounts(accRes.data)
+      setGeoList(filRes.data.geos || [])
+      setCategoryList(filRes.data.categories || [])
+    } catch { }
     setLoading(false)
   }
 
@@ -44,9 +60,11 @@ export default function AccountsPage() {
 
   const filtered = accounts.filter(a => {
     const q = search.toLowerCase()
-    const matchSearch = !q || [a.phone, a.username, a.first_name, a.last_name, a.status].some(v => (v || '').toLowerCase().includes(q))
+    const matchSearch = !q || [a.phone, a.username, a.first_name, a.last_name, a.status, a.geo, a.category].some(v => (v || '').toLowerCase().includes(q))
     const matchStatus = filterStatus === 'all' || a.status === filterStatus
-    return matchSearch && matchStatus
+    const matchGeo = filterGeo === 'all' || (a.geo || '') === filterGeo
+    const matchCategory = filterCategory === 'all' || (a.category || '') === filterCategory
+    return matchSearch && matchStatus && matchGeo && matchCategory
   })
 
   const handleAdd = async (e) => {
@@ -75,7 +93,7 @@ export default function AccountsPage() {
   const openEdit = (acc, e) => {
     e.stopPropagation()
     setSelected(acc)
-    setEditData({ role: acc.role, notes: acc.notes || '', tags: acc.tags || [] })
+    setEditData({ role: acc.role, notes: acc.notes || '', tags: acc.tags || [], geo: acc.geo || '', category: acc.category || '' })
     setEditModal(true)
   }
 
@@ -113,6 +131,77 @@ export default function AccountsPage() {
         </div>
       </div>
 
+      {/* Фильтры: Гео + Тематика */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 14 }}>
+        {/* Гео */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 10, color: 'var(--text-3)', fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', minWidth: 70 }}>🌍 Гео</span>
+          <button onClick={() => setFilterGeo('all')} style={{
+            padding: '5px 12px', borderRadius: 20, cursor: 'pointer', fontSize: 11, fontWeight: filterGeo === 'all' ? 600 : 400, transition: 'all 0.15s',
+            border: `1px solid ${filterGeo === 'all' ? 'rgba(59,130,246,0.4)' : 'var(--border)'}`,
+            background: filterGeo === 'all' ? 'rgba(59,130,246,0.15)' : 'transparent',
+            color: filterGeo === 'all' ? 'var(--blue)' : 'var(--text-3)',
+          }}>Все</button>
+          {geoList.map(g => (
+            <button key={g} onClick={() => setFilterGeo(filterGeo === g ? 'all' : g)} style={{
+              padding: '5px 12px', borderRadius: 20, cursor: 'pointer', fontSize: 11, fontWeight: filterGeo === g ? 600 : 400, transition: 'all 0.15s',
+              border: `1px solid ${filterGeo === g ? 'rgba(59,130,246,0.4)' : 'var(--border)'}`,
+              background: filterGeo === g ? 'rgba(59,130,246,0.15)' : 'transparent',
+              color: filterGeo === g ? 'var(--blue)' : 'var(--text-3)',
+            }}>{g}</button>
+          ))}
+          {!newGeoInput ? (
+            <button onClick={() => setNewGeoInput(true)} style={{
+              padding: '5px 10px', borderRadius: 20, cursor: 'pointer', fontSize: 11,
+              border: '1px dashed var(--border)', background: 'transparent', color: 'var(--text-3)',
+            }}>+ Добавить</button>
+          ) : (
+            <form onSubmit={e => { e.preventDefault(); const v = e.target.geo.value.trim(); if (v && !geoList.includes(v)) { setGeoList([...geoList, v]); } setNewGeoInput(false) }} style={{ display: 'flex', gap: 4 }}>
+              <input name="geo" autoFocus placeholder="UA, US, DE..." style={{
+                padding: '4px 10px', borderRadius: 20, border: '1px solid rgba(59,130,246,0.4)', background: 'rgba(59,130,246,0.08)',
+                color: 'var(--text)', fontSize: 11, outline: 'none', width: 80,
+              }} />
+              <button type="submit" style={{ padding: '4px 8px', borderRadius: 20, border: '1px solid rgba(61,214,140,0.4)', background: 'rgba(61,214,140,0.1)', color: 'var(--green)', fontSize: 11, cursor: 'pointer' }}>✓</button>
+              <button type="button" onClick={() => setNewGeoInput(false)} style={{ padding: '4px 8px', borderRadius: 20, border: '1px solid var(--border)', background: 'transparent', color: 'var(--text-3)', fontSize: 11, cursor: 'pointer' }}>✕</button>
+            </form>
+          )}
+        </div>
+
+        {/* Тематика */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 10, color: 'var(--text-3)', fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', minWidth: 70 }}>📁 Тема</span>
+          <button onClick={() => setFilterCategory('all')} style={{
+            padding: '5px 12px', borderRadius: 20, cursor: 'pointer', fontSize: 11, fontWeight: filterCategory === 'all' ? 600 : 400, transition: 'all 0.15s',
+            border: `1px solid ${filterCategory === 'all' ? 'rgba(124,77,255,0.4)' : 'var(--border)'}`,
+            background: filterCategory === 'all' ? 'rgba(124,77,255,0.15)' : 'transparent',
+            color: filterCategory === 'all' ? 'var(--violet)' : 'var(--text-3)',
+          }}>Все</button>
+          {categoryList.map(c => (
+            <button key={c} onClick={() => setFilterCategory(filterCategory === c ? 'all' : c)} style={{
+              padding: '5px 12px', borderRadius: 20, cursor: 'pointer', fontSize: 11, fontWeight: filterCategory === c ? 600 : 400, transition: 'all 0.15s',
+              border: `1px solid ${filterCategory === c ? 'rgba(124,77,255,0.4)' : 'var(--border)'}`,
+              background: filterCategory === c ? 'rgba(124,77,255,0.15)' : 'transparent',
+              color: filterCategory === c ? 'var(--violet)' : 'var(--text-3)',
+            }}>{c}</button>
+          ))}
+          {!newCatInput ? (
+            <button onClick={() => setNewCatInput(true)} style={{
+              padding: '5px 10px', borderRadius: 20, cursor: 'pointer', fontSize: 11,
+              border: '1px dashed var(--border)', background: 'transparent', color: 'var(--text-3)',
+            }}>+ Добавить</button>
+          ) : (
+            <form onSubmit={e => { e.preventDefault(); const v = e.target.cat.value.trim(); if (v && !categoryList.includes(v)) { setCategoryList([...categoryList, v]); } setNewCatInput(false) }} style={{ display: 'flex', gap: 4 }}>
+              <input name="cat" autoFocus placeholder="Крипто, Новини..." style={{
+                padding: '4px 10px', borderRadius: 20, border: '1px solid rgba(124,77,255,0.4)', background: 'rgba(124,77,255,0.08)',
+                color: 'var(--text)', fontSize: 11, outline: 'none', width: 120,
+              }} />
+              <button type="submit" style={{ padding: '4px 8px', borderRadius: 20, border: '1px solid rgba(61,214,140,0.4)', background: 'rgba(61,214,140,0.1)', color: 'var(--green)', fontSize: 11, cursor: 'pointer' }}>✓</button>
+              <button type="button" onClick={() => setNewCatInput(false)} style={{ padding: '4px 8px', borderRadius: 20, border: '1px solid var(--border)', background: 'transparent', color: 'var(--text-3)', fontSize: 11, cursor: 'pointer' }}>✕</button>
+            </form>
+          )}
+        </div>
+      </div>
+
       {/* Table */}
       {loading ? (
         <div style={{ display: 'flex', justifyContent: 'center', padding: 64 }}><Spinner size={28} /></div>
@@ -124,16 +213,16 @@ export default function AccountsPage() {
         <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', overflow: 'hidden' }}>
           {/* Header row */}
           <div style={{
-            display: 'grid', gridTemplateColumns: '2fr 1.2fr 1fr 1.2fr 100px 100px',
+            display: 'grid', gridTemplateColumns: '2fr 1.2fr 0.8fr 0.8fr 1fr 80px 100px',
             padding: '10px 20px', borderBottom: '1px solid var(--border)',
             fontSize: 10, color: 'var(--text-3)', letterSpacing: '0.1em', fontWeight: 700, textTransform: 'uppercase',
           }}>
-            <span>Аккаунт</span><span>Телефон</span><span>Статус</span><span>Trust</span><span>Роль</span><span style={{ textAlign: 'right' }}>Действия</span>
+            <span>Аккаунт</span><span>Телефон</span><span>Гео</span><span>Тема</span><span>Статус</span><span>Trust</span><span style={{ textAlign: 'right' }}>Действия</span>
           </div>
 
           {filtered.map((acc, i) => (
             <div key={acc.id} onClick={() => navigate(`/accounts/${acc.id}`)} style={{
-              display: 'grid', gridTemplateColumns: '2fr 1.2fr 1fr 1.2fr 100px 100px',
+              display: 'grid', gridTemplateColumns: '2fr 1.2fr 0.8fr 0.8fr 1fr 80px 100px',
               padding: '14px 20px', alignItems: 'center',
               borderBottom: i < filtered.length - 1 ? '1px solid var(--border)' : 'none',
               transition: 'background 0.1s', cursor: 'pointer',
@@ -157,11 +246,10 @@ export default function AccountsPage() {
                 </div>
               </div>
               <div style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: 'var(--text-2)' }}>{acc.phone}</div>
+              <div>{acc.geo ? <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 10, background: 'rgba(59,130,246,0.1)', color: 'rgba(59,130,246,0.8)', border: '1px solid rgba(59,130,246,0.2)' }}>{acc.geo}</span> : <span style={{ fontSize: 10, color: 'var(--text-3)' }}>—</span>}</div>
+              <div>{acc.category ? <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 10, background: 'rgba(124,77,255,0.1)', color: 'rgba(124,77,255,0.8)', border: '1px solid rgba(124,77,255,0.2)' }}>{acc.category}</span> : <span style={{ fontSize: 10, color: 'var(--text-3)' }}>—</span>}</div>
               <StatusBadge status={acc.status} />
               <TrustBar score={acc.trust_score} />
-              <div>
-                {acc.role !== 'default' && <Badge color="violet">{acc.role}</Badge>}
-              </div>
               <div style={{ display: 'flex', gap: 4, justifyContent: 'flex-end' }}>
                 <button onClick={(e) => openEdit(acc, e)} title="Редактировать" style={{
                   width: 28, height: 28, borderRadius: 6, border: '1px solid var(--border)',
@@ -213,6 +301,21 @@ export default function AccountsPage() {
             </select>
           </div>
           <Input label="Заметки" value={editData.notes || ''} onChange={e => setEditData(d => ({ ...d, notes: e.target.value }))} placeholder="Заметки об аккаунте" />
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+            <div>
+              <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>🌍 Гео</label>
+              <input list="geo-list" value={editData.geo || ''} onChange={e => setEditData(d => ({ ...d, geo: e.target.value }))}
+                placeholder="Введи или выбери" style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 13, outline: 'none' }} />
+              <datalist id="geo-list">{geoList.map(g => <option key={g} value={g} />)}</datalist>
+            </div>
+            <div>
+              <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>📁 Тематика</label>
+              <input list="cat-list" value={editData.category || ''} onChange={e => setEditData(d => ({ ...d, category: e.target.value }))}
+                placeholder="Введи или выбери" style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 13, outline: 'none' }} />
+              <datalist id="cat-list">{categoryList.map(c => <option key={c} value={c} />)}</datalist>
+            </div>
+          </div>
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
             <Button variant="ghost" type="button" onClick={() => setEditModal(false)}>Отмена</Button>
             <Button variant="primary" type="submit" loading={saving}>Сохранить</Button>
@@ -305,8 +408,20 @@ export default function AccountsPage() {
               onChange={e => setImportFiles(Array.from(e.target.files))}
             />
 
-            {(importType === 'session' || importType === 'tdata') && (
+            {importType === 'session' && (
               <Input label="Номер телефона (необязательно)" value={importPhone} onChange={e => setImportPhone(e.target.value)} placeholder="+380..." />
+            )}
+
+            {importType === 'session' && (
+              <div>
+                <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Прокси (рекомендуется)</label>
+                <select value={importProxyId || ''} onChange={e => setImportProxyId(e.target.value ? parseInt(e.target.value) : null)}
+                  onFocus={async () => { if (!importProxies.length) { try { const { data } = await proxiesAPI.list(); setImportProxies(data) } catch { } } }}
+                  style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 14, outline: 'none' }}>
+                  <option value="">Без прокси</option>
+                  {importProxies.map(p => <option key={p.id} value={p.id}>{p.host}:{p.port} ({p.protocol})</option>)}
+                </select>
+              </div>
             )}
 
             {importResult && (
@@ -329,7 +444,13 @@ export default function AccountsPage() {
                   } else if (importType === 'session-batch') {
                     res = await importAPI.uploadSessionsBatch(importFiles)
                   } else if (importType === 'tdata') {
-                    res = await importAPI.uploadTData(importFiles[0], importPhone)
+                    // Шаг 1: Детектим аккаунты
+                    const { data } = await accountsAPI.detectTData(importFiles[0])
+                    setTdataSessionId(data.session_id)
+                    setTdataDetected(data.accounts.map(a => ({ ...a, proxy_string: '' })))
+                    setTdataStep('assign')
+                    setImporting(false)
+                    return // Не закрываем модал — показываем таблицу
                   }
                   setImportResult({ success: true, message: res.data.message || 'Импорт успешен!' })
                   await load()
@@ -339,6 +460,90 @@ export default function AccountsPage() {
                 setImporting(false)
               }}>
                 {importing ? 'Импорт...' : 'Импортировать'}
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {/* TData Batch — таблица аккаунтов с прокси */}
+        {tdataStep === 'assign' && tdataDetected.length > 0 && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <button onClick={() => { setTdataStep('upload'); setTdataDetected([]); setImportType(null) }} style={{
+              background: 'none', border: 'none', color: 'var(--text-3)', cursor: 'pointer', fontSize: 12, padding: 0, textAlign: 'left',
+            }}>← Назад</button>
+
+            <div style={{ padding: '10px 14px', background: 'rgba(61,214,140,0.08)', border: '1px solid rgba(61,214,140,0.2)', borderRadius: 10, fontSize: 13, color: 'var(--green)' }}>
+              Найдено {tdataDetected.length} аккаунтов. Назначьте прокси и нажмите "Импортировать".
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              {tdataDetected.map((acc, i) => (
+                <div key={i} style={{ padding: '12px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, display: 'flex', alignItems: 'center', gap: 12 }}>
+                  <div style={{ flex: '0 0 30px', fontSize: 18, textAlign: 'center' }}>👤</div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 600, fontSize: 13 }}>{acc.name || 'Без имени'}</div>
+                    <div style={{ fontSize: 11, color: 'var(--text-3)' }}>{acc.phone || 'Номер не определён'} {acc.username ? `@${acc.username}` : ''}</div>
+                  </div>
+                  <div style={{ flex: '0 0 280px' }}>
+                    <input
+                      value={acc.proxy_string}
+                      onChange={e => setTdataDetected(prev => prev.map((a, j) => j === i ? { ...a, proxy_string: e.target.value } : a))}
+                      placeholder="ip:port:login:password"
+                      style={{ width: '100%', padding: '8px 10px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 12, outline: 'none', fontFamily: 'monospace' }}
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Быстрое назначение одного прокси всем */}
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <input id="bulk-proxy" placeholder="Один прокси для всех (ip:port:login:password)" style={{ flex: 1, padding: '8px 12px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 12, outline: 'none', fontFamily: 'monospace' }} />
+              <Button variant="outline" size="sm" onClick={() => {
+                const v = document.getElementById('bulk-proxy')?.value || ''
+                if (v) setTdataDetected(prev => prev.map(a => ({ ...a, proxy_string: v })))
+              }}>Применить ко всем</Button>
+            </div>
+
+            {/* Или выбрать из существующих */}
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <select id="bulk-proxy-select"
+                onFocus={async () => { if (!importProxies.length) { try { const { data } = await proxiesAPI.list(); setImportProxies(data) } catch { } } }}
+                style={{ flex: 1, padding: '8px 12px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 12, outline: 'none' }}>
+                <option value="">Выбрать из существующих прокси</option>
+                {importProxies.map(p => <option key={p.id} value={`${p.host}:${p.port}:${p.login || ''}:${p.password || ''}`}>{p.host}:{p.port} ({p.protocol})</option>)}
+              </select>
+              <Button variant="outline" size="sm" onClick={() => {
+                const v = document.getElementById('bulk-proxy-select')?.value || ''
+                if (v) setTdataDetected(prev => prev.map(a => ({ ...a, proxy_string: v })))
+              }}>Применить</Button>
+            </div>
+
+            {importResult && (
+              <div style={{
+                padding: '10px 14px', borderRadius: 10, fontSize: 13,
+                background: importResult.success ? 'var(--green-dim)' : 'var(--red-dim)',
+                color: importResult.success ? 'var(--green)' : 'var(--red)',
+              }}>{importResult.message}</div>
+            )}
+
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <Button variant="ghost" onClick={() => { setImportModal(false); setTdataStep('upload'); setTdataDetected([]) }}>Отмена</Button>
+              <Button variant="primary" loading={importing} onClick={async () => {
+                setImporting(true); setImportResult(null)
+                try {
+                  const accounts = tdataDetected.map(a => ({ index: a.index, proxy_string: a.proxy_string }))
+                  const { data } = await accountsAPI.importTDataBatch(tdataSessionId, accounts)
+                  setImportResult({ success: true, message: `Импортировано ${data.success}/${data.total} аккаунтов` })
+                  await load()
+                  // Закрываем через 1.5с
+                  setTimeout(() => { setImportModal(false); setTdataStep('upload'); setTdataDetected([]); setImportResult(null) }, 1500)
+                } catch (err) {
+                  setImportResult({ success: false, message: err.response?.data?.detail || 'Ошибка импорта' })
+                }
+                setImporting(false)
+              }}>
+                📦 Импортировать {tdataDetected.length} аккаунтов
               </Button>
             </div>
           </div>

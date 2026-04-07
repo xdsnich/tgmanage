@@ -53,6 +53,7 @@ ACTIONS = [
     {"name": "forward_saved",  "weight": 5,  "label": "💾 Пересылка в Saved"},
     {"name": "send_saved",     "weight": 10, "label": "💬 Сообщение в Saved"},
     {"name": "reply_dm",       "weight": 8,  "label": "↩️ Ответ на ЛС"},
+    {"name": "smart_comment",  "weight": 0,  "label": "💬 Комментарий (v2)"},  # weight=0: не выбирается рандомно, вставляется из очереди
 ]
 
 SAVED_MESSAGES = [
@@ -422,6 +423,56 @@ async def _do_reply_dm(client, phone):
     await client.send_read_acknowledge(d, await client.get_messages(d, limit=1))
     return f"Ответил «{reply}» в ЛС «{d.name or '?'}»", d.name or ""
 
+async def _do_smart_comment_warmup(client, phone, queue_item=None):
+    """
+    Выполняет комментарий из очереди как часть warmup сессии.
+    Если queue_item=None — просто пропускает.
+    """
+    if not queue_item:
+        return "Нет задач в очереди", ""
+
+    from tasks.comment_executor import _do_smart_comment
+    from services.llm import generate_comment, build_comment_prompt
+
+    personality = queue_item.personality or {}
+    style = queue_item.style or {}
+    prompt = build_comment_prompt(queue_item.post_text, style, personality)
+
+    # Генерируем комментарий
+    provider = "claude"  # default, кампания подставит свой
+    try:
+        from sqlalchemy import select
+        # provider берём из personality если есть
+        comment_text = generate_comment(provider, prompt, queue_item.post_text)
+        if not comment_text:
+            queue_item.status = "failed"
+            queue_item.error = "LLM не сгенерировал"
+            return "LLM ошибка", ""
+    except Exception as e:
+        queue_item.status = "failed"
+        queue_item.error = str(e)[:200]
+        return f"LLM ошибка: {e}", ""
+
+    status, detail = await _do_smart_comment(
+        client, None, queue_item.channel, queue_item.post_id, comment_text, personality
+    )
+
+    queue_item.comment_text = comment_text
+    queue_item.executed_at = datetime.utcnow()
+
+    if status == "aborted":
+        queue_item.status = "aborted"
+        queue_item.error = detail
+        return f"Комментарий отменён (передумал)", queue_item.channel
+    elif status == "ok":
+        queue_item.status = "done"
+        return f"Комментарий: {comment_text[:50]}...", queue_item.channel
+    else:
+        queue_item.status = "failed"
+        queue_item.error = detail
+        return f"Ошибка: {detail}", queue_item.channel
+
+
 ACTION_FNS = {
     "read_feed":     _do_read_feed,
     "set_reaction":  _do_reaction,
@@ -433,6 +484,7 @@ ACTION_FNS = {
     "forward_saved": _do_forward_saved,
     "send_saved":    _do_send_saved,
     "reply_dm":      _do_reply_dm,
+    "smart_comment": _do_smart_comment_warmup,
 }
 
 
@@ -483,11 +535,98 @@ async def _run_session(task_row, account, proxy, session_cfg, db):
             db.add(log)
             return 0
 
+        # ── Проверяем есть ли pending комментарии для этого аккаунта ──
+        pending_comment = None
+        comment_inserted = False
+        try:
+            from sqlalchemy import select
+            from models.comment_queue import CommentQueue
+            cq_result = await db.execute(
+                select(CommentQueue).where(
+                    CommentQueue.account_id == account.id,
+                    CommentQueue.status == "scheduled",
+                    CommentQueue.scheduled_at <= datetime.utcnow(),
+                ).order_by(CommentQueue.scheduled_at.asc()).limit(1)
+            )
+            pending_comment = cq_result.scalar_one_or_none()
+            if pending_comment:
+                pending_comment.status = "executing"
+                await db.flush()
+                logger.info(f"[warmup][{phone}] Найден pending комментарий #{pending_comment.id} → @{pending_comment.channel}")
+        except Exception as e:
+            logger.warning(f"[warmup][{phone}] Ошибка проверки очереди: {e}")
+
+        # Если есть pending — вставим smart_comment примерно в середину сессии
+        comment_at_action = random.randint(max(1, num_actions // 3), max(2, num_actions * 2 // 3)) if pending_comment else -1
+
         for i in range(num_actions):
             # Проверяем дневной лимит
             if task_row.today_actions >= task_row.today_limit:
                 logger.info(f"[warmup][{phone}] Дневной лимит достигнут ({task_row.today_limit})")
                 break
+
+            # Вставляем smart_comment в нужный момент
+            if pending_comment and not comment_inserted and i == comment_at_action:
+                action = {"name": "smart_comment", "weight": 0, "label": "💬 Комментарий (v2)"}
+                action_fn = ACTION_FNS.get("smart_comment")
+                comment_inserted = True
+                try:
+                    detail, channel = await action_fn(client, phone, queue_item=pending_comment)
+                    log = WarmupLog(
+                        task_id=task_row.id, account_id=account.id,
+                        action="smart_comment", detail=detail,
+                        channel=channel, success=(pending_comment.status == "done"),
+                        created_at=datetime.utcnow(),
+                    )
+                    db.add(log)
+                    await db.flush()
+                    await db.commit()
+
+                    if pending_comment.status == "done":
+                        # Обновляем behavior
+                        try:
+                            from tasks.behavior_engine import get_or_create_behavior
+                            behavior = await get_or_create_behavior(db, account.id, phone)
+                            behavior.comments_today += 1
+                            behavior.last_comment_at = datetime.utcnow()
+                            channels_today = behavior.channels_commented_today or []
+                            channels_today.append(pending_comment.channel)
+                            behavior.channels_commented_today = channels_today
+
+                            # Обновляем campaign comments_sent
+                            from models.campaign import Campaign, CommentLog
+                            camp_r = await db.execute(select(Campaign).where(Campaign.id == pending_comment.campaign_id))
+                            camp = camp_r.scalar_one_or_none()
+                            if camp:
+                                camp.comments_sent += 1
+                                db.add(CommentLog(
+                                    campaign_id=camp.id, account_id=account.id,
+                                    account_phone=phone, channel_username=pending_comment.channel,
+                                    channel_title="", post_id=pending_comment.post_id,
+                                    post_text=(pending_comment.post_text or "")[:500],
+                                    comment_text=pending_comment.comment_text or "",
+                                    llm_provider=_val(camp.llm_provider) if camp else "",
+                                ))
+                            await db.flush()
+                            await db.commit()
+                        except Exception as e:
+                            logger.warning(f"[warmup][{phone}] Ошибка обновления behavior: {e}")
+
+                    task_row.actions_done += 1
+                    task_row.today_actions += 1
+                    done += 1
+                    logger.info(f"[warmup][{phone}]   [{done}/{num_actions}] {action['label']}: {detail}")
+                except Exception as e:
+                    logger.warning(f"[warmup][{phone}] Smart comment ошибка: {e}")
+                    pending_comment.status = "failed"
+                    pending_comment.error = str(e)[:200]
+                    await db.flush()
+                    await db.commit()
+
+                if i < num_actions - 1:
+                    delay = random.randint(session_cfg["delay_min"], session_cfg["delay_max"])
+                    await asyncio.sleep(delay)
+                continue
 
             action = pick_action()
             action_fn = ACTION_FNS.get(action["name"])

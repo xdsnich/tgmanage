@@ -10,6 +10,8 @@ from .parsed_channel import ParsedChannel
 from .reaction import ReactionTask
 from .warmup_log import WarmupLog
 from .subscribe_task import SubscribeTask
+from .comment_queue import CommentQueue
+from .account_behavior import AccountBehavior
 __all__ = [
     "User", "RefreshToken", "PlanEnum",
     "TelegramAccount", "AccountStatus", "AccountRole",
@@ -17,4 +19,5 @@ __all__ = [
     "AIDialog", "ActionLog",
     "Campaign", "TargetChannel", "CampaignStatus", "TriggerMode", "LLMProvider", "CommentTone",
     "WarmupTask", "ParsedChannel","ReactionTask","WarmupLog","SubscribeTask",
+    "CommentQueue", "AccountBehavior",
 ]

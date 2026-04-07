@@ -51,5 +51,7 @@ class WarmupTask(Base):
     next_action_at:  Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     start_offset_min:Mapped[int]              = mapped_column(Integer, default=0)
     total_days:      Mapped[int]              = mapped_column(Integer, default=7)
+    # v2 — связь с кампанией комментинга
+    campaign_id:     Mapped[Optional[int]]    = mapped_column(ForeignKey("campaigns.id", ondelete="SET NULL"), nullable=True)
     def __repr__(self):
         return f"<WarmupTask account={self.account_id} mode={self.mode} status={self.status}>"
