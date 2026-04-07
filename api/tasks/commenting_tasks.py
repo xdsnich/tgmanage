@@ -162,7 +162,7 @@ async def _process_campaign(c, db):
             break
 
         if not selected_acc:
-            logger.info(f"[{c.name}] Все аккаунты достигли лимитов для @{channel.username}")
+            logger.info(f"[{c.name}] Все аккаунты заняты/на кулдауне для @{channel.username} — пост #{post.post_id} ПРОПУЩЕН, ждём следующий")
             continue
 
         # ── Ставим в очередь ────────────────────────────────
