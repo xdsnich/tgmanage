@@ -425,6 +425,69 @@ async def get_comment_logs(
     } for l in logs]
 
 
+@router.get("/campaigns/{campaign_id}/activity")
+async def get_campaign_activity(
+    campaign_id: int,
+    limit: int = 50,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Детальная активность кампании — каждое действие каждого аккаунта.
+    Показывает: что прочитал, какую реакцию поставил, сколько печатал,
+    передумал или отправил, какой коммент написал.
+    """
+    c = await _get_campaign(db, campaign_id, current_user.id)
+
+    from models.comment_queue import CommentQueue
+    from models.account import TelegramAccount
+
+    # Берём все записи очереди для этой кампании
+    result = await db.execute(
+        select(CommentQueue)
+        .where(CommentQueue.campaign_id == c.id)
+        .order_by(CommentQueue.created_at.desc())
+        .limit(limit)
+    )
+    items = result.scalars().all()
+
+    # Подгружаем телефоны аккаунтов
+    acc_ids = list(set(q.account_id for q in items))
+    acc_map = {}
+    if acc_ids:
+        accs_r = await db.execute(
+            select(TelegramAccount).where(TelegramAccount.id.in_(acc_ids))
+        )
+        for a in accs_r.scalars().all():
+            acc_map[a.id] = {"phone": a.phone, "name": a.first_name or a.phone}
+
+    out = []
+    for q in items:
+        acc_info = acc_map.get(q.account_id, {"phone": "?", "name": "?"})
+        personality_data = q.personality or {}
+        steps = personality_data.pop("_steps", []) if isinstance(personality_data, dict) else []
+
+        out.append({
+            "id": q.id,
+            "status": q.status,
+            "account_phone": acc_info["phone"],
+            "account_name": acc_info["name"],
+            "channel": q.channel,
+            "post_id": q.post_id,
+            "post_text": (q.post_text or "")[:200],
+            "personality": personality_data.get("name", ""),
+            "style": (q.style or {}).get("name", ""),
+            "comment_text": q.comment_text,
+            "error": q.error,
+            "steps": steps,
+            "scheduled_at": q.scheduled_at.isoformat() if q.scheduled_at else None,
+            "executed_at": q.executed_at.isoformat() if q.executed_at else None,
+            "created_at": q.created_at.isoformat() if q.created_at else None,
+        })
+
+    return out
+
+
 # ── Comment Queue (v2) ─────────────────────────────────────
 
 @router.get("/queue")

@@ -139,63 +139,76 @@ def _call_openai(system_prompt: str, post_text: str) -> str:
 
 
 def build_comment_prompt(post_text: str, style_profile: dict, personality: dict = None) -> str:
-    """Генерирует промпт для LLM с учётом стиля конкретного аккаунта."""
-    base = "Ты — реальный пользователь Telegram. Напиши комментарий к посту."
+    """Промпт который генерирует РЕАЛЬНЫЕ человеческие комментарии на ЛЮБОМ языке."""
 
-    rules = []
-
-    # Длина
     length = style_profile.get("length", "medium")
     if length == "short":
-        rules.append("Пиши ОЧЕНЬ коротко: 2-5 слов максимум.")
-    elif length == "medium":
-        rules.append("1-2 предложения, 20-80 символов.")
+        len_rule = "Maximum 3-5 words. Like a quick reaction."
+    elif length == "long":
+        len_rule = "2-3 sentences. Share your opinion on the topic."
     else:
-        rules.append("2-3 предложения, развёрнуто.")
+        len_rule = "1 sentence, 10-40 words."
 
-    # Эмодзи
+    style_rules = []
+
     if style_profile.get("uses_emoji"):
-        rules.append("Можешь использовать 1-2 эмодзи, но не всегда.")
-    else:
-        rules.append("НЕ используй эмодзи.")
+        style_rules.append("You can use 1 emoji but not in every comment.")
 
-    # Ошибки
     if style_profile.get("makes_typos"):
-        rules.append(
-            "Пиши разговорно, допускай мелкие ошибки "
-            "(пропущенные запятые, 'чо' вместо 'что', 'норм' вместо 'нормально'). "
-            "НЕ делай это в каждом слове — 1-2 ошибки максимум."
-        )
+        style_rules.append("Write casually like in a messenger — no caps, skip punctuation sometimes, use slang natural to the post's language.")
 
-    # Вопрос
     if style_profile.get("asks_question"):
-        rules.append("Обязательно задай вопрос по теме поста.")
+        style_rules.append("Ask a short casual question about the topic.")
 
-    # Цитирование
     if style_profile.get("starts_with_reply"):
-        rules.append(
-            "Начни с реакции на конкретную мысль из поста "
-            "('Согласен с тем что...', 'Не уверен насчёт...', 'Интересная мысль про...')."
-        )
+        style_rules.append("React to something specific from the post. Don't use templates — write like a real person.")
 
-    # Общие правила
-    rules.append("Пиши на том же языке что и пост.")
-    rules.append("НЕ начинай с 'Отличный пост', 'Спасибо за информацию' — это шаблонно.")
-    rules.append("Будь естественным. Представь что ты просто листаешь ленту и решил написать.")
-    rules.append("Каждый комментарий должен быть УНИКАЛЬНЫМ. Никаких повторяющихся фраз.")
+    style_block = "\n".join(f"- {r}" for r in style_rules) if style_rules else ""
 
-    prompt = f"""{base}
+    prompt = f"""You are writing a comment on a Telegram channel post. You are a regular person scrolling through their feed.
 
-Правила для ЭТОГО комментария:
-{chr(10).join(f'- {r}' for r in rules)}
+CRITICAL RULE #1: Detect the language of the post and write your comment in THE SAME LANGUAGE. 
+- Post in English → comment in English
+- Post in Ukrainian → comment in Ukrainian  
+- Post in Russian → comment in Russian
+- Post in Hindi → comment in Hindi
+- Post in Arabic → comment in Arabic
+- Post in ANY language → comment in THAT language
+Use the same script (Cyrillic, Latin, Devanagari, Arabic etc.)
 
-Пост:
-{post_text}
+CRITICAL RULE #2: Write like a REAL person in a messenger, not like an AI or copywriter.
 
-Напиши ТОЛЬКО текст комментария, ничего больше."""
+NEVER write anything like these (in any language):
+- "Great post!" / "Отличный пост!" / "बहुत अच्छी पोस्ट!"
+- "Thanks for sharing" / "Спасибо за информацию" / "शेयर करने के लिए धन्यवाद"
+- "Very interesting article" / "Очень интересная статья"
+- "I completely agree with the author"
+- Any phrase that sounds like a template or AI
+
+How REAL people comment (examples by language):
+
+English: "lol yeah been there", "wait what fr?", "nah I don't think so", "this is so true tho", "bruh 💀", "ok but why", "finally someone said it"
+
+Russian: "ну наконец-то кто-то это сказал", "хз, мне кажется тут не всё так просто", "кста да", "ну такое себе", "а можно подробнее?", "жиза", "я пробовал не работает"
+
+Ukrainian: "о це цікаво", "ну таке", "а шо так можна було?", "хм спірно", "підтримую", "а є пруфи?", "ну нарешті"
+
+Hindi: "sahi baat hai", "ye toh hona hi tha", "koi sense hai iss baat ka?", "haan bhai", "acha point hai", "seriously??"
+
+Arabic: "والله صح", "هذا اللي كنت أقوله", "مو متأكد بصراحة", "يب فعلاً"
+
+Spanish: "jaja tal cual", "eso no tiene sentido", "en serio??", "bueno depende", "al fin alguien lo dice"
+
+{len_rule}
+
+{style_block}
+
+Write ONLY the comment text. No quotes, no explanations, no meta-commentary.
+
+Post:
+{post_text}"""
 
     return prompt
-
 
 def _call_gemini(system_prompt: str, post_text: str) -> str:
     import httpx

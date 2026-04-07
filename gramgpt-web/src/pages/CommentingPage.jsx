@@ -56,6 +56,11 @@ export default function CommentingPage() {
   const [channelText, setChannelText] = useState('')
   const [channelFolders, setChannelFolders] = useState([])
 
+  // Activity log
+  const [activity, setActivity] = useState([])
+  const [activityLoading, setActivityLoading] = useState(false)
+  const [detailTab, setDetailTab] = useState('info')
+
   const showToast = (text, type = 'success') => {
     setToast({ text, type }); setTimeout(() => setToast(null), 3500)
   }
@@ -177,7 +182,13 @@ export default function CommentingPage() {
     ) || null
   }
 
-  const openDetail = (c) => { setSelected(c); setDetailModal(true) }
+  const loadActivity = async (campaignId) => {
+    setActivityLoading(true)
+    try { const { data } = await commentingAPI.activity(campaignId, 50); setActivity(data) } catch { setActivity([]) }
+    setActivityLoading(false)
+  }
+
+  const openDetail = (c) => { setSelected(c); setDetailTab('info'); setActivity([]); setDetailModal(true) }
 
   if (loading) return <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}><Spinner size={32} /></div>
 
@@ -433,7 +444,7 @@ export default function CommentingPage() {
       </Modal>
 
       {/* ── Detail Modal ───────────────────────────────── */}
-      <Modal open={detailModal} onClose={() => setDetailModal(false)} title={selected?.name || 'Кампания'} width={600}>
+      <Modal open={detailModal} onClose={() => setDetailModal(false)} title={selected?.name || 'Кампания'} width={680}>
         {selected && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 14, maxHeight: '70vh', overflow: 'auto' }}>
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -453,68 +464,154 @@ export default function CommentingPage() {
               </div>
             </div>
 
-            {/* ── Subscribe section in detail ──────────── */}
-            {(selected.channels || []).length > 0 && selected.status !== 'active' && (
-              <div style={{ padding: '14px 16px', borderRadius: 10, background: 'rgba(0,194,178,0.06)', border: '1px solid rgba(0,194,178,0.15)' }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-                  <span style={{ fontWeight: 700, fontSize: 13 }}>◎ Предподписка</span>
-                  <Button variant="outline" size="sm" onClick={() => openSubscribe(selected)}>Подписать аккаунты</Button>
-                </div>
-                <div style={{ fontSize: 12, color: 'var(--text-3)' }}>
-                  Подпиши {(selected.account_ids || []).length} аккаунтов на {(selected.channels || []).length} каналов перед запуском
-                </div>
-                {(() => {
-                  const sub = getSubscribeForCampaign(selected)
-                  if (!sub) return null
-                  return (
-                    <div style={{ marginTop: 8 }}>
-                      {sub.status === 'running' && (
-                        <>
-                          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>
-                            <span>✅ {sub.subscribed} / ❌ {sub.failed} / ✓ {sub.skipped}</span>
-                            <span>{sub.progress}%</span>
-                          </div>
-                          <div style={{ height: 4, borderRadius: 2, background: 'rgba(255,255,255,0.06)', overflow: 'hidden' }}>
-                            <div style={{ height: '100%', width: `${sub.progress}%`, background: '#7c4dff', borderRadius: 2, transition: 'width 0.5s' }} />
-                          </div>
-                        </>
-                      )}
-                      {sub.status === 'done' && (
-                        <div style={{ fontSize: 11, color: 'var(--green)' }}>
-                          ✅ Завершена: {sub.subscribed} подписано, {sub.skipped} уже были, {sub.failed} ошибок
-                        </div>
-                      )}
-                    </div>
-                  )
-                })()}
-              </div>
-            )}
-
-            {/* Channels */}
-            <div>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-                <span style={{ fontWeight: 700, fontSize: 13 }}>Целевые каналы ({(selected.channels || []).length})</span>
-                <Button variant="outline" size="sm" onClick={async () => { setChannelModal(true); try { const { data } = await parserAPI.folders(); setChannelFolders(data) } catch { } }}>+ Добавить</Button>
-              </div>
-              {(selected.channels || []).length === 0 ? (
-                <div style={{ fontSize: 12, color: 'var(--text-3)', textAlign: 'center', padding: '16px 0' }}>Нет каналов — добавьте для запуска</div>
-              ) : (selected.channels || []).map(ch => (
-                <div key={ch.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: 'var(--bg-3)', borderRadius: 8, marginBottom: 4 }}>
-                  <div>
-                    <span style={{ fontWeight: 600, fontSize: 13 }}>@{ch.username}</span>
-                    <span style={{ fontSize: 11, color: 'var(--text-3)', marginLeft: 8 }}>💬 {ch.comments_sent}</span>
-                  </div>
-                  <button onClick={() => handleRemoveChannel(selected.id, ch.id)} style={{ background: 'none', border: 'none', color: 'var(--red)', cursor: 'pointer', fontSize: 14 }}>✕</button>
-                </div>
+            {/* Detail Tabs */}
+            <div style={{ display: 'flex', gap: 4, background: 'var(--bg-2)', padding: 4, borderRadius: 10, border: '1px solid var(--border)' }}>
+              {[
+                { key: 'info', label: '📋 Инфо' },
+                { key: 'activity', label: '🔍 Активность' },
+              ].map(t => (
+                <button key={t.key} onClick={() => { setDetailTab(t.key); if (t.key === 'activity' && activity.length === 0) loadActivity(selected.id) }} style={{
+                  flex: 1, padding: '7px 14px', borderRadius: 8, border: 'none', cursor: 'pointer', fontSize: 12, fontWeight: 600,
+                  background: detailTab === t.key ? 'rgba(124,77,255,0.15)' : 'transparent',
+                  color: detailTab === t.key ? 'var(--violet)' : 'var(--text-3)', transition: 'all 0.15s',
+                }}>{t.label}</button>
               ))}
             </div>
 
-            <div style={{ padding: '12px 14px', background: 'var(--bg-3)', borderRadius: 10, fontSize: 12, color: 'var(--text-2)' }}>
-              <div>Триггер: {TRIGGERS.find(t => t.value === selected.trigger_mode)?.label}{selected.trigger_mode === 'random' ? ` (${selected.trigger_percent}%)` : ''}{selected.trigger_mode === 'keywords' ? `: ${(selected.trigger_keywords || []).join(', ')}` : ''}</div>
-              <div style={{ marginTop: 4 }}>Тайминги: вход {selected.delay_join}с · коммент {selected.delay_comment}с · между {selected.delay_between}с</div>
-              <div style={{ marginTop: 4 }}>Лимит: {selected.max_comments} комментов / {selected.max_hours}ч</div>
-              {selected.custom_prompt && <div style={{ marginTop: 4, color: 'var(--violet)' }}>Промпт: {selected.custom_prompt.slice(0, 100)}...</div>}
-            </div>
+            {detailTab === 'activity' ? (
+              /* ── Activity Tab ── */
+              <div>
+                <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 10 }}>
+                  <Button variant="ghost" size="sm" onClick={() => loadActivity(selected.id)} loading={activityLoading}>🔄 Обновить</Button>
+                </div>
+                {activityLoading ? <div style={{ display: 'flex', justifyContent: 'center', padding: 30 }}><Spinner size={20} /></div> :
+                  activity.length === 0 ? <Empty icon="🔍" title="Нет активности" subtitle="Запустите кампанию — здесь появится каждое действие аккаунтов" /> : (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                      {activity.map(a => (
+                        <div key={a.id} style={{ padding: '12px 14px', background: 'var(--bg-3)', borderRadius: 10, border: '1px solid var(--border)' }}>
+                          {/* Header */}
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                            <span style={{ fontSize: 18 }}>{a.status === 'done' ? '✅' : a.status === 'aborted' ? '🚫' : a.status === 'failed' ? '❌' : a.status === 'scheduled' ? '⏳' : '⚙️'}</span>
+                            <span style={{ fontWeight: 700, fontSize: 13 }}>{a.account_phone}</span>
+                            <span style={{ fontSize: 12, color: 'var(--text-3)' }}>→ @{a.channel} #{a.post_id}</span>
+                            <Badge color={a.status === 'done' ? 'green' : a.status === 'aborted' ? 'yellow' : a.status === 'failed' ? 'red' : 'default'}>{a.status}</Badge>
+                            {a.personality && <Badge color="violet">{a.personality}</Badge>}
+                            {a.style && <Badge color="blue">{a.style}</Badge>}
+                          </div>
+
+                          {/* Steps */}
+                          {a.steps && a.steps.length > 0 && (
+                            <div style={{ marginBottom: 8, padding: '8px 10px', background: 'var(--bg-2)', borderRadius: 8 }}>
+                              {a.steps.map((s, i) => (
+                                <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '3px 0', fontSize: 12 }}>
+                                  <span style={{ width: 20, textAlign: 'center' }}>
+                                    {s.action === 'pre_read' ? '📖' : s.action === 'read_post' ? '👁' : s.action === 'reaction' ? '😍' : s.action === 'reaction_skip' ? '⏭' : s.action === 'typing' ? '⌨️' : s.action === 'typing_skip' ? '⚡' : s.action === 'abort' ? '🚫' : s.action === 'comment_sent' ? '💬' : s.action === 'post_read' ? '📖' : '•'}
+                                  </span>
+                                  <span style={{ color: s.action === 'comment_sent' ? 'var(--green)' : s.action === 'abort' ? 'var(--red)' : 'var(--text-2)' }}>
+                                    {s.detail}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+
+                          {/* Comment text */}
+                          {a.comment_text && (
+                            <div style={{ fontSize: 13, color: 'var(--green)', padding: '6px 10px', background: 'rgba(61,214,140,0.06)', borderRadius: 8, borderLeft: '3px solid var(--green)' }}>
+                              💬 {a.comment_text}
+                            </div>
+                          )}
+
+                          {/* Error */}
+                          {a.error && (
+                            <div style={{ fontSize: 12, color: 'var(--red)', padding: '6px 10px', background: 'rgba(248,81,73,0.06)', borderRadius: 8, borderLeft: '3px solid var(--red)', marginTop: 4 }}>
+                              ❌ {a.error}
+                            </div>
+                          )}
+
+                          {/* Post preview */}
+                          {a.post_text && (
+                            <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 6, padding: '4px 8px', background: 'var(--bg-2)', borderRadius: 6 }}>
+                              📄 {a.post_text}
+                            </div>
+                          )}
+
+                          {/* Time */}
+                          <div style={{ display: 'flex', gap: 12, fontSize: 10, color: 'var(--text-3)', marginTop: 6 }}>
+                            {a.scheduled_at && <span>📅 Запланирован: {new Date(a.scheduled_at).toLocaleString('ru')}</span>}
+                            {a.executed_at && <span>⚡ Выполнен: {new Date(a.executed_at).toLocaleString('ru')}</span>}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+              </div>
+            ) : (
+              <>
+                {/* ── Subscribe section in detail ──────────── */}
+                {(selected.channels || []).length > 0 && selected.status !== 'active' && (
+                  <div style={{ padding: '14px 16px', borderRadius: 10, background: 'rgba(0,194,178,0.06)', border: '1px solid rgba(0,194,178,0.15)' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                      <span style={{ fontWeight: 700, fontSize: 13 }}>◎ Предподписка</span>
+                      <Button variant="outline" size="sm" onClick={() => openSubscribe(selected)}>Подписать аккаунты</Button>
+                    </div>
+                    <div style={{ fontSize: 12, color: 'var(--text-3)' }}>
+                      Подпиши {(selected.account_ids || []).length} аккаунтов на {(selected.channels || []).length} каналов перед запуском
+                    </div>
+                    {(() => {
+                      const sub = getSubscribeForCampaign(selected)
+                      if (!sub) return null
+                      return (
+                        <div style={{ marginTop: 8 }}>
+                          {sub.status === 'running' && (
+                            <>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>
+                                <span>✅ {sub.subscribed} / ❌ {sub.failed} / ✓ {sub.skipped}</span>
+                                <span>{sub.progress}%</span>
+                              </div>
+                              <div style={{ height: 4, borderRadius: 2, background: 'rgba(255,255,255,0.06)', overflow: 'hidden' }}>
+                                <div style={{ height: '100%', width: `${sub.progress}%`, background: '#7c4dff', borderRadius: 2, transition: 'width 0.5s' }} />
+                              </div>
+                            </>
+                          )}
+                          {sub.status === 'done' && (
+                            <div style={{ fontSize: 11, color: 'var(--green)' }}>
+                              ✅ Завершена: {sub.subscribed} подписано, {sub.skipped} уже были, {sub.failed} ошибок
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })()}
+                  </div>
+                )}
+
+                {/* Channels */}
+                <div>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+                    <span style={{ fontWeight: 700, fontSize: 13 }}>Целевые каналы ({(selected.channels || []).length})</span>
+                    <Button variant="outline" size="sm" onClick={async () => { setChannelModal(true); try { const { data } = await parserAPI.folders(); setChannelFolders(data) } catch { } }}>+ Добавить</Button>
+                  </div>
+                  {(selected.channels || []).length === 0 ? (
+                    <div style={{ fontSize: 12, color: 'var(--text-3)', textAlign: 'center', padding: '16px 0' }}>Нет каналов — добавьте для запуска</div>
+                  ) : (selected.channels || []).map(ch => (
+                    <div key={ch.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: 'var(--bg-3)', borderRadius: 8, marginBottom: 4 }}>
+                      <div>
+                        <span style={{ fontWeight: 600, fontSize: 13 }}>@{ch.username}</span>
+                        <span style={{ fontSize: 11, color: 'var(--text-3)', marginLeft: 8 }}>💬 {ch.comments_sent}</span>
+                      </div>
+                      <button onClick={() => handleRemoveChannel(selected.id, ch.id)} style={{ background: 'none', border: 'none', color: 'var(--red)', cursor: 'pointer', fontSize: 14 }}>✕</button>
+                    </div>
+                  ))}
+                </div>
+
+                <div style={{ padding: '12px 14px', background: 'var(--bg-3)', borderRadius: 10, fontSize: 12, color: 'var(--text-2)' }}>
+                  <div>Триггер: {TRIGGERS.find(t => t.value === selected.trigger_mode)?.label}{selected.trigger_mode === 'random' ? ` (${selected.trigger_percent}%)` : ''}{selected.trigger_mode === 'keywords' ? `: ${(selected.trigger_keywords || []).join(', ')}` : ''}</div>
+                  <div style={{ marginTop: 4 }}>Тайминги: вход {selected.delay_join}с · коммент {selected.delay_comment}с · между {selected.delay_between}с</div>
+                  <div style={{ marginTop: 4 }}>Лимит: {selected.max_comments} комментов / {selected.max_hours}ч</div>
+                  {selected.custom_prompt && <div style={{ marginTop: 4, color: 'var(--violet)' }}>Промпт: {selected.custom_prompt.slice(0, 100)}...</div>}
+                </div>
+              </>
+            )}
           </div>
         )}
       </Modal>

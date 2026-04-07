@@ -45,7 +45,9 @@ async def _do_smart_comment(client, account, channel_username, post_id, comment_
     """
     Человекоподобное комментирование:
     pre-read → пауза → реакция(40%) → typing → abort(10%) → send → post-read
+    Возвращает (status, detail, steps[]) — steps = лог каждого действия.
     """
+    steps = []  # лог шагов: [{"action": "...", "detail": "...", "seconds": N}]
     entity = await client.get_entity(channel_username)
 
     # 1. Прочитать последние посты (листаем ленту)
@@ -57,10 +59,12 @@ async def _do_smart_comment(client, account, channel_username, post_id, comment_
     for p in posts:
         await client.send_read_acknowledge(entity, p)
         await asyncio.sleep(random.uniform(1, 4))
+    steps.append({"action": "pre_read", "detail": f"Прочитал {len(posts)} постов в @{channel_username}"})
 
     # 2. Задержка — "читаем" целевой пост (НЕ БОЛЕЕ 2-3 мин)
     read_time = random.randint(30, 120)
     await asyncio.sleep(read_time)
+    steps.append({"action": "read_post", "detail": f"Читал пост #{post_id} ({read_time}с)"})
 
     # 3. Иногда ставим реакцию перед комментарием (40%)
     if random.random() < 0.4:
@@ -72,17 +76,20 @@ async def _do_smart_comment(client, account, channel_username, post_id, comment_
                 peer=entity, msg_id=post_id,
                 reaction=[ReactionEmoji(emoticon=emoji)]
             ))
+            steps.append({"action": "reaction", "detail": f"Поставил {emoji} на пост #{post_id}"})
             await asyncio.sleep(random.randint(5, 30))
         except Exception:
-            pass
+            steps.append({"action": "reaction", "detail": "Реакция не удалась (возможно отключены)"})
+    else:
+        steps.append({"action": "reaction_skip", "detail": "Реакцию не ставил (рандом)"})
 
     # 4. Typing перед комментарием
+    typing_done = False
     if personality.get("typing_before_comment", True):
         try:
             from telethon.tl.functions.messages import SetTypingRequest, GetDiscussionMessageRequest
             from telethon.tl.types import SendMessageTypingAction
 
-            # Пробуем получить discussion group для typing
             try:
                 disc = await client(GetDiscussionMessageRequest(peer=entity, msg_id=post_id))
                 if disc and disc.messages:
@@ -90,19 +97,30 @@ async def _do_smart_comment(client, account, channel_username, post_id, comment_
                     typing_duration = random.randint(3, 12)
                     await client(SetTypingRequest(peer=discussion_peer, action=SendMessageTypingAction()))
                     await asyncio.sleep(typing_duration)
+                    steps.append({"action": "typing", "detail": f"Печатал {typing_duration}с в discussion"})
+                    typing_done = True
             except Exception:
-                # Typing в сам канал если discussion недоступен
                 typing_duration = random.randint(3, 12)
                 await asyncio.sleep(typing_duration)
+                steps.append({"action": "typing", "detail": f"Пауза {typing_duration}с (discussion недоступен)"})
+                typing_done = True
         except Exception:
-            await asyncio.sleep(random.randint(3, 8))
+            wait = random.randint(3, 8)
+            await asyncio.sleep(wait)
+            steps.append({"action": "typing", "detail": f"Пауза {wait}с"})
+            typing_done = True
+
+    if not typing_done:
+        steps.append({"action": "typing_skip", "detail": "Импульсивный — без typing"})
 
     # 5. 10% шанс "передумал"
     if random.random() < 0.10:
-        return "aborted", "Начал писать, передумал"
+        steps.append({"action": "abort", "detail": "Начал писать, передумал"})
+        return "aborted", "Начал писать, передумал", steps
 
     # 6. Отправляем комментарий
     await client.send_message(entity=entity, message=comment_text, comment_to=post_id)
+    steps.append({"action": "comment_sent", "detail": f"Отправил: {comment_text[:80]}"})
 
     # 7. После комментария — прочитать ещё 1-3 поста (не уходим сразу)
     await asyncio.sleep(random.randint(5, 20))
@@ -110,8 +128,9 @@ async def _do_smart_comment(client, account, channel_username, post_id, comment_
     for p in more_posts:
         await client.send_read_acknowledge(entity, p)
         await asyncio.sleep(random.uniform(1, 3))
+    steps.append({"action": "post_read", "detail": f"Дочитал {len(more_posts)} постов после коммента"})
 
-    return "ok", f"Комментарий отправлен в @{channel_username}"
+    return "ok", f"Комментарий отправлен в @{channel_username}", steps
 
 
 async def _execute_queue_item(item, db):
@@ -214,17 +233,24 @@ async def _execute_queue_item(item, db):
             item.executed_at = now
             return
 
-        status, detail = await _do_smart_comment(
+        status, detail, steps = await _do_smart_comment(
             client, account, item.channel, item.post_id, comment_text, personality
         )
 
         item.executed_at = datetime.utcnow()
         item.comment_text = comment_text
 
+        # Сохраняем шаги в personality поле (для логов)
+        import json
+        item.personality = {
+            **(item.personality or {}),
+            "_steps": steps,
+        }
+
         if status == "aborted":
             item.status = "aborted"
             item.error = detail
-            logger.info(f"[executor] 🚫 {account.phone} → @{item.channel}: передумал")
+            logger.info(f"[executor] {account.phone} -> @{item.channel}: передумал")
             return
 
         if status == "ok":
@@ -253,7 +279,7 @@ async def _execute_queue_item(item, db):
                 llm_provider=_val(campaign.llm_provider),
             ))
 
-            logger.info(f"[executor] ✅ {account.phone} → @{item.channel} #{item.post_id}: {comment_text[:50]}...")
+            logger.info(f"[executor] {account.phone} -> @{item.channel} #{item.post_id}: {comment_text[:50]}...")
 
     except Exception as e:
         err = str(e)
