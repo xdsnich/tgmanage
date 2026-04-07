@@ -125,10 +125,17 @@ async def _execute_queue_item(item, db):
     from models.campaign import Campaign, CommentLog, CampaignStatus
     from models.comment_queue import CommentQueue
     from utils.telegram import make_telethon_client
+    from utils.account_lock import acquire_account_lock, release_account_lock
     from services.llm import generate_comment
     from tasks.behavior_engine import get_or_create_behavior
 
     now = datetime.utcnow()
+
+    # Acquire Redis lock — skip if another session is using this account
+    if not acquire_account_lock(item.account_id, ttl=300):
+        logger.info(f"[executor] Аккаунт {item.account_id} занят (lock) — пропуск")
+        item.status = "scheduled"  # Return to queue for retry
+        return
 
     # Помечаем как executing
     item.status = "executing"
@@ -288,6 +295,7 @@ async def _execute_queue_item(item, db):
     finally:
         try: await client.disconnect()
         except: pass
+        release_account_lock(item.account_id)
 
 
 async def _process_comment_queue():

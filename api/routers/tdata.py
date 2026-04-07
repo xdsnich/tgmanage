@@ -21,6 +21,7 @@ from database import get_db
 from routers.deps import get_current_user
 from models.user import User
 from models.account import TelegramAccount
+from models.api_app import ApiApp
 from services import accounts as acc_svc
 
 router = APIRouter(prefix="/import", tags=["import"])
@@ -220,13 +221,26 @@ async def import_session_files_batch(
     imported = 0
     errors = []
 
+    # Load proxy for verification
+    from sqlalchemy import select as _sel
+    from models.proxy import Proxy as _Proxy
+    _proxy_r = await db.execute(
+        _sel(_Proxy).where(_Proxy.user_id == current_user.id).limit(1)
+    )
+    _proxy_row = _proxy_r.scalar_one_or_none()
+    proxy_dict = None
+    if _proxy_row:
+        from routers.tg_auth import _make_proxy
+        proxy_dict = _make_proxy(_proxy_row)
+
+    cli_config = _get_cli_config()
+
     for file in files:
         if not file.filename.endswith(".session"):
             errors.append({"file": file.filename, "error": "Не .session файл"})
             continue
 
         try:
-            # Рекурсивно вызываем одиночный импорт
             clean_phone = file.filename.replace(".session", "")
             sessions_dir = _get_sessions_dir()
             session_path = sessions_dir / f"{clean_phone}.session"
@@ -237,15 +251,53 @@ async def import_session_files_batch(
 
             real_phone = f"+{clean_phone}" if not clean_phone.startswith("+") else clean_phone
 
+            # Verify session by connecting with proxy (timeout 15s)
+            status = "unknown"
+            tg_id = None
+            first_name = ""
+            username = ""
+            has_photo = False
+
+            if proxy_dict:
+                from telethon import TelegramClient
+                try:
+                    verify_client = TelegramClient(
+                        str(session_path).replace(".session", ""),
+                        cli_config.API_ID,
+                        cli_config.API_HASH,
+                        proxy=proxy_dict,
+                        timeout=15,
+                    )
+                    await verify_client.connect()
+                    if await verify_client.is_user_authorized():
+                        me = await verify_client.get_me()
+                        status = "active"
+                        tg_id = me.id
+                        first_name = me.first_name or ""
+                        username = me.username or ""
+                        has_photo = bool(me.photo)
+                        if me.phone:
+                            real_phone = f"+{me.phone}"
+                    await verify_client.disconnect()
+                except Exception:
+                    try:
+                        await verify_client.disconnect()
+                    except Exception:
+                        pass
+
             account = TelegramAccount(
                 user_id=current_user.id,
                 phone=real_phone,
+                tg_id=tg_id,
+                first_name=first_name,
+                username=username,
+                has_photo=has_photo,
                 session_file=str(session_path),
-                status="unknown",
+                status=status,
             )
             db.add(account)
             imported += 1
-            results.append({"file": file.filename, "phone": real_phone, "status": "added"})
+            results.append({"file": file.filename, "phone": real_phone, "status": status})
 
         except Exception as e:
             errors.append({"file": file.filename, "error": str(e)})
@@ -384,6 +436,22 @@ async def import_tdata_archive(
         )
         db.add(account)
         await db.flush()
+
+        # Auto-create ApiApp from TData's original API credentials
+        if account_dict.get("tdata_api_id"):
+            try:
+                api_app = ApiApp(
+                    user_id=current_user.id,
+                    api_id=account_dict["tdata_api_id"],
+                    api_hash=account_dict.get("tdata_api_hash", ""),
+                    title=f"TData import ({real_phone})",
+                )
+                db.add(api_app)
+                await db.flush()
+                account.api_app_id = api_app.id
+                await db.flush()
+            except Exception:
+                pass  # Non-critical: account works without dedicated ApiApp
 
         return {
             "success": True,

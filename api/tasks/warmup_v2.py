@@ -18,8 +18,6 @@ import sys
 import os
 import logging
 from datetime import datetime, timedelta
-from collections import defaultdict
-
 from celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -71,10 +69,46 @@ REPLY_MESSAGES = [
 
 REACTION_EMOJIS = ["👍", "🔥", "❤️", "😁", "🎉", "🤩", "👏", "💯", "😍", "🤔"]
 
-POPULAR_CHANNELS = [
-    "telegram", "durov", "tginfo", "interface", "design_channel",
-    "techcrunch", "bbcnews", "caborka", "exploitex", "habr_com",
-]
+POPULAR_CHANNELS = {
+    "news": [
+        "telegram", "durov", "tginfo", "bbcnews", "raborunews",
+        "aborunews", "interfax_news", "nexta_live", "medikiforall",
+    ],
+    "tech": [
+        "habr_com", "techcrunch", "exploitex", "tproger_official",
+        "dev_im", "pythonist", "javascript_ru", "webstandards",
+        "frontend_ru", "linux_geek",
+    ],
+    "crypto": [
+        "crypto_lenta", "bits_media", "coinkeeper", "cryptoworld",
+        "forklog", "bitcoin_ru", "ton_community",
+    ],
+    "entertainment": [
+        "memes_nya", "pikabu_official", "oldlentach", "leprasorium",
+        "boomervsmillennial", "kino_mania", "igrovye_novosti",
+    ],
+    "design": [
+        "interface", "design_channel", "ux_live", "figma_community",
+        "graphicdesign", "designchannel", "behance_ru",
+    ],
+    "business": [
+        "banksta", "bitkogan", "vcnews", "business_insider_ru",
+        "economika", "rbc_news", "finanz_ru",
+    ],
+    "lifestyle": [
+        "recipes_daily", "travel_blogs", "sport_express",
+        "fitness_tips", "bookmate_ru", "music_daily",
+    ],
+    "science": [
+        "nplus1", "postnauka", "sci_one", "nauchpop",
+        "spacex_rus", "nature_science",
+    ],
+}
+
+# Flatten for backwards compat
+_ALL_CHANNELS = []
+for _cat_channels in POPULAR_CHANNELS.values():
+    _ALL_CHANNELS.extend(_cat_channels)
 
 SEARCH_WORDS = [
     "новости", "crypto", "погода", "рецепт", "фильм", "музыка",
@@ -91,32 +125,52 @@ MAX_DAILY_PER_ACTION = {
     "reply_dm": 10,
 }
 
-# Track per-account per-action daily counts: {task_id: {action_name: count}}
-_action_daily_counts: dict[int, dict[str, int]] = {}
-_action_daily_date: dict[int, object] = {}
+
+async def _get_action_count_from_db(task_id: int, action_name: str, day_started_at) -> int:
+    """Query warmup_logs table for today's action count (DB, not RAM)."""
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+    from sqlalchemy import select, func
+    from config import DATABASE_URL
+    from models.warmup_log import WarmupLog
+
+    engine = create_async_engine(DATABASE_URL, pool_size=1, max_overflow=0)
+    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+
+    try:
+        async with Session() as db:
+            result = await db.execute(
+                select(func.count()).where(
+                    WarmupLog.task_id == task_id,
+                    WarmupLog.action == action_name,
+                    WarmupLog.success == True,
+                    WarmupLog.created_at >= day_started_at,
+                )
+            )
+            return result.scalar() or 0
+    finally:
+        await engine.dispose()
 
 
-def _check_action_daily_limit(task_id: int, action_name: str) -> bool:
-    """Returns True if action is under daily limit for this task."""
-    from datetime import date
-    today = date.today()
-    if _action_daily_date.get(task_id) != today:
-        _action_daily_counts[task_id] = defaultdict(int)
-        _action_daily_date[task_id] = today
-
+def _check_action_daily_limit_sync(task_id: int, action_name: str, day_started_at) -> bool:
+    """Returns True if action is under daily limit for this task. Queries DB."""
     limit = MAX_DAILY_PER_ACTION.get(action_name)
     if limit is None:
         return True
-    return _action_daily_counts[task_id][action_name] < limit
-
-
-def _increment_action_daily(task_id: int, action_name: str):
-    from datetime import date
-    today = date.today()
-    if _action_daily_date.get(task_id) != today:
-        _action_daily_counts[task_id] = defaultdict(int)
-        _action_daily_date[task_id] = today
-    _action_daily_counts[task_id][action_name] += 1
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # We're inside an async context — use a new loop in thread
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                count = pool.submit(
+                    lambda: asyncio.run(_get_action_count_from_db(task_id, action_name, day_started_at))
+                ).result(timeout=5)
+        else:
+            count = loop.run_until_complete(_get_action_count_from_db(task_id, action_name, day_started_at))
+        return count < limit
+    except Exception as e:
+        logger.warning(f"[warmup] DB action count check failed: {e}")
+        return True  # Fail-open
 
 # ── Сессии — расписание "живого" человека ────────────────────
 
@@ -261,7 +315,14 @@ def calc_session_actions(session: dict, day: int, mode: str) -> int:
 async def _do_read_feed(client, phone):
     dialogs = await client.get_dialogs(limit=15)
     if not dialogs:
-        return "Нет диалогов", ""
+        # Fallback: search for a popular term to generate some activity
+        from telethon.tl.functions.contacts import SearchRequest
+        word = random.choice(SEARCH_WORDS)
+        try:
+            await client(SearchRequest(q=word, limit=5))
+        except Exception:
+            pass
+        return f"Нет диалогов — поискал «{word}»", ""
     dialog = random.choice(dialogs)
     messages = await client.get_messages(dialog, limit=random.randint(3, 10))
     for msg in messages:
@@ -277,7 +338,14 @@ async def _do_reaction(client, phone):
     dialogs = await client.get_dialogs(limit=20)
     channels = [d for d in dialogs if d.is_channel and not d.is_group]
     if not channels:
-        return "Нет каналов для реакции", ""
+        # Fallback: search for something instead
+        from telethon.tl.functions.contacts import SearchRequest
+        word = random.choice(SEARCH_WORDS)
+        try:
+            await client(SearchRequest(q=word, limit=5))
+        except Exception:
+            pass
+        return f"Нет каналов для реакции — поискал «{word}»", ""
 
     ch = random.choice(channels)
     messages = await client.get_messages(ch, limit=5)
@@ -315,7 +383,13 @@ async def _do_view_profile(client, phone):
     dialogs = await client.get_dialogs(limit=20)
     users = [d for d in dialogs if d.is_user and not d.entity.bot]
     if not users:
-        return "Нет контактов", ""
+        # Fallback: view own profile
+        try:
+            me = await client.get_me()
+            await client(GetFullUserRequest(me))
+            return "Нет контактов — посмотрел свой профиль", ""
+        except Exception:
+            return "Нет контактов", ""
     user = random.choice(users)
     try:
         await client(GetFullUserRequest(user.entity))
@@ -345,7 +419,25 @@ async def _do_search(client, phone):
 
 async def _do_join_channel(client, phone):
     from telethon.tl.functions.channels import JoinChannelRequest
-    ch_name = random.choice(POPULAR_CHANNELS)
+    import hashlib
+
+    # Deterministic channel selection based on phone hash —
+    # each account gets a consistent subset of channels
+    h = int(hashlib.md5((phone or "").encode()).hexdigest(), 16)
+    categories = list(POPULAR_CHANNELS.keys())
+    # Pick 3-4 categories for this account
+    num_cats = 3 + (h % 2)
+    selected_cats = []
+    for i in range(num_cats):
+        selected_cats.append(categories[(h + i * 7) % len(categories)])
+    pool = []
+    for cat in selected_cats:
+        pool.extend(POPULAR_CHANNELS[cat])
+    # Remove duplicates, deterministic shuffle via hash
+    pool = list(dict.fromkeys(pool))
+    idx = (h >> 8) % len(pool) if pool else 0
+    ch_name = pool[idx % len(pool)] if pool else "telegram"
+
     try:
         entity = await client.get_entity(ch_name)
         await client(JoinChannelRequest(entity))
@@ -376,8 +468,8 @@ async def _do_send_saved(client, phone):
     return f"Написал «{msg}» в Saved", ""
 
 
-async def _do_reply_dm(client, phone):
-    """Отвечает на последнее непрочитанное ЛС."""
+async def _do_read_dm(client, phone):
+    """Читает непрочитанные ЛС (только read acknowledge, никогда не отвечает)."""
     dialogs = await client.get_dialogs(limit=20)
     # Ищем непрочитанные ЛС (не боты, не каналы)
     unread = [d for d in dialogs if d.is_user and not d.entity.bot and d.unread_count > 0]
@@ -386,42 +478,24 @@ async def _do_reply_dm(client, phone):
         # Нет непрочитанных — просто читаем случайный диалог
         users = [d for d in dialogs if d.is_user and not d.entity.bot]
         if not users:
-            return "Нет личных чатов", ""
+            # Fallback: write to Saved Messages
+            me = await client.get_me()
+            msg = random.choice(SAVED_MESSAGES)
+            await client.send_message(me, msg)
+            return f"Нет личных чатов — написал «{msg}» в Saved", ""
         d = random.choice(users)
         msgs = await client.get_messages(d, limit=3)
         for m in msgs:
             await client.send_read_acknowledge(d, m)
         return f"Прочитал ЛС от «{d.name or '?'}»", d.name or ""
 
-    # Есть непрочитанное — отвечаем
+    # Есть непрочитанное — только читаем
     d = random.choice(unread)
-    reply = random.choice(REPLY_MESSAGES)
-
-    # Иногда (30%) отвечаем стикером вместо текста
-    if random.random() < 0.3:
-        try:
-            # Получаем стикерпак
-            from telethon.tl.functions.messages import GetAllStickersRequest
-            stickers = await client(GetAllStickersRequest(0))
-            if stickers.sets:
-                from telethon.tl.functions.messages import GetStickerSetRequest
-                from telethon.tl.types import InputStickerSetID
-                pack = random.choice(stickers.sets[:5])
-                sticker_set = await client(GetStickerSetRequest(
-                    stickerset=InputStickerSetID(id=pack.id, access_hash=pack.access_hash),
-                    hash=0
-                ))
-                if sticker_set.documents:
-                    sticker = random.choice(sticker_set.documents[:10])
-                    await client.send_file(d.entity, sticker)
-                    await client.send_read_acknowledge(d, await client.get_messages(d, limit=1))
-                    return f"Отправил стикер в ЛС «{d.name or '?'}»", d.name or ""
-        except:
-            pass  # Если стикеры не получилось — отвечаем текстом
-
-    await client.send_message(d.entity, reply)
-    await client.send_read_acknowledge(d, await client.get_messages(d, limit=1))
-    return f"Ответил «{reply}» в ЛС «{d.name or '?'}»", d.name or ""
+    msgs = await client.get_messages(d, limit=random.randint(3, 8))
+    for m in msgs:
+        await client.send_read_acknowledge(d, m)
+        await asyncio.sleep(random.uniform(0.5, 2))
+    return f"Прочитал {len(msgs)} ЛС от «{d.name or '?'}»", d.name or ""
 
 async def _do_smart_comment_warmup(client, phone, queue_item=None):
     """
@@ -483,7 +557,7 @@ ACTION_FNS = {
     "join_channel":  _do_join_channel,
     "forward_saved": _do_forward_saved,
     "send_saved":    _do_send_saved,
-    "reply_dm":      _do_reply_dm,
+    "reply_dm":      _do_read_dm,
     "smart_comment": _do_smart_comment_warmup,
 }
 
@@ -498,9 +572,15 @@ async def _run_session(task_row, account, proxy, session_cfg, db):
     Имитирует: человек достал телефон, полистал 5 минут, убрал.
     """
     from utils.telegram import make_telethon_client
+    from utils.account_lock import acquire_account_lock, release_account_lock
     from models.warmup_log import WarmupLog
 
     phone = account.phone
+
+    # Acquire Redis lock — skip if another session is using this account
+    if not acquire_account_lock(account.id, ttl=300):
+        logger.info(f"[warmup][{phone}] Аккаунт занят (lock) — пропуск сессии")
+        return 0
     day = getattr(task_row, 'day', 1) or 1
     mode = task_row.mode or "normal"
 
@@ -633,8 +713,8 @@ async def _run_session(task_row, account, proxy, session_cfg, db):
             if not action_fn:
                 continue
 
-            # Check per-action-type daily limit
-            if not _check_action_daily_limit(task_row.id, action["name"]):
+            # Check per-action-type daily limit (from DB)
+            if not _check_action_daily_limit_sync(task_row.id, action["name"], task_row.day_started_at or datetime.utcnow()):
                 logger.info(f"[warmup][{phone}]   {action['label']}: дневной лимит типа достигнут, пропуск")
                 continue
 
@@ -660,7 +740,6 @@ async def _run_session(task_row, account, proxy, session_cfg, db):
                 # Обновляем счётчики
                 task_row.actions_done += 1
                 task_row.today_actions += 1
-                _increment_action_daily(task_row.id, action["name"])
                 if action["name"] == "read_feed": task_row.feeds_read += 1
                 elif action["name"] == "set_reaction": task_row.reactions_set += 1
                 elif action["name"] == "view_stories": task_row.stories_viewed += 1
@@ -717,6 +796,7 @@ async def _run_session(task_row, account, proxy, session_cfg, db):
             await client.disconnect()
         except:
             pass
+        release_account_lock(account.id)
 
     # Логируем конец сессии
     log = WarmupLog(

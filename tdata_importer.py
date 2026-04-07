@@ -128,6 +128,14 @@ async def import_tdata_opentele(tdata_path: str, phone_hint: str = "") -> dict |
         account["status"] = "active"
         account["trust_score"] = trust_module.calculate(account)
 
+        # Preserve original TData API credentials for later ApiApp creation
+        try:
+            if account_td.api:
+                account["tdata_api_id"] = account_td.api.api_id
+                account["tdata_api_hash"] = account_td.api.api_hash
+        except Exception:
+            pass
+
         ui.ok(f"TData импортирован: +{real_phone} ({me.first_name})")
         return account
 
@@ -140,10 +148,13 @@ async def import_tdata_opentele(tdata_path: str, phone_hint: str = "") -> dict |
 # ИМПОРТ ЧЕРЕЗ TELETHON-TDATA (альтернатива)
 # ============================================================
 
-async def import_tdata_telethon(tdata_path: str, phone_hint: str = "") -> dict | None:
+async def import_tdata_telethon(tdata_path: str, phone_hint: str = "", proxy: dict = None) -> dict | None:
     """
     Альтернативный метод через telethon-tdata.
     pip install telethon-tdata
+
+    proxy: optional dict for TelegramClient, e.g.
+        {'proxy_type': 'socks5', 'addr': '...', 'port': 1080}
     """
     try:
         from telethon_tdata import TData  # type: ignore
@@ -170,10 +181,14 @@ async def import_tdata_telethon(tdata_path: str, phone_hint: str = "") -> dict |
 
         # Подключаемся чтобы получить данные аккаунта
         from telethon import TelegramClient
+        client_kwargs = {}
+        if proxy:
+            client_kwargs["proxy"] = proxy
         client = TelegramClient(
             session_file.replace(".session", ""),
             config.API_ID,
-            config.API_HASH
+            config.API_HASH,
+            **client_kwargs,
         )
 
         await client.connect()

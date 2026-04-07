@@ -20,6 +20,7 @@ celery_app = Celery(
         "tasks.bulk_tasks",
         "tasks.ai_tasks",
         "tasks.commenting_tasks",
+        "tasks.comment_executor",
         "tasks.warmup_tasks",
         "tasks.warmup_v2",
         "tasks.subscribe_tasks",
@@ -39,6 +40,7 @@ celery_app.conf.update(
         "tasks.bulk_tasks.*":       {"queue": "bulk_actions"},
         "tasks.ai_tasks.*":         {"queue": "ai_dialogs"},
         "tasks.commenting_tasks.*": {"queue": "ai_dialogs"},
+        "tasks.comment_executor.*": {"queue": "ai_dialogs"},
     },
 
     result_expires=3600,
