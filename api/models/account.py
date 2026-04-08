@@ -62,7 +62,7 @@ class TelegramAccount(Base):
     updated_at:       Mapped[datetime]             = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     last_checked:     Mapped[Optional[datetime]]   = mapped_column(DateTime, nullable=True)
     error:            Mapped[Optional[str]]        = mapped_column(String(512), nullable=True)
-
+    device_fingerprint: Mapped[Optional[str]]      = mapped_column(String(64), nullable=True)
     user:  Mapped[User]  = relationship("User", back_populates="accounts")
     proxy: Mapped[Optional[Proxy]] = relationship("Proxy", back_populates="accounts")
     api_app: Mapped[Optional[ApiApp]] = relationship("ApiApp", back_populates="accounts")

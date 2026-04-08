@@ -9,6 +9,7 @@ import json
 import os
 import importlib.util
 import logging
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -108,13 +109,19 @@ def _make_client(phone, proxy_dict=None):
     from utils.telegram import _get_device_fingerprint
     cli_config = load_cli_config()
     session_path = str(cli_config.SESSIONS_DIR / phone.replace("+", ""))
+    
+    # Проверяем есть ли уже fingerprint в БД
+    # При авторизации — используем fingerprint по хешу (новый или существующий)
     fingerprint = _get_device_fingerprint(phone)
+    
     return TelegramClient(
         session_path, cli_config.API_ID, cli_config.API_HASH,
         proxy=proxy_dict,
-        device_model=fingerprint["device"], system_version=fingerprint["system"],
+        device_model=fingerprint["device"],
+        system_version=fingerprint["system"],
         app_version=fingerprint["app_version"],
-        lang_code=fingerprint["lang"], system_lang_code=fingerprint["lang"],
+        lang_code=fingerprint["lang"],
+        system_lang_code=fingerprint["lang"],
         timeout=30,
     )
 
@@ -406,5 +413,7 @@ async def _save_account(db, current_user, phone, me):
     account_dict["session_file"] = str(cli_config.SESSIONS_DIR / phone.replace("+", "")) + ".session"
     account_dict["status"] = "active"
     account_dict["trust_score"] = trust_module.calculate(account_dict)
-
+    from utils.telegram import _get_device_fingerprint
+    fp = _get_device_fingerprint(phone)
+    account_dict["device_fingerprint"] = f"{fp['device']}|{fp['system']}|{fp['app_version']}|{fp['lang']}"
     return await sync_from_dict(db, current_user, account_dict)

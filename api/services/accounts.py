@@ -161,6 +161,7 @@ async def sync_from_dict(db: AsyncSession, user: User, account_dict: dict) -> Te
         existing.session_file = account_dict.get("session_file", existing.session_file)
         existing.status = account_dict.get("status", existing.status.value)
         existing.trust_score = account_dict.get("trust_score", existing.trust_score)
+        existing.device_fingerprint = account_dict.get("device_fingerprint") or existing.device_fingerprint
         existing.updated_at = datetime.utcnow()
 
         # Авто-распределение — если ещё не привязан к API-приложению
@@ -187,6 +188,7 @@ async def sync_from_dict(db: AsyncSession, user: User, account_dict: dict) -> Te
         session_file=account_dict.get("session_file", ""),
         status=account_dict.get("status", "unknown"),
         trust_score=account_dict.get("trust_score", 0),
+        device_fingerprint=account_dict.get("device_fingerprint"),
     )
     db.add(account)
     await db.flush()

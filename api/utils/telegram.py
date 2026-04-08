@@ -116,22 +116,35 @@ def make_telethon_client(account, proxy_row=None, api_id_override=None, api_hash
     if not tg_proxy:
         logger.warning(f"⛔ Аккаунт {session_path} — нет прокси, подключение отменено")
         return None
-    phone = ""
-    if hasattr(account, 'phone'):
-        phone = account.phone
-    elif isinstance(account, dict):
-        phone = account.get('phone', '')
+    session_file_path = Path(session_path + ".session")
     
-    fingerprint = _get_device_fingerprint(phone)
+    if session_file_path.exists():
+        # Существующая сессия — НЕ ТРОГАЕМ device
+        device = "Desktop"
+        system = "Windows 10"
+        app_ver = "4.14.15"
+        lang = "ru"
+    else:
+        # Новая сессия — рандомный fingerprint
+        phone = ""
+        if hasattr(account, 'phone'):
+            phone = account.phone
+        elif isinstance(account, dict):
+            phone = account.get('phone', '')
+        fp = _get_device_fingerprint(phone)
+        device = fp["device"]
+        system = fp["system"]
+        app_ver = fp["app_version"]
+        lang = fp["lang"]
 
     return TelegramClient(
         session_path, used_api_id, used_api_hash,
         proxy=tg_proxy,
-        device_model=fingerprint["device"],
-        system_version=fingerprint["system"],
-        app_version=fingerprint["app_version"],
-        lang_code=fingerprint["lang"],
-        system_lang_code=fingerprint["lang"],
+        device_model=device,
+        system_version=system,
+        app_version=app_ver,
+        lang_code=lang,
+        system_lang_code=lang,
         timeout=30,
     )
 
