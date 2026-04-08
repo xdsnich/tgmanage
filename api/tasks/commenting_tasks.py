@@ -42,15 +42,20 @@ def _should_comment(mode, pct, keywords, text):
 
 
 def _pick_account_round_robin(campaign_id: int, account_ids: list[int]) -> list[int]:
-    """
-    Round-robin ротация аккаунтов. Возвращает упорядоченный список ID
-    начиная с текущего индекса (для перебора при лимитах).
-    """
+    """Round-robin через Redis — переживает рестарты."""
     if not account_ids:
         return []
-    idx = _round_robin_idx.get(campaign_id, 0) % len(account_ids)
-    _round_robin_idx[campaign_id] = idx + 1
-    # Возвращаем все аккаунты начиная с текущего (чтобы можно было fallback)
+    try:
+        import redis as redis_lib
+        r = redis_lib.Redis()
+        key = f"gramgpt:rr:{campaign_id}"
+        idx = r.incr(key) - 1
+        r.expire(key, 86400)
+    except Exception:
+        # Fallback на память если Redis недоступен
+        idx = _round_robin_idx.get(campaign_id, 0)
+        _round_robin_idx[campaign_id] = idx + 1
+    idx = idx % len(account_ids)
     return account_ids[idx:] + account_ids[:idx]
 
 

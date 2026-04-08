@@ -121,3 +121,20 @@ async def root():
 # cd gramgpt-web && npm run dev
 #python -m uvicorn main:app --reload --port 8000
 #python -m celery -A celery_app worker -Q high_priority,bulk_actions,ai_dialogs --loglevel=info -P solo
+
+
+# # Терминал 1: API
+# cd api
+# python -m uvicorn main:app --reload --port 8000
+
+# # Терминал 2: Celery (комментинг + executor + проверки)
+# cd api
+# python -m celery -A celery_app worker -Q high_priority,bulk_actions,ai_dialogs --loglevel=info -P solo
+
+# # Терминал 3: Celery (прогрев + подписки — отдельно, не блокирует комментинг)
+# cd api
+# python -m celery -A celery_app worker -Q warmup --loglevel=info -P solo
+
+# # Терминал 4: Планировщик
+# cd api
+# python run_periodic.py
