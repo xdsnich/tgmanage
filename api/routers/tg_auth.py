@@ -120,8 +120,8 @@ def _make_client(phone, proxy_dict=None):
         device_model=fingerprint["device"],
         system_version=fingerprint["system"],
         app_version=fingerprint["app_version"],
-        lang_code=fingerprint["lang"],
-        system_lang_code=fingerprint["lang"],
+        lang_code="en",
+        system_lang_code="en",
         timeout=30,
     )
 

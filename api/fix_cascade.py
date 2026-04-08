@@ -2,7 +2,6 @@ import asyncio
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy import select
 from config import DATABASE_URL
-from utils.telegram import _get_device_fingerprint
 
 async def fix():
     engine = create_async_engine(DATABASE_URL)
@@ -11,11 +10,15 @@ async def fix():
         from models.account import TelegramAccount
         r = await db.execute(select(TelegramAccount))
         for acc in r.scalars().all():
-            fp = _get_device_fingerprint(acc.phone)
-            new_val = f"{fp['device']}|{fp['system']}|{fp['app_version']}"
-            old_val = acc.device_fingerprint
-            acc.device_fingerprint = new_val
-            print(f"  {acc.phone}: {old_val} -> {new_val}")
+            if acc.device_fingerprint and "|ru" in acc.device_fingerprint:
+                old = acc.device_fingerprint
+                # Убираем |ru или |en из конца, оставляем device|system|app_version
+                parts = acc.device_fingerprint.split("|")
+                if len(parts) == 4:
+                    acc.device_fingerprint = f"{parts[0]}|{parts[1]}|{parts[2]}"
+                print(f"  {acc.phone}: {old} -> {acc.device_fingerprint}")
+            elif acc.device_fingerprint:
+                print(f"  {acc.phone}: {acc.device_fingerprint} (ok)")
         await db.commit()
     await engine.dispose()
     print("Done!")

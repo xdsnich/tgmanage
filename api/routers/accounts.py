@@ -418,7 +418,7 @@ async def import_tdata(
             proxy=proxy_dict,
             device_model=_fp["device"], system_version=_fp["system"],
             app_version=_fp["app_version"],
-            lang_code=_fp["lang"], system_lang_code=_fp["lang"], timeout=30,
+            lang_code="en", system_lang_code="en", timeout=30,
         )
 
         await client.connect()
@@ -769,7 +769,7 @@ async def import_tdata_batch(
                 proxy=proxy_dict,
                 device_model=_fp["device"], system_version=_fp["system"],
                 app_version=_fp["app_version"],
-                lang_code=_fp["lang"], system_lang_code=_fp["lang"], timeout=30,
+                lang_code="en", system_lang_code="en", timeout=30,
             )
 
             await client.connect()
