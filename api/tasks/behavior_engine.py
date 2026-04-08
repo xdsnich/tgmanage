@@ -144,10 +144,10 @@ COMMENT_STYLE_PROFILES = [
 # ═══════════════════════════════════════════════════════════
 
 ACCOUNT_LIMITS = {
-    "max_comments_per_day": 5,
+    "max_comments_per_day": 4,
     "max_comments_per_channel_day": 1,
-    "cooldown_after_comment_min": 90,    # минуты (1.5 часа)
-    "cooldown_after_comment_max": 240,   # минуты (4 часа)
+    "cooldown_after_comment_min": 120,    # минуты (1.5 часа)
+    "cooldown_after_comment_max": 340,   # минуты (4 часа)
     "min_account_age_days": 0,  # disabled — user manages warmup manually
 }
 
