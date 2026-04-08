@@ -5,6 +5,7 @@ GramGPT API — routers/commenting.py
 """
 
 from datetime import datetime
+import random
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -237,7 +238,7 @@ async def start_campaign(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Запустить кампанию"""
+    """Запустить кампанию + автоматически включить прогрев для аккаунтов"""
     c = await _get_campaign(db, campaign_id, current_user.id)
 
     # Проверяем есть ли каналы
@@ -251,13 +252,55 @@ async def start_campaign(
     if not c.account_ids:
         raise HTTPException(status_code=400, detail="Выберите аккаунты для комментинга")
 
+    # ── Автоматический прогрев ───────────────────────────
+    from models.warmup import WarmupTask
+
+    warmup_created = 0
+    warmup_existing = 0
+
+    for acc_id in c.account_ids:
+        # Проверяем есть ли уже активный прогрев
+        existing = await db.execute(
+            select(WarmupTask).where(
+                WarmupTask.account_id == acc_id,
+                WarmupTask.status.in_(["active", "paused"]),
+            )
+        )
+        if existing.scalar_one_or_none():
+            warmup_existing += 1
+            continue
+
+        # Создаём прогрев
+        import random
+        warmup = WarmupTask(
+            user_id=current_user.id,
+            account_id=acc_id,
+            mode="normal",
+            status="running",
+            total_days=30,  # Прогрев на весь период кампании
+            day=1,
+            today_actions=0,
+            today_limit=random.randint(15, 25),
+            start_offset_min=random.randint(0, 90),
+            campaign_id=c.id,
+            day_started_at=datetime.utcnow(),
+            next_action_at=datetime.utcnow(),
+        )
+        db.add(warmup)
+        warmup_created += 1
+
     c.status = CampaignStatus.active
     c.started_at = datetime.utcnow()
     c.finished_at = None
     await db.flush()
 
-    return {"success": True, "status": "active", "message": "Кампания запущена"}
+    msg = "Кампания запущена"
+    if warmup_created > 0:
+        msg += f", прогрев включён для {warmup_created} аккаунтов"
+    if warmup_existing > 0:
+        msg += f" ({warmup_existing} уже прогреваются)"
 
+    return {"success": True, "status": "active", "message": msg}
 
 @router.post("/campaigns/{campaign_id}/pause")
 async def pause_campaign(
@@ -426,6 +469,7 @@ async def get_comment_logs(
 
 
 @router.get("/campaigns/{campaign_id}/activity")
+@router.get("/campaigns/{campaign_id}/activity")
 async def get_campaign_activity(
     campaign_id: int,
     limit: int = 50,
@@ -433,59 +477,119 @@ async def get_campaign_activity(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Детальная активность кампании — каждое действие каждого аккаунта.
-    Показывает: что прочитал, какую реакцию поставил, сколько печатал,
-    передумал или отправил, какой коммент написал.
+    Вся активность кампании: прогрев + комментарии.
+    Показывает что делали аккаунты: чтение, реакции, typing, комменты.
     """
     c = await _get_campaign(db, campaign_id, current_user.id)
 
     from models.comment_queue import CommentQueue
+    from models.warmup_log import WarmupLog
+    from models.warmup import WarmupTask
     from models.account import TelegramAccount
 
-    # Берём все записи очереди для этой кампании
-    result = await db.execute(
+    # ── 1. Комментарии из очереди ────────────────────────
+    cq_result = await db.execute(
         select(CommentQueue)
         .where(CommentQueue.campaign_id == c.id)
         .order_by(CommentQueue.created_at.desc())
         .limit(limit)
     )
-    items = result.scalars().all()
+    comments = cq_result.scalars().all()
 
-    # Подгружаем телефоны аккаунтов
-    acc_ids = list(set(q.account_id for q in items))
+    # ── 2. Логи прогрева привязанные к кампании ──────────
+    warmup_result = await db.execute(
+        select(WarmupLog)
+        .join(WarmupTask, WarmupLog.task_id == WarmupTask.id)
+        .where(WarmupTask.campaign_id == c.id)
+        .order_by(WarmupLog.created_at.desc())
+        .limit(limit)
+    )
+    warmup_logs = warmup_result.scalars().all()
+
+    # ── 3. Подгружаем телефоны аккаунтов ─────────────────
+    all_acc_ids = list(set(
+        [q.account_id for q in comments] +
+        [w.account_id for w in warmup_logs]
+    ))
     acc_map = {}
-    if acc_ids:
+    if all_acc_ids:
         accs_r = await db.execute(
-            select(TelegramAccount).where(TelegramAccount.id.in_(acc_ids))
+            select(TelegramAccount).where(TelegramAccount.id.in_(all_acc_ids))
         )
         for a in accs_r.scalars().all():
             acc_map[a.id] = {"phone": a.phone, "name": a.first_name or a.phone}
 
+    # ── 4. Собираем единый список ────────────────────────
     out = []
-    for q in items:
+
+    # Комментарии
+    for q in comments:
         acc_info = acc_map.get(q.account_id, {"phone": "?", "name": "?"})
-        personality_data = q.personality or {}
-        steps = personality_data.pop("_steps", []) if isinstance(personality_data, dict) else []
+        steps = []
+        personality_name = ""
+        style_name = ""
+        if q.personality:
+            steps = q.personality.get("_steps", [])
+            personality_name = q.personality.get("name", "")
+        if q.style:
+            style_name = q.style.get("name", "")
 
         out.append({
-            "id": q.id,
-            "status": q.status,
+            "id": f"c_{q.id}",
+            "type": "comment",
+            "account_id": q.account_id,
             "account_phone": acc_info["phone"],
             "account_name": acc_info["name"],
             "channel": q.channel,
             "post_id": q.post_id,
             "post_text": (q.post_text or "")[:200],
-            "personality": personality_data.get("name", ""),
-            "style": (q.style or {}).get("name", ""),
+            "status": q.status,
             "comment_text": q.comment_text,
             "error": q.error,
+            "personality": personality_name,
+            "style": style_name,
             "steps": steps,
-            "scheduled_at": q.scheduled_at.isoformat() if q.scheduled_at else None,
-            "executed_at": q.executed_at.isoformat() if q.executed_at else None,
-            "created_at": q.created_at.isoformat() if q.created_at else None,
+            "scheduled_at": q.scheduled_at.isoformat() + "Z" if q.scheduled_at else None,
+            "executed_at": q.executed_at.isoformat() + "Z" if q.executed_at else None,
+            "created_at": q.created_at.isoformat() + "Z",
+            "sort_time": (q.executed_at or q.created_at).isoformat(),
         })
 
-    return out
+    # Warmup логи
+    for w in warmup_logs:
+        acc_info = acc_map.get(w.account_id, {"phone": "?", "name": "?"})
+
+        # Иконка по типу действия
+        action_icons = {
+            "read_feed": "📖", "set_reaction": "😍", "view_stories": "👁",
+            "view_profile": "👤", "typing": "⌨️", "search": "🔍",
+            "join_channel": "📢", "forward_saved": "💾", "send_saved": "💬",
+            "reply_dm": "↩️", "session_start": "▶", "session_end": "⏹",
+            "smart_comment": "💬", "new_day": "🌅", "rest_day": "😴",
+            "error": "❌",
+        }
+        icon = action_icons.get(w.action, "•")
+
+        out.append({
+            "id": f"w_{w.id}",
+            "type": "warmup",
+            "account_id": w.account_id,
+            "account_phone": acc_info["phone"],
+            "account_name": acc_info["name"],
+            "channel": w.channel or "",
+            "action": w.action,
+            "action_icon": icon,
+            "detail": w.detail or "",
+            "success": w.success,
+            "error": w.error,
+            "created_at": w.created_at.isoformat() + "Z" if w.created_at else None,
+            "sort_time": w.created_at.isoformat() if w.created_at else "",
+        })
+
+    # Сортируем по времени (новые сверху)
+    out.sort(key=lambda x: x.get("sort_time", ""), reverse=True)
+
+    return out[:limit]
 
 
 # ── Comment Queue (v2) ─────────────────────────────────────
