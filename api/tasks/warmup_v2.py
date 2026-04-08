@@ -19,7 +19,7 @@ import os
 import logging
 from datetime import datetime, timedelta
 from celery_app import celery_app
-
+from models.campaign import Campaign
 logger = logging.getLogger(__name__)
 
 API_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -513,7 +513,7 @@ async def _do_smart_comment_warmup(client, phone, queue_item=None):
     prompt = build_comment_prompt(queue_item.post_text, style, personality)
 
     # Генерируем комментарий
-    provider = "claude"  # default, кампания подставит свой
+    provider = (queue_item.personality or {}).get("llm_provider", "groq")
     try:
         from sqlalchemy import select
         # provider берём из personality если есть

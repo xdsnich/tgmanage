@@ -192,7 +192,7 @@ async def _process_campaign(c, db):
             channel=channel.username,
             post_id=post.post_id,
             post_text=post.text[:2000],
-            personality=personality,
+            personality={**personality, "llm_provider": _val(c.llm_provider)},
             style=style,
             status="scheduled",
             scheduled_at=scheduled_at,

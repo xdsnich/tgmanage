@@ -62,12 +62,14 @@ async def _do_smart_comment(client, account, channel_username, post_id, comment_
     steps.append({"action": "pre_read", "detail": f"Прочитал {len(posts)} постов в @{channel_username}"})
 
     # 2. Задержка — "читаем" целевой пост (НЕ БОЛЕЕ 2-3 мин)
-    read_time = random.randint(30, 120)
+    read_time = random.randint(15, 180)
     await asyncio.sleep(read_time)
     steps.append({"action": "read_post", "detail": f"Читал пост #{post_id} ({read_time}с)"})
 
     # 3. Иногда ставим реакцию перед комментарием (40%)
-    if random.random() < 0.4:
+    reaction_chance = random.uniform(0.05, 0.55)  # От 15% до 55% каждый раз разный
+    if random.random() < reaction_chance:
+
         try:
             from telethon.tl.functions.messages import SendReactionRequest
             from telethon.tl.types import ReactionEmoji
@@ -94,13 +96,13 @@ async def _do_smart_comment(client, account, channel_username, post_id, comment_
                 disc = await client(GetDiscussionMessageRequest(peer=entity, msg_id=post_id))
                 if disc and disc.messages:
                     discussion_peer = disc.messages[0].peer_id
-                    typing_duration = random.randint(3, 12)
+                    typing_duration = random.randint(2, 25)
                     await client(SetTypingRequest(peer=discussion_peer, action=SendMessageTypingAction()))
                     await asyncio.sleep(typing_duration)
                     steps.append({"action": "typing", "detail": f"Печатал {typing_duration}с в discussion"})
                     typing_done = True
             except Exception:
-                typing_duration = random.randint(3, 12)
+                typing_duration = random.randint(2, 25)
                 await asyncio.sleep(typing_duration)
                 steps.append({"action": "typing", "detail": f"Пауза {typing_duration}с (discussion недоступен)"})
                 typing_done = True
@@ -114,7 +116,8 @@ async def _do_smart_comment(client, account, channel_username, post_id, comment_
         steps.append({"action": "typing_skip", "detail": "Импульсивный — без typing"})
 
     # 5. 10% шанс "передумал"
-    if random.random() < 0.10:
+    abort_chance = random.uniform(0.04, 0.19)  # 5-18%
+    if random.random() < abort_chance:
         steps.append({"action": "abort", "detail": "Начал писать, передумал"})
         return "aborted", "Начал писать, передумал", steps
 
