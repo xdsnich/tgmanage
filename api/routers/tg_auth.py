@@ -415,5 +415,4 @@ async def _save_account(db, current_user, phone, me):
     account_dict["trust_score"] = trust_module.calculate(account_dict)
     from utils.telegram import _get_device_fingerprint
     fp = _get_device_fingerprint(phone)
-    account_dict["device_fingerprint"] = f"{fp['device']}|{fp['system']}|{fp['app_version']}|{fp['lang']}"
-    return await sync_from_dict(db, current_user, account_dict)
+    account_dict["device_fingerprint"] = f"{fp['device']}|{fp['system']}|{fp['app_version']}"
