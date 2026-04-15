@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { reactionsAPI, accountsAPI } from '../services/api'
 import { Card, Button, Input, Modal, Badge, Spinner, Empty, StatusBadge } from '../components/ui'
-
+import { useAutoRefresh } from '../hooks/useAutoRefresh'
 const POPULAR_EMOJIS = ["👍", "🔥", "❤️", "🎉", "🤩", "👏", "😁", "💯", "🏆", "❤️‍🔥", "🤣", "😍", "🙏", "🕊", "😎"]
 
 const TARGET_OPTIONS = [
@@ -36,6 +36,7 @@ export default function ReactionsPage() {
   }
 
   useEffect(() => { load() }, [])
+  useAutoRefresh(() => load(), 15000)
 
   const handleCreate = async () => {
     if (!form.channel_link || !form.account_ids.length || !form.reactions.length) {

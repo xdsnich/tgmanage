@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef } from 'react'
 import { warmupAPI, accountsAPI } from '../services/api'
 import { Card, Button, Input, Modal, Badge, Spinner, Empty } from '../components/ui'
+import { useAutoRefresh } from '../hooks/useAutoRefresh'
 
 const MODE_INFO = {
   careful: { label: '🐢 Осторожный', desc: 'Мало действий, большие паузы', color: '#3dd68c' },
@@ -39,6 +40,7 @@ export default function WarmupPage() {
   }
 
   useEffect(() => { load() }, [])
+  useAutoRefresh(() => load(), 15000)
 
   // Авто-обновление логов каждые 15с
   useEffect(() => {

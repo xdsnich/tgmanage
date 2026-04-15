@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { accountsAPI, parserAPI } from '../services/api'
 import { Card, Button, Input, Modal, Badge, Spinner, Empty, StatCard } from '../components/ui'
-
+import { useAutoRefresh } from '../hooks/useAutoRefresh'
 export default function ParserPage() {
   const [channels, setChannels] = useState([])
   const [accounts, setAccounts] = useState([])
@@ -40,6 +40,7 @@ export default function ParserPage() {
   }
 
   useEffect(() => { load() }, [])
+  useAutoRefresh(() => load(), 15000)
 
   const filteredChannels = channels.filter(c =>
     filterFolder === 'all' || (c.folder || '') === filterFolder

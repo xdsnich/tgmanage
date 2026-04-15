@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { proxiesAPI } from '../services/api'
 import { Button, Modal, Input, Empty, Spinner, Badge } from '../components/ui'
-
+import { useAutoRefresh } from '../hooks/useAutoRefresh'
 export default function ProxiesPage() {
   const [proxies, setProxies] = useState([])
   const [loading, setLoading] = useState(true)
@@ -26,6 +26,7 @@ export default function ProxiesPage() {
     setLoading(false)
   }
   useEffect(() => { load() }, [])
+  useAutoRefresh(() => load(), 15000)
 
   const handleAdd = async (e) => {
     e.preventDefault(); setSaving(true)

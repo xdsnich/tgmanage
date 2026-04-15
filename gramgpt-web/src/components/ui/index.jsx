@@ -91,15 +91,16 @@ export function Input({ label, error, ...props }) {
     <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
       {label && <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase' }}>{label}</label>}
       <input
+        {...props}
         style={{
+          width: '100%', padding: '10px 14px',
           background: 'var(--bg-3)', border: `1px solid ${error ? 'var(--red)' : 'var(--border)'}`,
           borderRadius: 'var(--radius-sm)', color: 'var(--text)',
-          padding: '10px 14px', fontSize: 14, outline: 'none', width: '100%',
-          transition: 'border-color 0.15s, box-shadow 0.15s',
+          fontSize: 14, outline: 'none', transition: 'border-color 0.15s, box-shadow 0.15s',
+          ...props.style,
         }}
         onFocus={e => { e.target.style.borderColor = 'var(--violet)'; e.target.style.boxShadow = '0 0 0 3px rgba(124,77,255,0.15)' }}
-        onBlur={e => { e.target.style.borderColor = error ? 'var(--red)' : 'var(--border)'; e.target.style.boxShadow = 'none' }}
-        {...props}
+        onBlur={e => { e.target.style.borderColor = 'var(--border)'; e.target.style.boxShadow = 'none' }}
       />
       {error && <span style={{ fontSize: 12, color: 'var(--red)' }}>{error}</span>}
     </div>

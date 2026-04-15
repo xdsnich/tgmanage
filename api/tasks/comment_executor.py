@@ -390,3 +390,102 @@ def process_comment_queue(self):
     """Обработка очереди комментариев — каждые 60с."""
     self.update_state(state="PROGRESS", meta={"message": "Обработка очереди..."})
     return run_async(_process_comment_queue())
+
+# ═══════════════════════════════════════════════════════════
+# ПАРАЛЛЕЛЬНЫЙ РЕЖИМ
+# Диспетчер (<1с) → отдельная задача на каждый комментарий
+# ═══════════════════════════════════════════════════════════
+
+async def _dispatch_comments():
+    """Находит готовые комментарии → отправляет по одной задаче."""
+    if API_DIR not in sys.path:
+        sys.path.insert(0, API_DIR)
+
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+    from sqlalchemy import select
+    from config import DATABASE_URL
+    from models.comment_queue import CommentQueue
+
+    engine = create_async_engine(DATABASE_URL, pool_size=2, max_overflow=0)
+    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+
+    dispatched = 0
+
+    try:
+        async with Session() as db:
+            now = datetime.utcnow()
+            result = await db.execute(
+                select(CommentQueue).where(
+                    CommentQueue.status == "scheduled",
+                    CommentQueue.scheduled_at <= now,
+                ).order_by(CommentQueue.scheduled_at.asc()).limit(50)
+            )
+            items = result.scalars().all()
+
+            for item in items:
+                celery_app.send_task(
+                    "tasks.comment_executor.execute_single_comment",
+                    args=[item.id],
+                    queue="ai_dialogs",
+                )
+                dispatched += 1
+
+            logger.info(f"[dispatch] Comments: отправлено {dispatched}")
+    except Exception as e:
+        logger.error(f"[dispatch] Comments ошибка: {e}")
+    finally:
+        await engine.dispose()
+
+    return {"dispatched": dispatched}
+
+
+async def _execute_single_comment(queue_id: int):
+    """Выполняет ОДИН комментарий — отдельная Celery задача."""
+    if API_DIR not in sys.path:
+        sys.path.insert(0, API_DIR)
+
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+    from sqlalchemy import select
+    from config import DATABASE_URL
+    from models.comment_queue import CommentQueue
+
+    engine = create_async_engine(DATABASE_URL, pool_size=2, max_overflow=0)
+    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+
+    async with Session() as db:
+        try:
+            item = (await db.execute(
+                select(CommentQueue).where(CommentQueue.id == queue_id)
+            )).scalar_one_or_none()
+
+            if not item:
+                return {"status": "skip", "reason": "not found"}
+            if item.status not in ("scheduled", "dispatched"):
+                return {"status": "skip", "reason": f"status={item.status}"}
+
+            await _execute_queue_item(item, db)
+            await db.commit()
+
+            return {"status": item.status, "channel": item.channel}
+
+        except Exception as e:
+            logger.error(f"[single_comment] #{queue_id}: {e}")
+            try:
+                await db.rollback()
+            except:
+                pass
+            return {"error": str(e)}
+        finally:
+            await engine.dispose()
+
+
+@celery_app.task(bind=True, name="tasks.comment_executor.dispatch_comments")
+def dispatch_comments(self):
+    """Диспетчер комментариев (<1с)."""
+    return run_async(_dispatch_comments())
+
+
+@celery_app.task(bind=True, name="tasks.comment_executor.execute_single_comment")
+def execute_single_comment(self, queue_id: int):
+    """Один комментарий — параллельно с другими."""
+    return run_async(_execute_single_comment(queue_id))

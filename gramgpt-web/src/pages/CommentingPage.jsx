@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { commentingAPI, accountsAPI, parserAPI, subscribeAPI } from '../services/api'
 import { Card, Button, Input, Modal, Badge, Spinner, Empty, StatCard } from '../components/ui'
-
+import { useAutoRefresh } from '../hooks/useAutoRefresh'
 const TONES = [
   { value: 'positive', label: 'Позитивный', icon: '😊' },
   { value: 'negative', label: 'Критичный', icon: '🤨' },
@@ -81,6 +81,20 @@ export default function CommentingPage() {
   }
 
   useEffect(() => { load() }, [])
+  useAutoRefresh(async () => {
+    const [c, st] = await Promise.all([
+      commentingAPI.list(),
+      subscribeAPI.list().catch(() => ({ data: [] })),
+    ])
+    setCampaigns(c.data)
+    setSubscribeTasks(st.data || [])
+    if (selected && detailModal) {
+      const updated = c.data.find(x => x.id === selected.id)
+      if (updated) setSelected(updated)
+    }
+  }, 15000)
+
+  useAutoRefresh(() => loadActivity(selected.id), 10000, detailModal && detailTab === 'activity' && !!selected)
 
   // Авто-обновление подписок каждые 10с
   useEffect(() => {
@@ -135,15 +149,27 @@ export default function CommentingPage() {
     try {
       const channels = channelText.split('\n').map(s => s.trim()).filter(Boolean)
       const { data } = await commentingAPI.addChannels(selected.id, channels)
-      showToast(data.message); setChannelModal(false); setChannelText('')
+      setChannelText('')
+      setChannelModal(false)
+
+      // Перезагружаем кампанию и обновляем selected
+      const { data: updated } = await commentingAPI.get(selected.id)
+      setSelected({ ...updated })  // spread чтобы React увидел новый объект
+
       await load()
+      showToast(data.message)
     } catch (err) { showToast(err.response?.data?.detail || 'Ошибка', 'error') }
     setSaving(false)
   }
 
   const handleRemoveChannel = async (campaignId, channelId) => {
-    try { await commentingAPI.removeChannel(campaignId, channelId); showToast('Канал удалён'); await load() }
-    catch { }
+    try {
+      await commentingAPI.removeChannel(campaignId, channelId)
+      showToast('Канал удалён')
+      await load()
+      const { data: updated } = await commentingAPI.get(campaignId)
+      setSelected(updated)
+    } catch { }
   }
 
   // ── Subscribe ─────────────────────────────────────────
@@ -488,59 +514,65 @@ export default function CommentingPage() {
                   activity.length === 0 ? <Empty icon="🔍" title="Нет активности" subtitle="Запустите кампанию — здесь появится каждое действие аккаунтов" /> : (
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
                       {activity.map(a => (
-                        <div key={a.id} style={{ padding: '12px 14px', background: 'var(--bg-3)', borderRadius: 10, border: '1px solid var(--border)' }}>
-                          {/* Header */}
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-                            <span style={{ fontSize: 18 }}>{a.status === 'done' ? '✅' : a.status === 'aborted' ? '🚫' : a.status === 'failed' ? '❌' : a.status === 'scheduled' ? '⏳' : '⚙️'}</span>
-                            <span style={{ fontWeight: 700, fontSize: 13 }}>{a.account_phone}</span>
-                            <span style={{ fontSize: 12, color: 'var(--text-3)' }}>→ @{a.channel} #{a.post_id}</span>
-                            <Badge color={a.status === 'done' ? 'green' : a.status === 'aborted' ? 'yellow' : a.status === 'failed' ? 'red' : 'default'}>{a.status}</Badge>
-                            {a.personality && <Badge color="violet">{a.personality}</Badge>}
-                            {a.style && <Badge color="blue">{a.style}</Badge>}
-                          </div>
+                        <div key={a.id} style={{ padding: '10px 14px', background: 'var(--bg-3)', borderRadius: 10, border: '1px solid var(--border)' }}>
+                          {a.type === 'warmup' ? (
+                            /* ── Warmup action ── */
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                              <span style={{ fontSize: 16 }}>{a.action_icon}</span>
+                              <span style={{ fontWeight: 600, fontSize: 12, color: 'var(--text-2)' }}>{a.account_phone}</span>
+                              <span style={{ fontSize: 12, color: a.success === false ? 'var(--red)' : 'var(--text-3)' }}>{a.detail}</span>
+                              {a.channel && <span style={{ fontSize: 11, color: 'var(--violet)' }}>@{a.channel}</span>}
+                              <span style={{ fontSize: 10, color: 'var(--text-3)', marginLeft: 'auto' }}>{a.created_at ? new Date(a.created_at).toLocaleTimeString('ru') : ''}</span>
+                            </div>
+                          ) : (
+                            /* ── Comment action ── */
+                            <>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                                <span style={{ fontSize: 18 }}>{a.status === 'done' ? '✅' : a.status === 'aborted' ? '🚫' : a.status === 'failed' ? '❌' : a.status === 'scheduled' ? '⏳' : '⚙️'}</span>
+                                <span style={{ fontWeight: 700, fontSize: 13 }}>{a.account_phone}</span>
+                                <span style={{ fontSize: 12, color: 'var(--text-3)' }}>→ @{a.channel} #{a.post_id}</span>
+                                <Badge color={a.status === 'done' ? 'green' : a.status === 'aborted' ? 'yellow' : a.status === 'failed' ? 'red' : 'default'}>{a.status}</Badge>
+                                {a.personality && <Badge color="violet">{a.personality}</Badge>}
+                                {a.style && <Badge color="blue">{a.style}</Badge>}
+                              </div>
 
-                          {/* Steps */}
-                          {a.steps && a.steps.length > 0 && (
-                            <div style={{ marginBottom: 8, padding: '8px 10px', background: 'var(--bg-2)', borderRadius: 8 }}>
-                              {a.steps.map((s, i) => (
-                                <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '3px 0', fontSize: 12 }}>
-                                  <span style={{ width: 20, textAlign: 'center' }}>
-                                    {s.action === 'pre_read' ? '📖' : s.action === 'read_post' ? '👁' : s.action === 'reaction' ? '😍' : s.action === 'reaction_skip' ? '⏭' : s.action === 'typing' ? '⌨️' : s.action === 'typing_skip' ? '⚡' : s.action === 'abort' ? '🚫' : s.action === 'comment_sent' ? '💬' : s.action === 'post_read' ? '📖' : '•'}
-                                  </span>
-                                  <span style={{ color: s.action === 'comment_sent' ? 'var(--green)' : s.action === 'abort' ? 'var(--red)' : 'var(--text-2)' }}>
-                                    {s.detail}
-                                  </span>
+                              {a.steps && a.steps.length > 0 && (
+                                <div style={{ marginBottom: 8, padding: '8px 10px', background: 'var(--bg-2)', borderRadius: 8 }}>
+                                  {a.steps.map((s, i) => (
+                                    <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '3px 0', fontSize: 12 }}>
+                                      <span style={{ width: 20, textAlign: 'center' }}>
+                                        {s.action === 'pre_read' ? '📖' : s.action === 'read_post' ? '👁' : s.action === 'reaction' ? '😍' : s.action === 'reaction_skip' ? '⏭' : s.action === 'typing' ? '⌨️' : s.action === 'typing_skip' ? '⚡' : s.action === 'abort' ? '🚫' : s.action === 'comment_sent' ? '💬' : s.action === 'post_read' ? '📖' : '•'}
+                                      </span>
+                                      <span style={{ color: s.action === 'comment_sent' ? 'var(--green)' : s.action === 'abort' ? 'var(--red)' : 'var(--text-2)' }}>{s.detail}</span>
+                                    </div>
+                                  ))}
                                 </div>
-                              ))}
-                            </div>
-                          )}
+                              )}
 
-                          {/* Comment text */}
-                          {a.comment_text && (
-                            <div style={{ fontSize: 13, color: 'var(--green)', padding: '6px 10px', background: 'rgba(61,214,140,0.06)', borderRadius: 8, borderLeft: '3px solid var(--green)' }}>
-                              💬 {a.comment_text}
-                            </div>
-                          )}
+                              {a.comment_text && (
+                                <div style={{ fontSize: 13, color: 'var(--green)', padding: '6px 10px', background: 'rgba(61,214,140,0.06)', borderRadius: 8, borderLeft: '3px solid var(--green)' }}>
+                                  💬 {a.comment_text}
+                                </div>
+                              )}
 
-                          {/* Error */}
-                          {a.error && (
-                            <div style={{ fontSize: 12, color: 'var(--red)', padding: '6px 10px', background: 'rgba(248,81,73,0.06)', borderRadius: 8, borderLeft: '3px solid var(--red)', marginTop: 4 }}>
-                              ❌ {a.error}
-                            </div>
-                          )}
+                              {a.error && (
+                                <div style={{ fontSize: 12, color: 'var(--red)', padding: '6px 10px', background: 'rgba(248,81,73,0.06)', borderRadius: 8, borderLeft: '3px solid var(--red)', marginTop: 4 }}>
+                                  ❌ {a.error}
+                                </div>
+                              )}
 
-                          {/* Post preview */}
-                          {a.post_text && (
-                            <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 6, padding: '4px 8px', background: 'var(--bg-2)', borderRadius: 6 }}>
-                              📄 {a.post_text}
-                            </div>
-                          )}
+                              {a.post_text && (
+                                <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 6, padding: '4px 8px', background: 'var(--bg-2)', borderRadius: 6 }}>
+                                  📄 {a.post_text}
+                                </div>
+                              )}
 
-                          {/* Time */}
-                          <div style={{ display: 'flex', gap: 12, fontSize: 10, color: 'var(--text-3)', marginTop: 6 }}>
-                            {a.scheduled_at && <span>📅 Запланирован: {new Date(a.scheduled_at).toLocaleString('ru')}</span>}
-                            {a.executed_at && <span>⚡ Выполнен: {new Date(a.executed_at).toLocaleString('ru')}</span>}
-                          </div>
+                              <div style={{ display: 'flex', gap: 12, fontSize: 10, color: 'var(--text-3)', marginTop: 6 }}>
+                                {a.scheduled_at && <span>📅 {new Date(a.scheduled_at).toLocaleString('ru')}</span>}
+                                {a.executed_at && <span>⚡ {new Date(a.executed_at).toLocaleString('ru')}</span>}
+                              </div>
+                            </>
+                          )}
                         </div>
                       ))}
                     </div>

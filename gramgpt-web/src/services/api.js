@@ -332,6 +332,9 @@ export const commentingAPI = {
 
   logs: (campaignId = null, limit = 50) =>
     api.get('/commenting/logs', { params: { campaign_id: campaignId, limit } }),
+
+  activity: (id, limit = 50) =>
+    api.get(`/commenting/campaigns/${id}/activity`, { params: { limit } }),
 }
 
 // ── API APPS (мульти-API ключи) ──────────────────────────────

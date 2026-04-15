@@ -1017,3 +1017,218 @@ def process_warmups_v2(self):
     """Вызывается каждые 60 секунд из run_periodic.py."""
     self.update_state(state="PROGRESS", meta={"message": "Прогрев v2..."})
     return run_async(_process_all_warmups_v2())
+
+# ═══════════════════════════════════════════════════════════
+# ПАРАЛЛЕЛЬНЫЙ РЕЖИМ
+# Диспетчер (<1с) → отдельная Celery задача на каждый аккаунт
+# 3 воркера = 3 аккаунта одновременно
+# ═══════════════════════════════════════════════════════════
+
+async def _dispatch_warmups():
+    """Находит аккаунты которым пора → отправляет по одной задаче."""
+    if API_DIR not in sys.path:
+        sys.path.insert(0, API_DIR)
+
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+    from sqlalchemy import select
+    from config import DATABASE_URL
+    from models.warmup import WarmupTask
+
+    engine = create_async_engine(DATABASE_URL, pool_size=2, max_overflow=0)
+    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+
+    dispatched = 0
+    skipped = 0
+
+    try:
+        async with Session() as db:
+            result = await db.execute(
+                select(WarmupTask).where(WarmupTask.status == "running")
+            )
+            tasks = result.scalars().all()
+            now = datetime.utcnow()
+            hour = (now.hour + 3) % 24
+
+            for t in tasks:
+                if hour < 8 or hour >= 24:
+                    skipped += 1
+                    continue
+                if t.next_action_at and now < t.next_action_at:
+                    skipped += 1
+                    continue
+                if t.today_actions >= (t.today_limit or 999):
+                    skipped += 1
+                    continue
+
+                celery_app.send_task(
+                    "tasks.warmup_v2.run_single_warmup",
+                    args=[t.id],
+                    queue="ai_dialogs",
+                )
+                dispatched += 1
+
+            logger.info(f"[dispatch] Warmup: отправлено {dispatched}, пропущено {skipped}")
+    except Exception as e:
+        logger.error(f"[dispatch] Ошибка: {e}")
+    finally:
+        await engine.dispose()
+
+    return {"dispatched": dispatched, "skipped": skipped}
+
+
+async def _run_single_warmup(task_id: int):
+    """Прогрев ОДНОГО аккаунта. Переиспользует _run_session()."""
+    if API_DIR not in sys.path:
+        sys.path.insert(0, API_DIR)
+
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+    from sqlalchemy import select
+    from sqlalchemy.orm import joinedload
+    from config import DATABASE_URL
+    from models.warmup import WarmupTask
+    from models.warmup_log import WarmupLog
+    from models.account import TelegramAccount
+    from models.proxy import Proxy
+    from utils.account_lock import acquire_account_lock, release_account_lock
+
+    engine = create_async_engine(DATABASE_URL, pool_size=2, max_overflow=0)
+    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+
+    async with Session() as db:
+        try:
+            t = (await db.execute(select(WarmupTask).where(WarmupTask.id == task_id))).scalar_one_or_none()
+            if not t or t.status != "running":
+                return {"status": "skip"}
+
+            now = datetime.utcnow()
+            hour = (now.hour + 3) % 24
+
+            if t.next_action_at and now < t.next_action_at:
+                return {"status": "skip", "reason": "not time"}
+            if t.today_actions >= (t.today_limit or 999):
+                return {"status": "skip", "reason": "limit"}
+
+            # Redis lock — один аккаунт одновременно
+            if not acquire_account_lock(t.account_id, ttl=600):
+                return {"status": "skip", "reason": "locked"}
+
+            try:
+                # ── Новый день ────────────────────────────
+                if t.day_started_at:
+                    if (now - t.day_started_at).total_seconds() >= 86400:
+                        t.day += 1
+                        t.day_started_at = now
+                        t.today_actions = 0
+                        day_type = pick_day_type()
+                        day_mult = DAY_MULTIPLIER.get(min(t.day, 7), 1.0)
+                        mode_mult = MODE_MULTIPLIER.get(t.mode, 1.0)
+                        t.today_limit = max(3, int(random.randint(25, 50) * day_mult * mode_mult * day_type["session_mult"]))
+                        t.is_resting = day_type["name"] == "rest"
+
+                        if t.day > t.total_days:
+                            t.status = "finished"
+                            t.finished_at = now
+                            db.add(WarmupLog(task_id=t.id, account_id=t.account_id, action="finished",
+                                            detail=f"Прогрев завершён ({t.total_days} дней)", success=True, created_at=now))
+                            await db.commit()
+                            return {"status": "finished"}
+
+                        db.add(WarmupLog(task_id=t.id, account_id=t.account_id, action="new_day",
+                                        detail=f"День {t.day}: {day_type['label']}, лимит {t.today_limit}",
+                                        success=True, created_at=now))
+
+                        if t.is_resting:
+                            db.add(WarmupLog(task_id=t.id, account_id=t.account_id, action="rest_day",
+                                            detail="День отдыха", success=True, created_at=now))
+                            t.next_action_at = now + timedelta(hours=random.randint(20, 28))
+                            await db.commit()
+                            return {"status": "rest_day"}
+                else:
+                    t.day_started_at = now
+                    t.day = 1
+                    day_type = pick_day_type()
+                    while day_type["name"] == "rest":
+                        day_type = pick_day_type()
+                    t.today_limit = max(3, int(random.randint(25, 50) * DAY_MULTIPLIER.get(1, 0.4) * MODE_MULTIPLIER.get(t.mode, 1.0) * day_type["session_mult"]))
+                    t.today_actions = 0
+                    t.is_resting = False
+                    db.add(WarmupLog(task_id=t.id, account_id=t.account_id, action="new_day",
+                                    detail=f"День 1: {day_type['label']}, лимит {t.today_limit}",
+                                    success=True, created_at=now))
+
+                if t.is_resting:
+                    await db.commit()
+                    return {"status": "resting"}
+
+                # ── Сессия ────────────────────────────────
+                session_cfg = get_current_session(hour)
+                if not session_cfg:
+                    t.next_action_at = now + timedelta(minutes=random.randint(20, 40))
+                    await db.commit()
+                    return {"status": "no_session"}
+
+                if random.random() > session_cfg["chance"]:
+                    t.next_action_at = now + timedelta(minutes=random.randint(30, 60))
+                    await db.commit()
+                    return {"status": "skipped_session"}
+
+                existing = (await db.execute(
+                    select(WarmupLog).where(
+                        WarmupLog.task_id == t.id,
+                        WarmupLog.action == "session_start",
+                        WarmupLog.detail.contains(session_cfg["label"]),
+                        WarmupLog.created_at >= t.day_started_at,
+                    ).limit(1)
+                )).scalar_one_or_none()
+                if existing:
+                    t.next_action_at = now + timedelta(minutes=random.randint(20, 40))
+                    await db.commit()
+                    return {"status": "session_done_today"}
+
+                # ── Аккаунт + прокси ─────────────────────
+                acc = (await db.execute(
+                    select(TelegramAccount).options(joinedload(TelegramAccount.api_app))
+                    .where(TelegramAccount.id == t.account_id)
+                )).scalar_one_or_none()
+                if not acc or acc.status not in ("active", "unknown"):
+                    await db.commit()
+                    return {"status": "inactive"}
+
+                proxy = None
+                if acc.proxy_id:
+                    proxy = (await db.execute(select(Proxy).where(Proxy.id == acc.proxy_id))).scalar_one_or_none()
+
+                # ── СЕССИЯ ────────────────────────────────
+                done = await _run_session(t, acc, proxy, session_cfg, db)
+
+                silence = random.randint(60, 180)
+                t.next_action_at = now + timedelta(minutes=silence)
+                await db.commit()
+
+                return {"status": "done", "account": acc.phone, "session": session_cfg["label"],
+                        "actions": done, "next_in_min": silence}
+
+            finally:
+                release_account_lock(t.account_id)
+
+        except Exception as e:
+            logger.error(f"[single_warmup] #{task_id}: {e}")
+            try:
+                await db.rollback()
+            except:
+                pass
+            return {"error": str(e)}
+        finally:
+            await engine.dispose()
+
+
+@celery_app.task(bind=True, name="tasks.warmup_v2.dispatch_warmups")
+def dispatch_warmups(self):
+    """Диспетчер (<1с): находит готовые аккаунты → задачи."""
+    return run_async(_dispatch_warmups())
+
+
+@celery_app.task(bind=True, name="tasks.warmup_v2.run_single_warmup")
+def run_single_warmup(self, task_id: int):
+    """Прогрев одного аккаунта — параллельно с другими."""
+    return run_async(_run_single_warmup(task_id))

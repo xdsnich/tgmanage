@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { accountsAPI, tasksAPI } from '../services/api'
 import { Card, TrustBar, Button, Spinner, StatusBadge, StatCard } from '../components/ui'
 import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer } from 'recharts'
-
+import { useAutoRefresh } from '../hooks/useAutoRefresh'
 const PIE_COLORS = { active: '#3dd68c', spamblock: '#f85149', frozen: '#e3a13f', error: '#f85149', unknown: '#444' }
 
 export default function DashboardPage() {
@@ -18,12 +18,12 @@ export default function DashboardPage() {
     try {
       const [s, a] = await Promise.all([accountsAPI.stats(), accountsAPI.list()])
       setStats(s.data); setAccounts(a.data)
-    } catch {}
+    } catch { }
     setLoading(false)
   }
 
   useEffect(() => { load() }, [])
-
+  useAutoRefresh(() => load(), 15000)
   useEffect(() => {
     if (!taskId) return
     const iv = setInterval(async () => {
@@ -113,8 +113,8 @@ export default function DashboardPage() {
               borderBottom: i < recent.length - 1 ? '1px solid var(--border)' : 'none',
               cursor: 'pointer', transition: 'background 0.12s',
             }}
-            onMouseEnter={e => e.currentTarget.style.background = 'rgba(255,255,255,0.025)'}
-            onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+              onMouseEnter={e => e.currentTarget.style.background = 'rgba(255,255,255,0.025)'}
+              onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
               {/* Avatar */}
               <div style={{
                 width: 38, height: 38, borderRadius: 10, flexShrink: 0,
@@ -174,8 +174,8 @@ export default function DashboardPage() {
               <div style={{ display: 'flex', gap: 16, marginTop: 14 }}>
                 {[
                   { label: 'Макс', val: stats.max_trust || 0, color: 'var(--green)' },
-                  { label: 'Мин',  val: stats.min_trust || 0, color: 'var(--red)' },
-                  { label: '2FA',  val: stats.with_2fa || 0,  color: 'var(--violet)' },
+                  { label: 'Мин', val: stats.min_trust || 0, color: 'var(--red)' },
+                  { label: '2FA', val: stats.with_2fa || 0, color: 'var(--violet)' },
                 ].map(({ label, val, color }) => (
                   <div key={label} style={{ flex: 1, textAlign: 'center' }}>
                     <div style={{ fontSize: 20, fontWeight: 800, color, letterSpacing: '-0.04em' }}>{val}</div>

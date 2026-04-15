@@ -61,8 +61,8 @@ def make_client(phone: str, proxy: dict = None,
         device_model="Desktop",
         system_version="Windows 10",
         app_version="4.14.15",
-        lang_code="ru",
-        system_lang_code="ru"
+        lang_code="en",
+        system_lang_code="en"
     )
 
 
