@@ -138,3 +138,16 @@ async def root():
 # # Терминал 4: Планировщик
 # cd api
 # python run_periodic.py
+
+
+# # Терминал 1: API
+# cd api && python -m uvicorn main:app --reload --port 8000
+
+# # Терминал 2: Celery воркер
+# cd api && python -m celery -A celery_app worker -Q high_priority,bulk_actions,ai_dialogs -P solo --loglevel=info
+
+# # Терминал 3: Планировщик
+# cd api && python run_periodic.py
+
+# # Терминал 4: Фронт
+# cd gramgpt-web && npm run dev

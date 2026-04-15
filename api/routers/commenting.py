@@ -284,6 +284,14 @@ async def start_campaign(
     # Генерируем планы
     plans_created = 0
     total_planned_comments = 0
+    # Удаляем старые планы этой кампании
+    from models.campaign_plan import CampaignPlan
+    await db.execute(
+        select(CampaignPlan).where(CampaignPlan.campaign_id == c.id)
+    )
+    from sqlalchemy import delete as sa_delete
+    await db.execute(sa_delete(CampaignPlan).where(CampaignPlan.campaign_id == c.id))
+    await db.flush()
 
     for day_num in range(1, total_days + 1):
         from datetime import date, timedelta
@@ -310,17 +318,7 @@ async def start_campaign(
                 style=style,
             )
 
-            # Удаляем старый план если есть
-            existing = await db.execute(
-                select(CampaignPlan).where(
-                    CampaignPlan.campaign_id == c.id,
-                    CampaignPlan.account_id == acc_id,
-                    CampaignPlan.plan_date == plan_date,
-                )
-            )
-            old = existing.scalar_one_or_none()
-            if old:
-                await db.delete(old)
+            
 
             db.add(CampaignPlan(
                 campaign_id=c.id,

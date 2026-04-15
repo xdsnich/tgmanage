@@ -139,8 +139,8 @@ def _pick_day_mood():
     Влияет на количество сессий и действий.
     """
     moods = [
-        {"name": "lazy", "session_mult": 0.5, "action_mult": 0.4, "weight": 15},
-        {"name": "tired", "session_mult": 0.7, "action_mult": 0.6, "weight": 15},
+        {"name": "lazy", "session_mult": 0.7, "action_mult": 0.6, "weight": 15},
+        {"name": "tired", "session_mult": 0.8, "action_mult": 0.7, "weight": 15},
         {"name": "normal", "session_mult": 1.0, "action_mult": 1.0, "weight": 35},
         {"name": "active", "session_mult": 1.2, "action_mult": 1.3, "weight": 20},
         {"name": "hyper", "session_mult": 1.5, "action_mult": 1.6, "weight": 10},
@@ -198,36 +198,43 @@ def generate_daily_plan(
     # ── Времена сессий ───────────────────────────────────
     # Не фиксированные окна! Рандомно по всему дню
     session_times = []
+    # Если это первый день (сегодня) — не планируем раньше чем сейчас + 10 мин
+    from datetime import datetime as dt
+    now = dt.utcnow()
+    current_hour = (now.hour + 3) % 24  # UTC+3
+    current_minute = now.minute
+    min_start_hour = current_hour if day_number == 1 else 8
+    min_start_minute = (current_minute + 10) if day_number == 1 else 0
 
     if p_name == "night_owl":
-        # Совы: 70% вечер (17-23), 30% день (10-16)
         for _ in range(num_sessions):
             if random.random() < 0.7:
-                h = random.randint(17, 23)
+                lo, hi = max(min_start_hour, 17), 23
             else:
-                h = random.randint(10, 16)
-            session_times.append((h, random.randint(0, 59)))
+                lo, hi = max(min_start_hour, 10), 16
+            if lo > hi:
+                lo, hi = min_start_hour, 23
+            session_times.append((random.randint(lo, hi), random.randint(0, 59)))
     elif p_name == "lurker":
-        # Молчуны: 1-2 сессии, часто вечером
         for _ in range(num_sessions):
             if random.random() < 0.5:
-                h = random.randint(19, 23)
+                lo, hi = max(min_start_hour, 19), 23
             else:
-                h = random.randint(8, 18)
-            session_times.append((h, random.randint(0, 59)))
+                lo, hi = max(min_start_hour, 8), 18
+            if lo > hi:
+                lo, hi = min_start_hour, 23
+            session_times.append((random.randint(lo, hi), random.randint(0, 59)))
     else:
-        # Остальные: равномерно по дню 8-23 с лёгким смещением к вечеру
         for _ in range(num_sessions):
-            # Вечер чуть вероятнее
-            weights = [1]*4 + [2]*5 + [3]*5  # 8-11: вес 1, 12-16: вес 2, 17-23: вес 3 (но их 5 часов)
-            # Проще: выбираем час с bias к вечеру
             if random.random() < 0.4:
-                h = random.randint(8, 13)
+                lo, hi = max(min_start_hour, 8), 13
             elif random.random() < 0.6:
-                h = random.randint(13, 18)
+                lo, hi = max(min_start_hour, 13), 18
             else:
-                h = random.randint(18, 23)
-            session_times.append((h, random.randint(0, 59)))
+                lo, hi = max(min_start_hour, 18), 23
+            if lo > hi:
+                lo, hi = min_start_hour, 23
+            session_times.append((random.randint(lo, hi), random.randint(0, 59)))
 
     session_times.sort()
 
@@ -241,6 +248,19 @@ def generate_daily_plan(
             new_h = min(23, new_min // 60)
             new_m = new_min % 60
             session_times[i] = (new_h, new_m)
+
+    # Убираем сессии раньше текущего времени (для первого дня)
+    if day_number == 1:
+        session_times = [(h, m) for h, m in session_times
+                         if h > current_hour or (h == current_hour and m >= min_start_minute)]
+        if not session_times:
+            next_h = current_hour
+            next_m = current_minute + 15
+            if next_m >= 60:
+                next_h += 1
+                next_m -= 60
+            if next_h <= 23:
+                session_times = [(next_h, next_m)]
 
     # ── Распределяем комментарии по сессиям ──────────────
     comment_sessions = set()
@@ -275,17 +295,17 @@ def generate_daily_plan(
         else:
             base_actions = random.randint(2, 8)
 
-        # День 1-3: меньше
+        # День 1-3: чуть меньше, но не меньше 3
         if day_number <= 1:
-            base_actions = max(1, base_actions // 3)
+            base_actions = max(3, int(base_actions * 0.5))
         elif day_number <= 3:
-            base_actions = max(2, int(base_actions * 0.6))
+            base_actions = max(3, int(base_actions * 0.7))
 
         # Настроение
         num_actions = max(1, int(base_actions * mood["action_mult"]))
 
         # Ещё ±1-2
-        num_actions = max(1, num_actions + random.choice([-2, -1, 0, 0, 0, 1, 1, 2]))
+        num_actions = max(3, num_actions + random.choice([-1, 0, 0, 0, 0, 1, 1, 2]))
 
         # Доступные действия (зависят от дня)
         if day_number <= 2:

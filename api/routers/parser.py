@@ -78,6 +78,7 @@ async def list_parsed_channels(
         "subscribers": c.subscribers, "has_comments": c.has_comments,
         "last_post_date": c.last_post_date.isoformat() if c.last_post_date else None,
         "search_query": c.search_query, "added_at": c.added_at.isoformat(),
+        "folder": c.folder or "",
     } for c in channels]
 
 

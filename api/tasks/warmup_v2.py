@@ -19,7 +19,6 @@ import os
 import logging
 from datetime import datetime, timedelta
 from celery_app import celery_app
-from models.campaign import Campaign
 logger = logging.getLogger(__name__)
 
 API_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
