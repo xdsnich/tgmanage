@@ -29,6 +29,7 @@ def run_async(coro):
     finally:
         loop.close()
 
+
 async def _safe_log(db, **kwargs):
     """Логирует в warmup_logs без краша. Если ошибка — пропускает."""
     try:
@@ -40,6 +41,7 @@ async def _safe_log(db, **kwargs):
             await db.rollback()
         except:
             pass
+
 
 def _val(x):
     return x.value if hasattr(x, 'value') else x
@@ -244,12 +246,17 @@ async def _execute_plan_session(plan_id: int):
                 # ── Подключаемся ──────────────────────────
                 phone = acc.phone
                 done_actions = 0
+                sess_num = plan.executed_idx + 1
+                total_sess = len(sessions)
+                mood = plan.plan.get('mood', '?')
+
+                logger.info(f"[plan][{phone}] ═══ Сессия {sess_num}/{total_sess} (день {plan.day_number}, {mood}) ═══")
 
                 # Логируем начало
                 await _safe_log(db,
                     task_id=None, account_id=acc.id,
                     action="session_start",
-                    detail=f"План день {plan.day_number}, сессия {plan.executed_idx + 1}/{len(sessions)} ({plan.plan.get('mood', '?')})",
+                    detail=f"План день {plan.day_number}, сессия {sess_num}/{total_sess} ({mood})",
                     success=True, created_at=datetime.utcnow(),
                 )
 
@@ -257,19 +264,22 @@ async def _execute_plan_session(plan_id: int):
                     await client.connect()
                     if not await client.is_user_authorized():
                         plan.executed_idx += 1
-                        await _safe_log(db,task_id=None, account_id=acc.id, action="error",
+                        logger.warning(f"[plan][{phone}] Не авторизован")
+                        await _safe_log(db, task_id=None, account_id=acc.id, action="error",
                                          detail="Не авторизован", success=False)
                         await db.commit()
                         return {"status": "not_authorized"}
 
+                    logger.info(f"[plan][{phone}] Подключен, {len(actions)} действий")
+
                     # ── Выполняем действия ────────────────
-                    for action in actions:
+                    for action_num, action in enumerate(actions, 1):
                         try:
                             action_type = action.get("type", "")
 
                             if action_type == "idle":
-                                # Просто пауза
                                 dur = action.get("duration", 30)
+                                logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] ⏸ Пауза {dur}с")
                                 await asyncio.sleep(dur)
                                 continue
 
@@ -292,19 +302,21 @@ async def _execute_plan_session(plan_id: int):
                                         await asyncio.sleep(random.uniform(0.5, 4))
 
                                     name = channel_name or getattr(entity, 'name', '?') or getattr(entity, 'title', '?')
-                                    await _safe_log(db,task_id=None, account_id=acc.id, action="read_feed",
+                                    logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 📖 Прочитал {len(msgs)} постов в «{name}»")
+                                    await _safe_log(db, task_id=None, account_id=acc.id, action="read_feed",
                                                      detail=f"Прочитал {len(msgs)} в «{name}»",
                                                      channel=str(name), success=True)
                                     done_actions += 1
                                 except Exception as e:
-                                    logger.warning(f"[plan][{phone}] read_feed: {e}")
+                                    logger.warning(f"[plan][{phone}]   [{action_num}/{len(actions)}] 📖 read_feed ошибка: {e}")
 
                             elif action_type == "view_stories":
                                 try:
                                     from telethon.tl.functions.stories import GetAllReadPeerStoriesRequest
                                     await client(GetAllReadPeerStoriesRequest())
                                     count = action.get("count", 3)
-                                    await _safe_log(db,task_id=None, account_id=acc.id, action="view_stories",
+                                    logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 👁 Stories ({count})")
+                                    await _safe_log(db, task_id=None, account_id=acc.id, action="view_stories",
                                                      detail=f"Просмотрел stories ({count})", success=True)
                                     done_actions += 1
                                 except Exception:
@@ -334,12 +346,13 @@ async def _execute_plan_session(plan_id: int):
                                             reaction=[ReactionEmoji(emoticon=emoji)]
                                         ))
                                         name = channel_name or getattr(entity, 'name', '?') or getattr(entity, 'title', '?')
-                                        await _safe_log(db,task_id=None, account_id=acc.id, action="set_reaction",
+                                        logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 😍 Реакция {emoji} в «{name}»")
+                                        await _safe_log(db, task_id=None, account_id=acc.id, action="set_reaction",
                                                          detail=f"Поставил {emoji} в «{name}»",
                                                          channel=str(name), success=True)
                                         done_actions += 1
                                 except Exception as e:
-                                    logger.warning(f"[plan][{phone}] reaction: {e}")
+                                    logger.warning(f"[plan][{phone}]   [{action_num}/{len(actions)}] 😍 reaction ошибка: {e}")
 
                             elif action_type == "view_profile":
                                 try:
@@ -349,7 +362,8 @@ async def _execute_plan_session(plan_id: int):
                                         u = random.choice(users[:5])
                                         from telethon.tl.functions.users import GetFullUserRequest
                                         await client(GetFullUserRequest(u.input_entity))
-                                        await _safe_log(db,task_id=None, account_id=acc.id, action="view_profile",
+                                        logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 👤 Профиль «{u.name or '?'}»")
+                                        await _safe_log(db, task_id=None, account_id=acc.id, action="view_profile",
                                                          detail=f"Просмотрел профиль «{u.name or '?'}»", success=True)
                                         done_actions += 1
                                 except Exception:
@@ -359,9 +373,11 @@ async def _execute_plan_session(plan_id: int):
                                 try:
                                     from telethon.tl.functions.contacts import SearchRequest
                                     terms = ["crypto", "news", "music", "sport", "tech", "games", "memes", "trade"]
-                                    await client(SearchRequest(q=random.choice(terms), limit=5))
-                                    await _safe_log(db,task_id=None, account_id=acc.id, action="search",
-                                                     detail="Поиск", success=True)
+                                    term = random.choice(terms)
+                                    await client(SearchRequest(q=term, limit=5))
+                                    logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 🔍 Поиск «{term}»")
+                                    await _safe_log(db, task_id=None, account_id=acc.id, action="search",
+                                                     detail=f"Поиск «{term}»", success=True)
                                     done_actions += 1
                                 except Exception:
                                     pass
@@ -371,7 +387,8 @@ async def _execute_plan_session(plan_id: int):
                                     text = action.get("text", "📌")
                                     me = await client.get_me()
                                     await client.send_message(me, text)
-                                    await _safe_log(db,task_id=None, account_id=acc.id, action="send_saved",
+                                    logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 💬 Saved: {text}")
+                                    await _safe_log(db, task_id=None, account_id=acc.id, action="send_saved",
                                                      detail=f"Saved: {text}", success=True)
                                     done_actions += 1
                                 except Exception:
@@ -387,7 +404,8 @@ async def _execute_plan_session(plan_id: int):
                                         if msgs:
                                             me = await client.get_me()
                                             await client.forward_messages(me, msgs[0])
-                                            await _safe_log(db,task_id=None, account_id=acc.id, action="forward_saved",
+                                            logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 💾 Переслал из «{ch.name or '?'}»")
+                                            await _safe_log(db, task_id=None, account_id=acc.id, action="forward_saved",
                                                              detail=f"Переслал из «{ch.name or '?'}»", success=True)
                                             done_actions += 1
                                 except Exception:
@@ -402,7 +420,8 @@ async def _execute_plan_session(plan_id: int):
                                         msgs = await client.get_messages(u, limit=5)
                                         for m in msgs:
                                             await client.send_read_acknowledge(u, m)
-                                        await _safe_log(db,task_id=None, account_id=acc.id, action="reply_dm",
+                                        logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] ↩️ Прочитал ЛС от «{u.name or '?'}»")
+                                        await _safe_log(db, task_id=None, account_id=acc.id, action="reply_dm",
                                                          detail=f"Прочитал ЛС от «{u.name or '?'}»", success=True)
                                         done_actions += 1
                                 except Exception:
@@ -430,6 +449,7 @@ async def _execute_plan_session(plan_id: int):
 
                                     # Typing
                                     typing_dur = action.get("pause_before", random.randint(2, 20))
+                                    logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] ⌨️ Typing {typing_dur}с в @{target_channel}")
                                     try:
                                         from telethon.tl.functions.messages import SetTypingRequest, GetDiscussionMessageRequest
                                         from telethon.tl.types import SendMessageTypingAction
@@ -442,7 +462,8 @@ async def _execute_plan_session(plan_id: int):
 
                                     # Abort? (5-15%)
                                     if random.random() < random.uniform(0.05, 0.15):
-                                        await _safe_log(db,task_id=None, account_id=acc.id, action="smart_comment",
+                                        logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 🚫 Передумал комментировать @{target_channel}")
+                                        await _safe_log(db, task_id=None, account_id=acc.id, action="smart_comment",
                                                          detail=f"Передумал комментировать @{target_channel}",
                                                          channel=target_channel, success=True)
                                         done_actions += 1
@@ -457,12 +478,14 @@ async def _execute_plan_session(plan_id: int):
 
                                     comment_text = generate_comment(provider, prompt, post_text)
                                     if not comment_text:
+                                        logger.warning(f"[plan][{phone}]   [{action_num}/{len(actions)}] ❌ LLM вернул пустой ответ")
                                         continue
 
                                     # Отправляем
                                     await client.send_message(entity=entity, message=comment_text, comment_to=target_post.id)
 
-                                    await _safe_log(db,task_id=None, account_id=acc.id, action="smart_comment",
+                                    logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 💬 @{target_channel}: {comment_text[:60]}")
+                                    await _safe_log(db, task_id=None, account_id=acc.id, action="smart_comment",
                                                      detail=f"💬 @{target_channel}: {comment_text[:60]}",
                                                      channel=target_channel, success=True)
 
@@ -479,21 +502,22 @@ async def _execute_plan_session(plan_id: int):
                                         ))
 
                                     done_actions += 1
-                                    logger.info(f"[plan][{phone}] 💬 @{target_channel}: {comment_text[:50]}")
 
                                 except Exception as e:
                                     err = str(e)
-                                    logger.warning(f"[plan][{phone}] comment error: {err[:100]}")
-                                    await _safe_log(db,task_id=None, account_id=acc.id, action="smart_comment",
+                                    logger.warning(f"[plan][{phone}]   [{action_num}/{len(actions)}] ❌ comment error: {err[:100]}")
+                                    await _safe_log(db, task_id=None, account_id=acc.id, action="smart_comment",
                                                      detail=f"Ошибка: {err[:100]}", channel=target_channel,
                                                      success=False, error=err[:200])
 
                                     import re as _re
                                     if "FLOOD_WAIT" in err:
                                         wait = int(_re.search(r"(\d+)", err).group(1)) if _re.search(r"(\d+)", err) else 60
+                                        logger.warning(f"[plan][{phone}] FLOOD_WAIT {wait}с — пауза")
                                         await asyncio.sleep(wait + random.randint(5, 15))
                                         break
                                     elif "PEER_FLOOD" in err or "AUTH_KEY_UNREGISTERED" in err:
+                                        logger.error(f"[plan][{phone}] {err[:30]} — аккаунт frozen")
                                         acc.status = "frozen"
                                         break
 
@@ -505,7 +529,8 @@ async def _execute_plan_session(plan_id: int):
                                                "sciencedaily", "nationalgeographic", "historyfacts"]
                                     ch = random.choice(popular)
                                     await client(JoinChannelRequest(ch))
-                                    await _safe_log(db,task_id=None, account_id=acc.id, action="join_channel",
+                                    logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 📢 Подписался на @{ch}")
+                                    await _safe_log(db, task_id=None, account_id=acc.id, action="join_channel",
                                                      detail=f"Подписался на @{ch}", channel=ch, success=True)
                                     done_actions += 1
                                 except Exception:
@@ -518,6 +543,7 @@ async def _execute_plan_session(plan_id: int):
                                     from telethon.tl.types import SendMessageTypingAction
                                     await client(SetTypingRequest(peer=me, action=SendMessageTypingAction()))
                                     dur = action.get("duration", random.randint(2, 10))
+                                    logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] ⌨️ Typing {dur}с")
                                     await asyncio.sleep(dur)
                                     done_actions += 1
                                 except Exception:
@@ -532,7 +558,7 @@ async def _execute_plan_session(plan_id: int):
 
                         except Exception as e:
                             err = str(e)
-                            logger.warning(f"[plan][{phone}] action {action.get('type')}: {err[:80]}")
+                            logger.warning(f"[plan][{phone}]   [{action_num}/{len(actions)}] ❌ {action.get('type')}: {err[:80]}")
 
                             if "FLOOD_WAIT" in err:
                                 import re as _re
@@ -547,7 +573,7 @@ async def _execute_plan_session(plan_id: int):
 
                 except Exception as e:
                     logger.error(f"[plan][{phone}] Session error: {e}")
-                    await _safe_log(db,task_id=None, account_id=acc.id, action="error",
+                    await _safe_log(db, task_id=None, account_id=acc.id, action="error",
                                      detail=f"Ошибка сессии: {str(e)[:200]}", success=False)
                 finally:
                     try:
@@ -556,6 +582,7 @@ async def _execute_plan_session(plan_id: int):
                         pass
 
                 # Логируем конец
+                logger.info(f"[plan][{phone}] ═══ Сессия {sess_num}/{total_sess} завершена: {done_actions}/{len(actions)} действий ═══")
                 await _safe_log(db,
                     task_id=None, account_id=acc.id,
                     action="session_end",

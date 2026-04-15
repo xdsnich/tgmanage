@@ -450,6 +450,13 @@ def generate_daily_plan(
             "skipped": False,
         })
 
+    # Считаем реально размещённые комменты (не запрошенные)
+    actual_comments = sum(
+        1 for s in sessions
+        for a in s.get("actions", [])
+        if a.get("type") == "smart_comment"
+    )
+
     return {
         "account_id": account_id,
         "campaign_id": campaign_id,
@@ -458,7 +465,7 @@ def generate_daily_plan(
         "style": style.get("name", "unknown"),
         "mood": mood["name"],
         "day_number": day_number,
-        "total_comments": comments_today,
+        "total_comments": actual_comments,
         "total_sessions": len(sessions),
         "sessions": sessions,
     }

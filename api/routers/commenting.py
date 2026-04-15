@@ -588,15 +588,40 @@ async def get_campaign_activity(
     )
     comments = cq_result.scalars().all()
 
-    # ── 2. Логи прогрева привязанные к кампании ──────────
-    warmup_result = await db.execute(
-        select(WarmupLog)
-        .join(WarmupTask, WarmupLog.task_id == WarmupTask.id)
-        .where(WarmupTask.campaign_id == c.id)
-        .order_by(WarmupLog.created_at.desc())
-        .limit(limit)
+    # ── 2. Warmup логи (включая plan_executor) ───────────
+    # Логи от plan_executor имеют task_id=NULL, ищем по account_id
+    account_ids = c.account_ids or []
+    
+    warmup_logs = []
+    if account_ids:
+        # Логи с task_id=NULL (от plan_executor) для аккаунтов кампании
+        plan_logs_result = await db.execute(
+            select(WarmupLog)
+            .where(
+                WarmupLog.account_id.in_(account_ids),
+                WarmupLog.task_id == None,
+            )
+            .order_by(WarmupLog.created_at.desc())
+            .limit(limit)
+        )
+        warmup_logs.extend(plan_logs_result.scalars().all())
+    
+    # Логи от warmup_v2 (с task_id через warmup_tasks)
+    wt_result = await db.execute(
+        select(WarmupTask.id).where(
+            WarmupTask.account_id.in_(account_ids) if account_ids else WarmupTask.campaign_id == c.id,
+        )
     )
-    warmup_logs = warmup_result.scalars().all()
+    wt_ids = [r[0] for r in wt_result.all()]
+    
+    if wt_ids:
+        wl_result = await db.execute(
+            select(WarmupLog)
+            .where(WarmupLog.task_id.in_(wt_ids))
+            .order_by(WarmupLog.created_at.desc())
+            .limit(limit)
+        )
+        warmup_logs.extend(wl_result.scalars().all())
 
     # ── 3. Подгружаем телефоны аккаунтов ─────────────────
     all_acc_ids = list(set(
