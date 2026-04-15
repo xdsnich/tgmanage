@@ -62,14 +62,7 @@ try:
         ts = time.strftime('%H:%M:%S')
 
         # Парсинг каналов → очередь комментариев
-        if now - last_commenting >= COMMENTING_INTERVAL:
-            if done(commenting_tid):
-                try:
-                    r = celery_app.send_task("tasks.commenting_tasks.process_campaigns", queue="ai_dialogs")
-                    commenting_tid = r.id; print(f"[{ts}] → Комментинг (парсинг)")
-                except Exception as e: print(f"[{ts}] ✗ Комментинг: {e}")
-            else: print(f"[{ts}] ⏳ Комментинг работает...")
-            last_commenting = now
+    
 
         # Диспетчер прогрева → параллельные задачи по аккаунтам
         if now - last_warmup >= WARMUP_DISPATCH_INTERVAL:
@@ -80,15 +73,7 @@ try:
                 except Exception as e: print(f"[{ts}] ✗ Warmup: {e}")
             last_warmup = now
 
-        # Диспетчер комментариев → параллельные задачи
-        if now - last_comments >= COMMENT_DISPATCH_INTERVAL:
-            if done(comments_tid):
-                try:
-                    r = celery_app.send_task("tasks.comment_executor.dispatch_comments", queue="ai_dialogs")
-                    comments_tid = r.id; print(f"[{ts}] → Comment dispatch")
-                except Exception as e: print(f"[{ts}] ✗ Comments: {e}")
-            last_comments = now
-
+       
         # Диспетчер планов кампаний → параллельные сессии
         if now - last_plans >= PLAN_DISPATCH_INTERVAL:
             if done(plans_tid):
