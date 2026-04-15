@@ -36,6 +36,9 @@ AI_INTERVAL = 60
 COMMENTING_INTERVAL = 90
 WARMUP_DISPATCH_INTERVAL = 60
 COMMENT_DISPATCH_INTERVAL = 60
+PLAN_DISPATCH_INTERVAL = 60
+last_plans = 0
+plans_tid = None
 
 print("=" * 50)
 print("  GramGPT Scheduler (Parallel)")
@@ -85,6 +88,15 @@ try:
                     comments_tid = r.id; print(f"[{ts}] → Comment dispatch")
                 except Exception as e: print(f"[{ts}] ✗ Comments: {e}")
             last_comments = now
+
+        # Диспетчер планов кампаний → параллельные сессии
+        if now - last_plans >= PLAN_DISPATCH_INTERVAL:
+            if done(plans_tid):
+                try:
+                    r = celery_app.send_task("tasks.plan_executor.dispatch_plans", queue="ai_dialogs")
+                    plans_tid = r.id; print(f"[{ts}] → Plan dispatch")
+                except Exception as e: print(f"[{ts}] ✗ Plans: {e}")
+            last_plans = now
 
         # AI-диалоги
         if now - last_ai >= AI_INTERVAL:

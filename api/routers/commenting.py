@@ -238,69 +238,111 @@ async def start_campaign(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Запустить кампанию + автоматически включить прогрев для аккаунтов"""
+    """Запустить кампанию + сгенерировать планы для всех аккаунтов"""
     c = await _get_campaign(db, campaign_id, current_user.id)
 
-    # Проверяем есть ли каналы
     ch_result = await db.execute(
         select(TargetChannel).where(TargetChannel.campaign_id == c.id, TargetChannel.is_active == True)
     )
     channels = ch_result.scalars().all()
     if not channels:
         raise HTTPException(status_code=400, detail="Добавьте целевые каналы перед запуском")
-
     if not c.account_ids:
         raise HTTPException(status_code=400, detail="Выберите аккаунты для комментинга")
 
-    # ── Автоматический прогрев ───────────────────────────
-    from models.warmup import WarmupTask
+    channel_usernames = [ch.username for ch in channels if ch.username]
 
-    warmup_created = 0
-    warmup_existing = 0
+    # ── Генерация планов ─────────────────────────────────
+    from models.campaign_plan import CampaignPlan
+    from models.account import TelegramAccount
+    from tasks.plan_generator import (
+        distribute_comments_by_days,
+        distribute_day_comments,
+        generate_daily_plan,
+    )
+    from tasks.behavior_engine import assign_personality, assign_timing_profile, assign_style_profile
 
+    total_days = max(1, c.max_hours // 24) if c.max_hours else 7
+
+    # Загружаем аккаунты и их personality
+    accounts_data = []
     for acc_id in c.account_ids:
-        # Проверяем есть ли уже активный прогрев
-        existing = await db.execute(
-            select(WarmupTask).where(
-                WarmupTask.account_id == acc_id,
-                WarmupTask.status.in_(["active", "paused"]),
-            )
+        acc_r = await db.execute(
+            select(TelegramAccount).where(TelegramAccount.id == acc_id)
         )
-        if existing.scalar_one_or_none():
-            warmup_existing += 1
-            continue
+        acc = acc_r.scalar_one_or_none()
+        if acc and acc.phone:
+            p = assign_personality(acc.phone)
+            accounts_data.append((acc.id, acc.phone, p))
 
-        # Создаём прогрев
-        import random
-        warmup = WarmupTask(
-            user_id=current_user.id,
-            account_id=acc_id,
-            mode="normal",
-            status="running",
-            total_days=30,  # Прогрев на весь период кампании
-            day=1,
-            today_actions=0,
-            today_limit=random.randint(15, 25),
-            start_offset_min=random.randint(0, 90),
-            campaign_id=c.id,
-            day_started_at=datetime.utcnow(),
-            next_action_at=datetime.utcnow(),
-        )
-        db.add(warmup)
-        warmup_created += 1
+    if not accounts_data:
+        raise HTTPException(status_code=400, detail="Нет активных аккаунтов")
+
+    # Распределяем комменты по дням
+    daily_comments = distribute_comments_by_days(c.max_comments, total_days)
+
+    # Генерируем планы
+    plans_created = 0
+    total_planned_comments = 0
+
+    for day_num in range(1, total_days + 1):
+        from datetime import date, timedelta
+        plan_date = date.today() + timedelta(days=day_num - 1)
+
+        # Распределяем комменты дня по аккаунтам
+        accs_with_p = [(a_id, p) for a_id, _, p in accounts_data]
+        day_distribution = distribute_day_comments(daily_comments[day_num - 1], accs_with_p)
+
+        for acc_id, phone, personality in accounts_data:
+            comments_for_acc = day_distribution.get(acc_id, 0)
+            timing = assign_timing_profile(phone)
+            style = assign_style_profile(phone)
+
+            plan = generate_daily_plan(
+                account_id=acc_id,
+                phone=phone,
+                campaign_channels=channel_usernames,
+                campaign_id=c.id,
+                day_number=day_num,
+                comments_today=comments_for_acc,
+                personality=personality,
+                timing=timing,
+                style=style,
+            )
+
+            # Удаляем старый план если есть
+            existing = await db.execute(
+                select(CampaignPlan).where(
+                    CampaignPlan.campaign_id == c.id,
+                    CampaignPlan.account_id == acc_id,
+                    CampaignPlan.plan_date == plan_date,
+                )
+            )
+            old = existing.scalar_one_or_none()
+            if old:
+                await db.delete(old)
+
+            db.add(CampaignPlan(
+                campaign_id=c.id,
+                account_id=acc_id,
+                plan_date=plan_date,
+                day_number=day_num,
+                plan=plan,
+                total_comments=comments_for_acc,
+            ))
+            plans_created += 1
+            total_planned_comments += comments_for_acc
 
     c.status = CampaignStatus.active
     c.started_at = datetime.utcnow()
     c.finished_at = None
     await db.flush()
 
-    msg = "Кампания запущена"
-    if warmup_created > 0:
-        msg += f", прогрев включён для {warmup_created} аккаунтов"
-    if warmup_existing > 0:
-        msg += f" ({warmup_existing} уже прогреваются)"
-
-    return {"success": True, "status": "active", "message": msg}
+    return {
+        "success": True,
+        "status": "active",
+        "message": f"Кампания запущена: {total_days} дней, {plans_created} планов, {total_planned_comments} комментов распределено",
+    }
 
 @router.post("/campaigns/{campaign_id}/pause")
 async def pause_campaign(
@@ -433,6 +475,58 @@ async def campaign_stats(
         ],
     }
 
+
+@router.get("/campaigns/{campaign_id}/plans")
+async def get_campaign_plans(
+    campaign_id: int,
+    day: int = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Планы кампании — расписание каждого аккаунта"""
+    c = await _get_campaign(db, campaign_id, current_user.id)
+
+    from models.campaign_plan import CampaignPlan
+    from models.account import TelegramAccount
+
+    query = select(CampaignPlan).where(CampaignPlan.campaign_id == c.id)
+    if day:
+        query = query.where(CampaignPlan.day_number == day)
+    else:
+        from datetime import date
+        query = query.where(CampaignPlan.plan_date == date.today())
+
+    result = await db.execute(query.order_by(CampaignPlan.account_id))
+    plans = result.scalars().all()
+
+    acc_ids = list(set(p.account_id for p in plans))
+    acc_map = {}
+    if acc_ids:
+        accs = await db.execute(select(TelegramAccount).where(TelegramAccount.id.in_(acc_ids)))
+        for a in accs.scalars().all():
+            acc_map[a.id] = {"phone": a.phone, "name": a.first_name or a.phone}
+
+    out = []
+    for p in plans:
+        acc = acc_map.get(p.account_id, {"phone": "?", "name": "?"})
+        sessions = p.plan.get("sessions", [])
+        out.append({
+            "id": p.id,
+            "account_id": p.account_id,
+            "account_phone": acc["phone"],
+            "account_name": acc["name"],
+            "day_number": p.day_number,
+            "plan_date": p.plan_date.isoformat(),
+            "personality": p.plan.get("personality", "?"),
+            "mood": p.plan.get("mood", "?"),
+            "total_comments": p.total_comments,
+            "total_sessions": len(sessions),
+            "executed_idx": p.executed_idx,
+            "status": p.status,
+            "sessions": sessions,
+        })
+
+    return out
 
 # ── Лог комментариев ────────────────────────────────────────
 

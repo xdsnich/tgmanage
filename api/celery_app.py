@@ -24,6 +24,7 @@ celery_app = Celery(
         "tasks.warmup_tasks",
         "tasks.warmup_v2",
         "tasks.subscribe_tasks",
+        "tasks.plan_executor", 
     ]
 )
 
