@@ -79,10 +79,14 @@ async def _dispatch_plans():
             current_minute = now.minute
 
             # Только сегодняшние активные планы
+            from models.campaign import Campaign, CampaignStatus
             result = await db.execute(
-                select(CampaignPlan).where(
+                select(CampaignPlan)
+                .join(Campaign, Campaign.id == CampaignPlan.campaign_id)
+                .where(
                     CampaignPlan.plan_date == today,
                     CampaignPlan.status == "active",
+                    Campaign.status == CampaignStatus.active,
                 )
             )
             plans = result.scalars().all()
@@ -211,8 +215,9 @@ async def _execute_plan_session(plan_id: int):
                 return {"status": "empty_session"}
 
             # ── Lock аккаунта ─────────────────────────────
-            if not acquire_account_lock(plan.account_id, ttl=600):
-                return {"status": "locked"}
+            from utils.connection_limiter import check_connection_limit, increment_connection
+            if not check_connection_limit(plan.account_id):
+                return {"status": "daily_limit"}
 
             try:
                 # ── Аккаунт + прокси ─────────────────────
@@ -262,6 +267,7 @@ async def _execute_plan_session(plan_id: int):
 
                 try:
                     await client.connect()
+                    increment_connection(plan.account_id)
                     if not await client.is_user_authorized():
                         plan.executed_idx += 1
                         logger.warning(f"[plan][{phone}] Не авторизован")

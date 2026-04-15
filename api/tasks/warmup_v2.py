@@ -577,9 +577,7 @@ async def _run_session(task_row, account, proxy, session_cfg, db):
     phone = account.phone
 
     # Acquire Redis lock — skip if another session is using this account
-    if not acquire_account_lock(account.id, ttl=300):
-        logger.info(f"[warmup][{phone}] Аккаунт занят (lock) — пропуск сессии")
-        return 0
+    
     day = getattr(task_row, 'day', 1) or 1
     mode = task_row.mode or "normal"
 
@@ -608,6 +606,8 @@ async def _run_session(task_row, account, proxy, session_cfg, db):
 
     try:
         await client.connect()
+        from utils.connection_limiter import increment_connection
+        increment_connection(account.id)
         if not await client.is_user_authorized():
             log = WarmupLog(task_id=task_row.id, account_id=account.id,
                             action="error", detail="Не авторизован", success=False)
@@ -818,6 +818,8 @@ async def _run_session(task_row, account, proxy, session_cfg, db):
 # ═══════════════════════════════════════════════════════════
 
 async def _process_all_warmups_v2():
+    logger.warning("[DEPRECATED] _process_all_warmups_v2 — используйте dispatch_warmups")
+    return {"processed": 0, "deprecated": True}
     """
     Вызывается каждые 60 секунд.
     Для каждого аккаунта проверяет:
@@ -1108,8 +1110,9 @@ async def _run_single_warmup(task_id: int):
                 return {"status": "skip", "reason": "limit"}
 
             # Redis lock — один аккаунт одновременно
-            if not acquire_account_lock(t.account_id, ttl=600):
-                return {"status": "skip", "reason": "locked"}
+            from utils.connection_limiter import check_connection_limit, increment_connection
+            if not check_connection_limit(t.account_id):
+                return {"status": "skip", "reason": "daily_limit"}
 
             try:
                 # ── Новый день ────────────────────────────

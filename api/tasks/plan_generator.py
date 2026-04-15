@@ -450,6 +450,19 @@ def generate_daily_plan(
             "skipped": False,
         })
 
+        join_found = 0
+        for s in sessions:
+            if s.get("skipped"):
+                continue
+            filtered_actions = []
+            for a in s.get("actions", []):
+                if a.get("type") == "join_channel":
+                    join_found += 1
+                    if join_found > 7:
+                        continue  # Пропускаем лишние
+                filtered_actions.append(a)
+            s["actions"] = filtered_actions
+
     # Считаем реально размещённые комменты (не запрошенные)
     actual_comments = sum(
         1 for s in sessions

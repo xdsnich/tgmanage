@@ -395,8 +395,15 @@ async def _process_all_dialogs():
 
                 # ONE connection per account, process all dialogs
                 from utils.telegram import make_telethon_client
+                from utils.account_lock import acquire_account_lock, release_account_lock
+
+                if not acquire_account_lock(account.id, ttl=300):
+                    logger.info(f"[ai] Аккаунт {account.phone} занят — пропуск")
+                    continue
+
                 client = make_telethon_client(account, proxy)
                 if not client:
+                    release_account_lock(account.id)
                     continue
 
                 try:
@@ -414,6 +421,7 @@ async def _process_all_dialogs():
                         await client.disconnect()
                     except:
                         pass
+                    release_account_lock(account.id)
 
             await db.commit()
             return {"processed": processed, "total": len(active_dialogs)}

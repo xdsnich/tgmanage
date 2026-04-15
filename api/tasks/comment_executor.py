@@ -328,6 +328,8 @@ async def _execute_queue_item(item, db):
 
 
 async def _process_comment_queue():
+    logger.warning("[DEPRECATED] _process_comment_queue — используйте dispatch_comments")
+    return {"processed": 0, "deprecated": True}
     """Обрабатывает очередь комментариев — запускается каждые 60с."""
     if API_DIR not in sys.path: sys.path.insert(0, API_DIR)
 

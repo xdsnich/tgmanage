@@ -214,6 +214,8 @@ async def _process_campaign(c, db):
 
 
 async def _process_all_campaigns():
+    logger.warning("[DEPRECATED] _process_all_campaigns — используйте plan_executor")
+    return {"processed": 0, "deprecated": True}
     if API_DIR not in sys.path: sys.path.insert(0, API_DIR)
     from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select
