@@ -158,21 +158,43 @@ async def _dispatch_plans():
 
             for camp in active_campaigns:
                 logger.info(f"[autoclose]   camp {camp.id}: started_at={camp.started_at}, max_hours={camp.max_hours}, comments={camp.comments_sent}/{camp.max_comments}")
-                if camp.started_at and camp.max_hours:
-                    from datetime import datetime as _dt
-                    elapsed = (_dt.utcnow() - camp.started_at).total_seconds() / 3600
-                    if elapsed >= camp.max_hours:
-                        camp.status = CampaignStatus.finished
-                        logger.info(f"[autoclose] Кампания {camp.id} → finished (время истекло: {elapsed:.1f}ч / {camp.max_hours}ч)")
+
+                # 1. Время истекло?
+                # 1. Время истекло?
+                if camp.started_at and camp.max_hours and camp.max_hours > 0:
+                    # Нормализуем — убираем tzinfo если есть
+                    started = camp.started_at
+                    if hasattr(started, 'tzinfo') and started.tzinfo is not None:
+                        started = started.replace(tzinfo=None)
+                    now_utc = datetime.utcnow()
+                    delta = now_utc - started
+                    elapsed_sec = delta.total_seconds()
+                    logger.info(f"[autoclose]   DEBUG: now={now_utc}, started={started}, delta={delta}, elapsed_sec={elapsed_sec}")
+
+                    # Защита от отрицательных значений (если started_at в будущем)
+                    if elapsed_sec < 0:
+                        logger.warning(f"[autoclose]   camp {camp.id}: started_at В БУДУЩЕМ! ({started} > {now_utc}) — пропуск")
                         continue
 
-                # Проверяем достигнут ли лимит комментов
-                if camp.comments_sent >= camp.max_comments:
+                    elapsed_hours = elapsed_sec / 3600
+                    logger.info(f"[autoclose]   camp {camp.id}: прошло {elapsed_hours:.2f}ч / {camp.max_hours}ч")
+
+                    if elapsed_hours >= camp.max_hours:
+                        camp.status = CampaignStatus.finished
+                        if not getattr(camp, 'finished_at', None):
+                            camp.finished_at = datetime.utcnow()
+                        logger.info(f"[autoclose] Кампания {camp.id} → finished (время истекло: {elapsed_hours:.1f}ч / {camp.max_hours}ч)")
+                        continue
+
+                # 2. Лимит комментов достигнут?
+                if camp.max_comments and camp.comments_sent >= camp.max_comments:
                     camp.status = CampaignStatus.finished
-                    logger.info(f"[autoclose] Кампания {camp.id} → finished (лимит комментов)")
+                    if not getattr(camp, 'finished_at', None):
+                        camp.finished_at = datetime.utcnow()
+                    logger.info(f"[autoclose] Кампания {camp.id} → finished (лимит комментов {camp.comments_sent}/{camp.max_comments})")
                     continue
 
-                # Проверяем все ли планы выполнены
+                # 3. Все планы выполнены?
                 remaining = (await db.execute(
                     select(func.count(CampaignPlan.id)).where(
                         CampaignPlan.campaign_id == camp.id,
@@ -181,7 +203,6 @@ async def _dispatch_plans():
                 )).scalar() or 0
 
                 if remaining == 0:
-                    # Все планы done — проверяем не остались ли дни
                     future = (await db.execute(
                         select(func.count(CampaignPlan.id)).where(
                             CampaignPlan.campaign_id == camp.id,
@@ -191,7 +212,10 @@ async def _dispatch_plans():
 
                     if future == 0:
                         camp.status = CampaignStatus.finished
+                        if not getattr(camp, 'finished_at', None):
+                            camp.finished_at = datetime.utcnow()
                         logger.info(f"[autoclose] Кампания {camp.id} → finished (все планы выполнены)")
+
             await db.commit()
             logger.info(f"[plan_dispatch] Отправлено {dispatched}, пропущено {skipped}")
 
@@ -199,6 +223,7 @@ async def _dispatch_plans():
         logger.error(f"[plan_dispatch] Ошибка: {e}")
     finally:
         await engine.dispose()
+
 
     return {"dispatched": dispatched, "skipped": skipped}
 

@@ -84,9 +84,9 @@ def _task_to_dict(t: WarmupTask, logs_count: int = 0) -> dict:
         "start_offset_min": getattr(t, 'start_offset_min', 0) or 0,
         "mode_config": MODE_CONFIG.get(t.mode, MODE_CONFIG["normal"]),
         "logs_count": logs_count,
-        "started_at": t.started_at.isoformat() if t.started_at else None,
-        "finished_at": t.finished_at.isoformat() if getattr(t, 'finished_at', None) else None,
-        "created_at": t.created_at.isoformat(),
+        "started_at": (t.started_at.isoformat() + "Z") if t.started_at else None,
+        "finished_at": (t.finished_at.isoformat() + "Z") if getattr(t, 'finished_at', None) else None,
+        "created_at": t.created_at.isoformat() + "Z",
         "batch_id": getattr(t, 'batch_id', None) or f"single_{t.id}",
         "batch_name": getattr(t, 'batch_name', None),
     }
@@ -219,6 +219,12 @@ async def start_warmup(
     t.day = 1
     t.day_started_at = now
     t.today_actions = 0
+    # Сброс общих счётчиков чтобы не мешались со старыми
+    t.actions_done = 0
+    t.feeds_read = 0
+    t.stories_viewed = 0
+    t.reactions_set = 0
+    t.channels_joined = 0
 
     # Случайный лимит для первого дня
     day_mult = {"careful": 0.6, "normal": 1.0, "aggressive": 1.4}.get(t.mode, 1.0)
@@ -288,11 +294,18 @@ async def start_all_warmups(
     started = 0
 
     for t in tasks:
+        now = datetime.utcnow()
         t.status = "running"
         t.started_at = now
         t.day = 1
         t.day_started_at = now
         t.today_actions = 0
+        # Сброс общих счётчиков чтобы не мешались со старыми
+        t.actions_done = 0
+        t.feeds_read = 0
+        t.stories_viewed = 0
+        t.reactions_set = 0
+        t.channels_joined = 0
 
         min_a, max_a = get_day_limit(1)
         mult = MODE_CONFIG.get(t.mode, {}).get("day_mult", 1.0)

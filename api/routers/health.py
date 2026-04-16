@@ -25,11 +25,12 @@ async def health_check():
         pass
 
     # Celery workers
+    # Celery workers
     try:
         from celery_app import celery_app
-        inspect = celery_app.control.inspect(timeout=3)
-        active = inspect.active() or {}
+        inspect = celery_app.control.inspect(timeout=0.8)
         stats = inspect.stats() or {}
+        active = inspect.active() or {}
 
         for worker_name, worker_stats in stats.items():
             status["workers"].append({
@@ -40,8 +41,9 @@ async def health_check():
             })
 
         status["celery_workers"] = len(stats)
-    except:
-        pass
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Celery health check failed: {e}")
 
     # DB
     try:

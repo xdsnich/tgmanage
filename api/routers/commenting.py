@@ -114,9 +114,9 @@ def _campaign_to_dict(c: Campaign, channels: list = None) -> dict:
         "delay_join": c.delay_join,
         "delay_comment": c.delay_comment,
         "delay_between": c.delay_between,
-        "started_at": c.started_at.isoformat() if c.started_at else None,
-        "finished_at": c.finished_at.isoformat() if c.finished_at else None,
-        "created_at": c.created_at.isoformat(),
+        "started_at": (c.started_at.isoformat() + "Z") if c.started_at else None,
+        "finished_at": (c.finished_at.isoformat() + "Z") if c.finished_at else None,
+        "created_at": c.created_at.isoformat() + "Z",
         "channels": [
             {
                 "id": ch.id, "username": ch.username, "title": ch.title,
@@ -262,7 +262,15 @@ async def start_campaign(
     )
     from tasks.behavior_engine import assign_personality, assign_timing_profile, assign_style_profile
 
-    total_days = max(1, c.max_hours // 24) if c.max_hours else 7
+    import math
+    if c.max_hours and c.max_hours < 24:
+        total_days = 1
+    elif c.max_hours:
+        total_days = max(1, math.ceil(c.max_hours / 24))
+    else:
+        total_days = 7
+
+    print(f"[start_campaign] max_hours={c.max_hours}, total_days={total_days}")
 
     # Загружаем аккаунты и их personality
     accounts_data = []
@@ -490,11 +498,9 @@ async def get_campaign_plans(
     query = select(CampaignPlan).where(CampaignPlan.campaign_id == c.id)
     if day:
         query = query.where(CampaignPlan.day_number == day)
-    else:
-        from datetime import date
-        query = query.where(CampaignPlan.plan_date == date.today())
+    # Иначе — все дни кампании
 
-    result = await db.execute(query.order_by(CampaignPlan.account_id))
+    result = await db.execute(query.order_by(CampaignPlan.plan_date, CampaignPlan.account_id))
     plans = result.scalars().all()
 
     acc_ids = list(set(p.account_id for p in plans))
@@ -600,6 +606,7 @@ async def get_campaign_activity(
             .where(
                 WarmupLog.account_id.in_(account_ids),
                 WarmupLog.task_id == None,
+                WarmupLog.created_at >= (c.started_at or c.created_at),
             )
             .order_by(WarmupLog.created_at.desc())
             .limit(limit)
