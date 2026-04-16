@@ -138,7 +138,39 @@ async def _dispatch_plans():
                     queue="ai_dialogs",
                 )
                 dispatched += 1
+            from models.campaign import Campaign, CampaignStatus
+            from sqlalchemy import func
+            active_campaigns = (await db.execute(
+                select(Campaign).where(Campaign.status == CampaignStatus.active)
+            )).scalars().all()
 
+            for camp in active_campaigns:
+                # Проверяем достигнут ли лимит комментов
+                if camp.comments_sent >= camp.max_comments:
+                    camp.status = CampaignStatus.finished
+                    logger.info(f"[autoclose] Кампания {camp.id} → finished (лимит комментов)")
+                    continue
+
+                # Проверяем все ли планы выполнены
+                remaining = (await db.execute(
+                    select(func.count(CampaignPlan.id)).where(
+                        CampaignPlan.campaign_id == camp.id,
+                        CampaignPlan.status == "active",
+                    )
+                )).scalar() or 0
+
+                if remaining == 0:
+                    # Все планы done — проверяем не остались ли дни
+                    future = (await db.execute(
+                        select(func.count(CampaignPlan.id)).where(
+                            CampaignPlan.campaign_id == camp.id,
+                            CampaignPlan.plan_date > today,
+                        )
+                    )).scalar() or 0
+
+                    if future == 0:
+                        camp.status = CampaignStatus.finished
+                        logger.info(f"[autoclose] Кампания {camp.id} → finished (все планы выполнены)")
             await db.commit()
             logger.info(f"[plan_dispatch] Отправлено {dispatched}, пропущено {skipped}")
 
