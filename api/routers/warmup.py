@@ -87,6 +87,8 @@ def _task_to_dict(t: WarmupTask, logs_count: int = 0) -> dict:
         "started_at": t.started_at.isoformat() if t.started_at else None,
         "finished_at": t.finished_at.isoformat() if getattr(t, 'finished_at', None) else None,
         "created_at": t.created_at.isoformat(),
+        "batch_id": getattr(t, 'batch_id', None) or f"single_{t.id}",
+        "batch_name": getattr(t, 'batch_name', None),
     }
 
 
@@ -134,6 +136,10 @@ async def create_warmup_tasks(
 
     created = []
     skipped = []
+    # Генерируем batch_id для группировки
+    import secrets
+    batch_id = secrets.token_hex(8)
+    batch_name = f"Прогрев {len(body.account_ids)} акк. — {datetime.utcnow().strftime('%d.%m %H:%M')}"
 
     for i, acc_id in enumerate(body.account_ids):
         # Проверяем аккаунт
@@ -173,6 +179,8 @@ async def create_warmup_tasks(
             view_stories=True,
             set_reactions=True,
             join_channels=True,
+            batch_id=batch_id,
+            batch_name=batch_name,
         )
         db.add(t)
         await db.flush()
@@ -221,6 +229,40 @@ async def start_warmup(
     t.next_action_at = now + timedelta(minutes=offset)
 
     await db.flush()
+
+    # Генерируем план прогрева
+    from tasks.plan_generator import generate_daily_plan
+    from tasks.behavior_engine import assign_personality
+    from models.campaign_plan import CampaignPlan
+    from models.account import TelegramAccount
+    from sqlalchemy import delete as sa_delete
+    from datetime import date
+
+    acc = (await db.execute(select(TelegramAccount).where(TelegramAccount.id == t.account_id))).scalar_one_or_none()
+    await db.execute(sa_delete(CampaignPlan).where(CampaignPlan.warmup_task_id == t.id))
+
+    total_days = getattr(t, 'total_days', 7) or 7
+    personality = assign_personality(str(t.account_id))
+
+    for day_num in range(1, total_days + 1):
+        plan_date = date.today() + timedelta(days=day_num - 1)
+        plan = generate_daily_plan(
+            account_id=t.account_id,
+            phone=acc.phone if acc else str(t.account_id),
+            campaign_channels=[],
+            campaign_id=0,
+            day_number=day_num,
+            comments_today=0,
+            personality=personality,
+        )
+        db.add(CampaignPlan(
+            campaign_id=None, warmup_task_id=t.id,
+            account_id=t.account_id, plan_date=plan_date,
+            day_number=day_num, plan=plan,
+            total_comments=0, executed_idx=0, status="active",
+        ))
+
+    await db.flush()
     return {"success": True, "status": "running", "start_offset_min": offset,
             "message": f"Прогрев запущен. Первое действие через {offset} мин."}
 
@@ -259,6 +301,39 @@ async def start_all_warmups(
         offset = getattr(t, 'start_offset_min', 0) or 0
         t.next_action_at = now + timedelta(minutes=offset)
         started += 1
+    
+    await db.flush()
+    from tasks.plan_generator import generate_daily_plan
+    from tasks.behavior_engine import assign_personality
+    from models.campaign_plan import CampaignPlan
+    from models.account import TelegramAccount
+    from sqlalchemy import delete as sa_delete
+    from datetime import date
+
+    for t in tasks:
+        acc = (await db.execute(select(TelegramAccount).where(TelegramAccount.id == t.account_id))).scalar_one_or_none()
+        await db.execute(sa_delete(CampaignPlan).where(CampaignPlan.warmup_task_id == t.id))
+
+        total_days = getattr(t, 'total_days', 7) or 7
+        personality = assign_personality(str(t.account_id))
+
+        for day_num in range(1, total_days + 1):
+            plan_date = date.today() + timedelta(days=day_num - 1)
+            plan = generate_daily_plan(
+                account_id=t.account_id,
+                phone=acc.phone if acc else str(t.account_id),
+                campaign_channels=[],
+                campaign_id=0,
+                day_number=day_num,
+                comments_today=0,
+                personality=personality,
+            )
+            db.add(CampaignPlan(
+                campaign_id=None, warmup_task_id=t.id,
+                account_id=t.account_id, plan_date=plan_date,
+                day_number=day_num, plan=plan,
+                total_comments=0, executed_idx=0, status="active",
+            ))
 
     await db.flush()
     return {"started": started, "message": f"Запущено {started} задач"}
@@ -412,3 +487,176 @@ async def get_live_logs(
 async def list_modes():
     """Доступные режимы прогрева."""
     return MODE_CONFIG
+
+@router.get("/tasks/{task_id}/plans")
+async def get_warmup_plans(
+    task_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from models.campaign_plan import CampaignPlan
+    from models.account import TelegramAccount
+
+    # Проверяем владельца
+    wt = (await db.execute(
+        select(WarmupTask).where(WarmupTask.id == task_id, WarmupTask.user_id == current_user.id)
+    )).scalar_one_or_none()
+    if not wt:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+
+    result = await db.execute(
+        select(CampaignPlan).where(CampaignPlan.warmup_task_id == task_id)
+        .order_by(CampaignPlan.plan_date)
+    )
+    plans = result.scalars().all()
+
+    out = []
+    for p in plans:
+        acc = (await db.execute(
+            select(TelegramAccount).where(TelegramAccount.id == p.account_id)
+        )).scalar_one_or_none()
+        sessions = p.plan.get("sessions", [])
+        out.append({
+            "id": p.id,
+            "account_phone": acc.phone if acc else "?",
+            "plan_date": p.plan_date.isoformat(),
+            "day_number": p.day_number,
+            "personality": p.plan.get("personality", "?"),
+            "mood": p.plan.get("mood", "?"),
+            "total_sessions": len(sessions),
+            "total_comments": p.total_comments,
+            "executed_idx": p.executed_idx,
+            "status": p.status,
+            "sessions": sessions,
+        })
+    return out
+
+
+@router.get("/tasks/{task_id}/activity")
+async def get_warmup_activity(
+    task_id: int,
+    limit: int = Query(default=50, le=200),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    from models.warmup_log import WarmupLog
+    from models.account import TelegramAccount
+
+    wt = (await db.execute(
+        select(WarmupTask).where(WarmupTask.id == task_id, WarmupTask.user_id == current_user.id)
+    )).scalar_one_or_none()
+    if not wt:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+
+    # Логи от plan_executor (task_id=NULL) для этого аккаунта
+    # Дата создания задачи — берём логи только после её запуска
+    started_at = wt.started_at or wt.created_at or datetime.utcnow()
+
+    # Логи от plan_executor (task_id=NULL) для этого аккаунта, СОЗДАННЫЕ ПОСЛЕ старта задачи
+    plan_logs = (await db.execute(
+        select(WarmupLog).where(
+            WarmupLog.account_id == wt.account_id,
+            WarmupLog.task_id == None,
+            WarmupLog.created_at >= started_at,
+        ).order_by(WarmupLog.created_at.desc()).limit(limit)
+    )).scalars().all()
+
+    # Старые логи от warmup_v2 (по task_id)
+    old_logs = (await db.execute(
+        select(WarmupLog).where(
+            WarmupLog.task_id == task_id
+        ).order_by(WarmupLog.created_at.desc()).limit(limit)
+    )).scalars().all()
+
+    all_logs = list(plan_logs) + list(old_logs)
+    all_logs.sort(key=lambda x: x.created_at or datetime.utcnow(), reverse=True)
+
+    acc = (await db.execute(
+        select(TelegramAccount).where(TelegramAccount.id == wt.account_id)
+    )).scalar_one_or_none()
+    phone = acc.phone if acc else "?"
+
+    ACTION_ICONS = {
+        "session_start": "▶", "session_end": "⏹",
+        "read_feed": "📖", "view_stories": "👁",
+        "set_reaction": "😍", "view_profile": "👤",
+        "search": "🔍", "send_saved": "💬",
+        "forward_saved": "💾", "reply_dm": "↩️",
+        "smart_comment": "💬", "join_channel": "📢",
+        "typing": "⌨️", "error": "❌",
+    }
+
+    return [{
+        "id": l.id,
+        "type": "warmup",
+        "account_phone": phone,
+        "action": l.action,
+        "action_icon": ACTION_ICONS.get(l.action, "•"),
+        "detail": l.detail,
+        "channel": l.channel or "",
+        "emoji": l.emoji or "",
+        "success": l.success,
+        "error": l.error,
+        "created_at": l.created_at.isoformat() if l.created_at else None,
+    } for l in all_logs[:limit]]
+@router.post("/batch/{batch_id}/start")
+async def start_batch(
+    batch_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(WarmupTask).where(
+            WarmupTask.batch_id == batch_id,
+            WarmupTask.user_id == current_user.id,
+            WarmupTask.status.in_(["idle", "paused"]),
+        )
+    )
+    tasks = result.scalars().all()
+    now = datetime.utcnow()
+    for t in tasks:
+        t.status = "running"
+        if not t.started_at:
+            t.started_at = now
+        t.next_action_at = now + timedelta(minutes=getattr(t, 'start_offset_min', 0) or 0)
+    await db.flush()
+    return {"started": len(tasks)}
+
+
+@router.post("/batch/{batch_id}/stop")
+async def stop_batch(
+    batch_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(WarmupTask).where(
+            WarmupTask.batch_id == batch_id,
+            WarmupTask.user_id == current_user.id,
+            WarmupTask.status == "running",
+        )
+    )
+    tasks = result.scalars().all()
+    for t in tasks:
+        t.status = "finished"
+        t.finished_at = datetime.utcnow()
+    await db.flush()
+    return {"stopped": len(tasks)}
+
+
+@router.delete("/batch/{batch_id}", status_code=204)
+async def delete_batch(
+    batch_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(WarmupTask).where(
+            WarmupTask.batch_id == batch_id,
+            WarmupTask.user_id == current_user.id,
+        )
+    )
+    tasks = result.scalars().all()
+    for t in tasks:
+        await db.delete(t)
+    await db.flush()

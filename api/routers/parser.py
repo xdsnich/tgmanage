@@ -1,6 +1,7 @@
 """
-GramGPT API — routers/parser.py
-Парсер целевых каналов. Все подключения через make_telethon_client (с прокси).
+GramGPT API — routers/parser.py (v3)
+Парсер каналов через Telegram-поиск (user accounts).
+TGStat оставлен как опция, но по умолчанию используется Telegram.
 """
 
 import sys
@@ -8,15 +9,18 @@ import os
 import csv
 import io
 import asyncio
+import logging
+import random
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 from sqlalchemy.orm import joinedload
+
 from database import get_db
 from routers.deps import get_current_user
 from models.user import User
@@ -24,13 +28,13 @@ from models.account import TelegramAccount
 from models.proxy import Proxy
 from models.parsed_channel import ParsedChannel
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/parser", tags=["parser"])
 
 
 # ── Helper ───────────────────────────────────────────────────
 
 async def _get_client(acc, db):
-    """Создаёт TelegramClient С ПРОКСИ"""
     api_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     if api_dir not in sys.path:
         sys.path.insert(0, api_dir)
@@ -50,13 +54,33 @@ async def _get_client(acc, db):
 # ── Schemas ──────────────────────────────────────────────────
 
 class SearchRequest(BaseModel):
-    account_id: int
+    account_id: int  # Обязательно для Telegram поиска
+
+    # Ключевые слова (через запятую)
     keywords: str
+    
+    # Фильтры подписчиков
     min_subscribers: int = 0
-    max_subscribers: int = 1000000
-    only_with_comments: bool = False
-    active_hours: int = 0
-    source: str = "telegram"  # "telegram" | "tgstat" | "both"
+    max_subscribers: int = 10000000
+
+    # Только с открытыми комментариями
+    only_with_comments: bool = True
+    active_hours: int = 0  # Посты за последние N часов
+
+    # Фильтры username
+    name_endings: Optional[str] = None  # "_news,_info,_ua"
+    name_contains: Optional[str] = None  # "crypto,trade"
+
+    # Лимиты
+    limit_per_keyword: int = 50
+    max_channels: int = 500
+
+    # Кастомные паузы (секунды)
+    pause_between_keywords_min: float = 3.0
+    pause_between_keywords_max: float = 6.0
+    pause_between_channels_min: float = 0.8
+    pause_between_channels_max: float = 1.5
+
 
 class ImportRequest(BaseModel):
     channels: list[str]
@@ -66,12 +90,22 @@ class ImportRequest(BaseModel):
 
 @router.get("/channels")
 async def list_parsed_channels(
+    folder: Optional[str] = None,
+    min_subscribers: Optional[int] = None,
+    only_with_comments: bool = False,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        select(ParsedChannel).where(ParsedChannel.user_id == current_user.id).order_by(ParsedChannel.subscribers.desc())
-    )
+    q = select(ParsedChannel).where(ParsedChannel.user_id == current_user.id)
+    if folder is not None:
+        q = q.where(ParsedChannel.folder == folder)
+    if min_subscribers is not None:
+        q = q.where(ParsedChannel.subscribers >= min_subscribers)
+    if only_with_comments:
+        q = q.where(ParsedChannel.has_comments == True)
+    q = q.order_by(ParsedChannel.subscribers.desc())
+
+    result = await db.execute(q)
     channels = result.scalars().all()
     return [{
         "id": c.id, "username": c.username, "title": c.title,
@@ -79,6 +113,13 @@ async def list_parsed_channels(
         "last_post_date": c.last_post_date.isoformat() if c.last_post_date else None,
         "search_query": c.search_query, "added_at": c.added_at.isoformat(),
         "folder": c.folder or "",
+        "country": c.country or "",
+        "language": c.language or "",
+        "category": c.category or "",
+        "description": (c.description or "")[:200] if c.description else "",
+        "avg_post_reach": c.avg_post_reach or 0,
+        "err": c.err or 0,
+        "source": c.source or "telegram",
     } for c in channels]
 
 
@@ -88,203 +129,169 @@ async def search_channels(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Поиск каналов через Telegram С ПРОКСИ."""
+    """Поиск каналов через Telegram API (user account)."""
+    keywords = [k.strip() for k in body.keywords.split(",") if k.strip()]
+    if not keywords:
+        raise HTTPException(status_code=400, detail="Укажите хотя бы одно ключевое слово")
+
+    # Загружаем аккаунт
     acc_r = await db.execute(
-        select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(TelegramAccount.id == body.account_id, TelegramAccount.user_id == current_user.id)
+        select(TelegramAccount).options(joinedload(TelegramAccount.api_app))
+        .where(TelegramAccount.id == body.account_id, TelegramAccount.user_id == current_user.id)
     )
     acc = acc_r.scalar_one_or_none()
-    if not acc or not acc.session_file:
+    if not acc:
         raise HTTPException(status_code=404, detail="Аккаунт не найден")
+    if not acc.proxy_id:
+        raise HTTPException(status_code=400, detail="У аккаунта нет прокси")
 
+    client = await _get_client(acc, db)
     found = []
     seen_usernames = set()
-    keywords = [k.strip() for k in body.keywords.split(",") if k.strip()]
-    print(f"🔍 Парсер: keywords={keywords}, source={body.source}, account={acc.phone}")
 
-    # ── Telegram поиск ───────────────────────────────────────
-    if body.source in ("telegram", "both"):
-        client = await _get_client(acc, db)
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            raise HTTPException(status_code=400, detail="Аккаунт не авторизован")
 
         from telethon.tl.functions.contacts import SearchRequest as TgSearchRequest
-        from telethon.tl.functions.messages import SearchGlobalRequest
-        from telethon.tl.types import Channel, InputMessagesFilterEmpty, InputPeerEmpty
-        import asyncio
 
-        try:
-            await client.connect()
-            print(f"🔍 Telegram: подключён")
-            if not await client.is_user_authorized():
-                await client.disconnect()
-                raise HTTPException(status_code=400, detail="Сессия не активна")
+        for kw in keywords:
+            if len(found) >= body.max_channels:
+                break
 
-            for kw in keywords:
-                print(f"🔍 Telegram: ищу '{kw}'...")
+            logger.info(f"🔍 Telegram поиск: '{kw}'")
+            try:
+                res = await client(TgSearchRequest(q=kw, limit=body.limit_per_keyword))
+                channels_found_kw = 0
 
-                # Метод 1: contacts.Search
-                try:
-                    result = await client(TgSearchRequest(q=kw, limit=20))
-                    print(f"🔍 contacts.Search: найдено {len(result.chats)} чатов")
-                    for chat in result.chats:
-                        if not isinstance(chat, Channel) or not chat.broadcast:
+                for chat in res.chats:
+                    if len(found) >= body.max_channels:
+                        break
+                    if not hasattr(chat, 'username') or not chat.username:
+                        continue
+                    if chat.username in seen_usernames:
+                        continue
+
+                    # Фильтры username (дёшево — до запроса на канал)
+                    if body.name_endings:
+                        endings = [e.strip().lower() for e in body.name_endings.split(",") if e.strip()]
+                        if not any(chat.username.lower().endswith(e) for e in endings):
                             continue
-                        if not chat.username or chat.username in seen_usernames:
-                            continue
-                        seen_usernames.add(chat.username)
-
-                        subs = getattr(chat, 'participants_count', 0) or 0
-                        if subs < body.min_subscribers or subs > body.max_subscribers:
-                            continue
-
-                        has_comments = False
-                        last_post = None
-                        try:
-                            msgs = await client.get_messages(chat, limit=1)
-                            if msgs:
-                                last_post = msgs[0].date
-                                if msgs[0].replies and getattr(msgs[0].replies, 'comments', False):
-                                    has_comments = True
-                        except Exception as e:
-                            print(f"🔍 Ошибка get_messages @{chat.username}: {e}")
-
-                        if body.only_with_comments and not has_comments:
-                            continue
-                        if body.active_hours > 0 and last_post:
-                            cutoff = datetime.utcnow() - timedelta(hours=body.active_hours)
-                            if last_post.replace(tzinfo=None) < cutoff:
-                                continue
-
-                        found.append({
-                            "channel_id": chat.id, "username": chat.username, "title": chat.title,
-                            "subscribers": subs, "has_comments": has_comments,
-                            "last_post_date": last_post.isoformat() if last_post else None, "search_query": kw,
-                        })
-                        print(f"🔍 + @{chat.username} ({subs} подписчиков)")
-                except Exception as e:
-                    print(f"🔍 contacts.Search ошибка: {e}")
-
-                await asyncio.sleep(1)
-
-                # Метод 2: messages.SearchGlobal
-                try:
-                    global_result = await client(SearchGlobalRequest(
-                        q=kw, filter=InputMessagesFilterEmpty(),
-                        min_date=datetime(2020, 1, 1), max_date=datetime.utcnow(),
-                        offset_rate=0, offset_peer=InputPeerEmpty(),
-                        offset_id=0, limit=50,
-                    ))
-                    print(f"🔍 SearchGlobal: найдено {len(global_result.chats)} чатов")
-                    for chat in global_result.chats:
-                        if not isinstance(chat, Channel) or not chat.broadcast:
-                            continue
-                        if not chat.username or chat.username in seen_usernames:
-                            continue
-                        seen_usernames.add(chat.username)
-
-                        subs = getattr(chat, 'participants_count', 0) or 0
-                        if subs < body.min_subscribers or subs > body.max_subscribers:
+                    if body.name_contains:
+                        parts = [p.strip().lower() for p in body.name_contains.split(",") if p.strip()]
+                        if not any(p in chat.username.lower() for p in parts):
                             continue
 
-                        has_comments = False
-                        last_post = None
-                        try:
-                            msgs = await client.get_messages(chat, limit=1)
-                            if msgs:
-                                last_post = msgs[0].date
-                                if msgs[0].replies and getattr(msgs[0].replies, 'comments', False):
-                                    has_comments = True
-                        except Exception as e:
-                            print(f"🔍 Ошибка get_messages @{chat.username}: {e}")
+                    # Подписчики — берём participants_count если есть
+                    subs = getattr(chat, 'participants_count', 0) or 0
 
-                        if body.only_with_comments and not has_comments:
+                    # Если нет в SearchRequest — нужно через get_full
+                    # Если нет количества подписчиков — пропускаем (мелкий/приватный)
+                    if subs == 0:
+                        continue
+
+                    if subs < body.min_subscribers or subs > body.max_subscribers:
+                        continue
+
+                    # Проверка комментариев + активности
+                    has_comments = False
+                    last_post = None
+                    try:
+                        msgs = await client.get_messages(chat, limit=1)
+                        if msgs:
+                            last_post = msgs[0].date
+                            if msgs[0].replies and getattr(msgs[0].replies, 'comments', False):
+                                has_comments = True
+                    except Exception as e:
+                        logger.debug(f"get_messages @{chat.username}: {e}")
+
+                    if body.only_with_comments and not has_comments:
+                        continue
+                    if body.active_hours > 0 and last_post:
+                        cutoff = datetime.utcnow() - timedelta(hours=body.active_hours)
+                        if last_post.replace(tzinfo=None) < cutoff:
                             continue
-                        if body.active_hours > 0 and last_post:
-                            cutoff = datetime.utcnow() - timedelta(hours=body.active_hours)
-                            if last_post.replace(tzinfo=None) < cutoff:
-                                continue
 
-                        found.append({
-                            "channel_id": chat.id, "username": chat.username, "title": chat.title,
-                            "subscribers": subs, "has_comments": has_comments,
-                            "last_post_date": last_post.isoformat() if last_post else None, "search_query": kw,
-                        })
-                        print(f"🔍 + @{chat.username} ({subs} подписчиков)")
-                except Exception as e:
-                    print(f"🔍 SearchGlobal ошибка: {e}")
+                    seen_usernames.add(chat.username)
+                    ch_data = {
+                        "channel_id": chat.id,
+                        "username": chat.username,
+                        "title": chat.title,
+                        "subscribers": subs,
+                        "has_comments": has_comments,
+                        "last_post_date": last_post.isoformat() if last_post else None,
+                        "search_query": kw,
+                        "source": "telegram",
+                    }
+                    found.append(ch_data)
+                    channels_found_kw += 1
 
-                await asyncio.sleep(2)
-
-            await client.disconnect()
-            print(f"🔍 Telegram: отключён, найдено {len(found)} каналов")
-
-        except HTTPException: raise
-        except Exception as e:
-            try: await client.disconnect()
-            except: pass
-            print(f"🔍 Telegram ОШИБКА: {e}")
-            raise HTTPException(status_code=500, detail=f"Ошибка Telegram: {str(e)[:200]}")
-
-    # ── TGStat API ───────────────────────────────────────────
-    if body.source in ("tgstat", "both"):
-        tgstat_token = os.getenv("TGSTAT_API_KEY", "")
-        if tgstat_token:
-            import httpx
-            print(f"🔍 TGStat: начинаю поиск...")
-            for kw in keywords:
-                try:
-                    async with httpx.AsyncClient(timeout=15) as http:
-                        resp = await http.get("https://api.tgstat.ru/channels/search",
-                                              params={"token": tgstat_token, "q": kw, "limit": 50})
-                        print(f"🔍 TGStat '{kw}': status={resp.status_code}")
-                        if resp.status_code == 200:
-                            items = resp.json().get("response", {}).get("items", [])
-                            print(f"🔍 TGStat '{kw}': найдено {len(items)} каналов")
-                            for item in items:
-                                username = (item.get("username") or "").replace("@", "")
-                                if not username or username in seen_usernames:
-                                    continue
-                                seen_usernames.add(username)
-                                subs = item.get("participants_count", 0) or 0
-                                if subs < body.min_subscribers or subs > body.max_subscribers:
-                                    continue
-                                found.append({
-                                    "channel_id": item.get("id", 0), "username": username,
-                                    "title": item.get("title", username), "subscribers": subs,
-                                    "has_comments": True, "last_post_date": None, "search_query": kw,
-                                })
+                    # ═══ STREAMING: сохраняем в БД СРАЗУ ═══
+                    try:
+                        existing = await db.execute(
+                            select(ParsedChannel).where(
+                                ParsedChannel.user_id == current_user.id,
+                                ParsedChannel.username == chat.username,
+                            )
+                        )
+                        if not existing.scalar_one_or_none():
+                            db.add(ParsedChannel(
+                                user_id=current_user.id,
+                                channel_id=chat.id,
+                                username=chat.username,
+                                title=chat.title,
+                                subscribers=subs,
+                                has_comments=has_comments,
+                                last_post_date=last_post.replace(tzinfo=None) if last_post else None,
+                                search_query=kw,
+                                source="telegram",
+                            ))
+                            await db.commit()
+                            logger.info(f"  + @{chat.username} ({subs} подписчиков) [сохранён]")
                         else:
-                            print(f"🔍 TGStat ошибка: {resp.text[:200]}")
-                except Exception as e:
-                    print(f"🔍 TGStat ошибка: {e}")
-                await asyncio.sleep(1)
-        else:
-            print("🔍 TGStat: TGSTAT_API_KEY не задан в .env")
+                            logger.info(f"  + @{chat.username} (уже в БД)")
+                    except Exception as e:
+                        logger.warning(f"Save @{chat.username}: {e}")
+                        try: await db.rollback()
+                        except: pass
 
-    # Сохраняем в БД
-    saved = 0
-    for ch in found:
-        existing = await db.execute(
-            select(ParsedChannel).where(ParsedChannel.user_id == current_user.id, ParsedChannel.username == ch["username"])
-        )
-        if existing.scalar_one_or_none():
-            continue
+                    # Rate limit между проверками каналов (кастомный)
+                    await asyncio.sleep(random.uniform(body.pause_between_channels_min, body.pause_between_channels_max))
 
-        post_date = None
-        if ch["last_post_date"]:
-            dt = datetime.fromisoformat(ch["last_post_date"])
-            post_date = dt.replace(tzinfo=None)
+                logger.info(f"  '{kw}': добавлено {channels_found_kw} каналов")
+            except Exception as e:
+                err = str(e)
+                if "FLOOD_WAIT" in err:
+                    import re
+                    wait = int(re.search(r"(\d+)", err).group(1)) if re.search(r"(\d+)", err) else 60
+                    logger.warning(f"🔍 FLOOD_WAIT_{wait} на '{kw}' — прерываю поиск")
+                    break
+                logger.warning(f"🔍 Ошибка поиска '{kw}': {e}")
 
-        db.add(ParsedChannel(
-            user_id=current_user.id, channel_id=ch["channel_id"],
-            username=ch["username"], title=ch["title"],
-            subscribers=ch["subscribers"], has_comments=ch["has_comments"],
-            last_post_date=post_date, search_query=ch["search_query"],
-        ))
-        saved += 1
+            # Пауза между ключевыми словами (кастомная)
+            await asyncio.sleep(random.uniform(body.pause_between_keywords_min, body.pause_between_keywords_max))
 
-    await db.flush()
-    print(f"🔍 ИТОГО: найдено {len(found)}, сохранено {saved}")
-    return {"found": len(found), "saved": saved, "channels": found}
+        await client.disconnect()
+        logger.info(f"🔍 Telegram: найдено {len(found)} каналов")
 
+    except HTTPException:
+        try: await client.disconnect()
+        except: pass
+        raise
+    except Exception as e:
+        try: await client.disconnect()
+        except: pass
+        logger.error(f"🔍 Ошибка: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)[:200]}")
+
+    # ═══ Сохраняем в БД ═══
+# Каналы уже сохранены в процессе поиска (streaming)
+    saved = len(found)
+
+    return {"found": len(found), "saved": saved, "channels": found[:100]}
+
+# ── Удаление, экспорт, импорт ───────────────────────────────
 
 @router.delete("/channels/{channel_id}", status_code=204)
 async def delete_parsed_channel(
@@ -303,10 +310,14 @@ async def delete_parsed_channel(
 
 @router.delete("/channels", status_code=204)
 async def clear_all_parsed(
+    folder: Optional[str] = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await db.execute(delete(ParsedChannel).where(ParsedChannel.user_id == current_user.id))
+    q = delete(ParsedChannel).where(ParsedChannel.user_id == current_user.id)
+    if folder is not None:
+        q = q.where(ParsedChannel.folder == folder)
+    await db.execute(q)
     await db.flush()
 
 
@@ -322,10 +333,11 @@ async def export_channels_csv(
 
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["username", "title", "subscribers", "has_comments", "last_post", "query"])
+    writer.writerow(["username", "title", "subscribers", "has_comments", "folder", "last_post", "query"])
     for c in channels:
         writer.writerow([f"@{c.username}", c.title, c.subscribers, c.has_comments,
-                         c.last_post_date.isoformat() if c.last_post_date else "", c.search_query])
+                         c.folder or "", c.last_post_date.isoformat() if c.last_post_date else "",
+                         c.search_query])
 
     output.seek(0)
     return StreamingResponse(iter([output.getvalue()]), media_type="text/csv",
@@ -362,7 +374,6 @@ async def list_folders(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Уникальные папки + количество каналов в каждой"""
     result = await db.execute(
         select(ParsedChannel.folder).where(
             ParsedChannel.user_id == current_user.id,
@@ -382,7 +393,6 @@ async def get_folder_channels(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Каналы в конкретной папке"""
     result = await db.execute(
         select(ParsedChannel).where(
             ParsedChannel.user_id == current_user.id,
@@ -405,7 +415,6 @@ async def set_folder(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Назначить папку нескольким каналам"""
     result = await db.execute(
         select(ParsedChannel).where(
             ParsedChannel.user_id == current_user.id,
@@ -426,7 +435,6 @@ async def update_channel_folder(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Изменить папку одного канала"""
     result = await db.execute(
         select(ParsedChannel).where(ParsedChannel.id == channel_id, ParsedChannel.user_id == current_user.id)
     )

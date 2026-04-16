@@ -51,6 +51,8 @@ class WarmupTask(Base):
     next_action_at:  Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     start_offset_min:Mapped[int]              = mapped_column(Integer, default=0)
     total_days:      Mapped[int]              = mapped_column(Integer, default=7)
+    batch_id:   Mapped[Optional[str]] = mapped_column(String(32), nullable=True, index=True)
+    batch_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     # v2 — связь с кампанией комментинга
     campaign_id:     Mapped[Optional[int]]    = mapped_column(ForeignKey("campaigns.id", ondelete="SET NULL"), nullable=True)
     def __repr__(self):

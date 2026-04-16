@@ -18,6 +18,7 @@ class CampaignPlan(Base):
 
     id:              Mapped[int]              = mapped_column(Integer, primary_key=True)
     campaign_id:     Mapped[int]              = mapped_column(ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True)
+    warmup_task_id:  Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     account_id:      Mapped[int]              = mapped_column(ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True)
     plan_date:       Mapped[date]             = mapped_column(Date, nullable=False, index=True)
     day_number:      Mapped[int]              = mapped_column(Integer, default=1)

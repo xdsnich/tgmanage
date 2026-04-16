@@ -90,6 +90,16 @@ async def _dispatch_plans():
                 )
             )
             plans = result.scalars().all()
+            warmup_result = await db.execute(
+                select(CampaignPlan).where(
+                    CampaignPlan.plan_date == today,
+                    CampaignPlan.status == "active",
+                    CampaignPlan.campaign_id == None,
+                    CampaignPlan.warmup_task_id != None,
+                )
+            )
+            warmup_plans = warmup_result.scalars().all()
+            plans = list(plans) + list(warmup_plans)
 
             for plan in plans:
                 sessions = plan.plan.get("sessions", [])
@@ -144,7 +154,18 @@ async def _dispatch_plans():
                 select(Campaign).where(Campaign.status == CampaignStatus.active)
             )).scalars().all()
 
+            logger.info(f"[autoclose] Проверка {len(active_campaigns)} активных кампаний")
+
             for camp in active_campaigns:
+                logger.info(f"[autoclose]   camp {camp.id}: started_at={camp.started_at}, max_hours={camp.max_hours}, comments={camp.comments_sent}/{camp.max_comments}")
+                if camp.started_at and camp.max_hours:
+                    from datetime import datetime as _dt
+                    elapsed = (_dt.utcnow() - camp.started_at).total_seconds() / 3600
+                    if elapsed >= camp.max_hours:
+                        camp.status = CampaignStatus.finished
+                        logger.info(f"[autoclose] Кампания {camp.id} → finished (время истекло: {elapsed:.1f}ч / {camp.max_hours}ч)")
+                        continue
+
                 # Проверяем достигнут ли лимит комментов
                 if camp.comments_sent >= camp.max_comments:
                     camp.status = CampaignStatus.finished
@@ -251,6 +272,11 @@ async def _execute_plan_session(plan_id: int):
             if not check_connection_limit(plan.account_id):
                 return {"status": "daily_limit"}
 
+            # ── Acquire lock ──
+            if not acquire_account_lock(plan.account_id, ttl=1800):
+                logger.info(f"[plan] Аккаунт {plan.account_id} занят (lock) — пропуск")
+                return {"status": "locked"}
+
             try:
                 # ── Аккаунт + прокси ─────────────────────
                 acc = (await db.execute(
@@ -276,9 +302,11 @@ async def _execute_plan_session(plan_id: int):
                     return {"status": "no_client"}
 
                 # ── Кампания ──────────────────────────────
-                campaign = (await db.execute(
-                    select(Campaign).where(Campaign.id == plan.campaign_id)
-                )).scalar_one_or_none()
+                campaign = None
+                if plan.campaign_id:
+                    campaign = (await db.execute(
+                        select(Campaign).where(Campaign.id == plan.campaign_id)
+                    )).scalar_one_or_none()
 
                 # ── Подключаемся ──────────────────────────
                 phone = acc.phone
