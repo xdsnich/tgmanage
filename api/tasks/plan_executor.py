@@ -592,12 +592,31 @@ async def _execute_plan_session(plan_id: int):
                                         continue
 
                                     # Отправляем
+                                    # Отправляем
                                     await client.send_message(entity=entity, message=comment_text, comment_to=target_post.id)
 
+                                    # Статистика: успешный коммент
+                                    try:
+                                        from models.channel_ban_stats import ChannelBanStats
+                                        st = (await db.execute(
+                                            select(ChannelBanStats).where(
+                                                ChannelBanStats.user_id == campaign.user_id,
+                                                ChannelBanStats.channel_username == target_channel,
+                                            )
+                                        )).scalar_one_or_none()
+                                        if not st:
+                                            st = ChannelBanStats(
+                                                user_id=campaign.user_id,
+                                                channel_username=target_channel,
+                                                total_attempts=0, banned_count=0,
+                                            )
+                                            db.add(st)
+                                        st.total_attempts += 1
+                                        st.last_updated = datetime.utcnow()
+                                    except Exception as e:
+                                        logger.warning(f"[stats] Ошибка записи: {e}")
+
                                     logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 💬 @{target_channel}: {comment_text[:60]}")
-                                    await _safe_log(db, task_id=None, account_id=acc.id, action="smart_comment",
-                                                     detail=f"💬 @{target_channel}: {comment_text[:60]}",
-                                                     channel=target_channel, success=True)
 
                                     # CommentLog
                                     if campaign:
@@ -616,6 +635,39 @@ async def _execute_plan_session(plan_id: int):
                                 except Exception as e:
                                     err = str(e)
                                     logger.warning(f"[plan][{phone}]   [{action_num}/{len(actions)}] ❌ comment error: {err[:100]}")
+
+                                    # Статистика: определяем это бан или нет
+                                    ban_errors = [
+                                        "YOU_BLOCKED", "USER_BANNED", "CHAT_WRITE_FORBIDDEN",
+                                        "USER_RESTRICTED", "BANNED_RIGHTS", "USER_BLOCKED",
+                                        "CHANNEL_PRIVATE", "ChatWriteForbidden", "UserBannedInChannel"
+                                    ]
+                                    is_ban = any(b in err for b in ban_errors)
+
+                                    if is_ban and campaign:
+                                        try:
+                                            from models.channel_ban_stats import ChannelBanStats
+                                            st = (await db.execute(
+                                                select(ChannelBanStats).where(
+                                                    ChannelBanStats.user_id == campaign.user_id,
+                                                    ChannelBanStats.channel_username == target_channel,
+                                                )
+                                            )).scalar_one_or_none()
+                                            if not st:
+                                                st = ChannelBanStats(
+                                                    user_id=campaign.user_id,
+                                                    channel_username=target_channel,
+                                                    total_attempts=0, banned_count=0,
+                                                )
+                                                db.add(st)
+                                            st.total_attempts += 1
+                                            st.banned_count += 1
+                                            st.last_ban_reason = err[:200]
+                                            st.last_updated = datetime.utcnow()
+                                            logger.warning(f"[stats] 🚫 @{target_channel} банит: {st.banned_count}/{st.total_attempts}")
+                                        except Exception as se:
+                                            logger.warning(f"[stats] Ошибка записи бана: {se}")
+
                                     await _safe_log(db, task_id=None, account_id=acc.id, action="smart_comment",
                                                      detail=f"Ошибка: {err[:100]}", channel=target_channel,
                                                      success=False, error=err[:200])

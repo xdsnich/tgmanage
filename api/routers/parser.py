@@ -133,14 +133,14 @@ async def search_channels(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Поиск каналов через Telegram API (user account)."""
+    """Запускает парсинг в фоне через Celery — возвращается сразу."""
     keywords = [k.strip() for k in body.keywords.split(",") if k.strip()]
     if not keywords:
         raise HTTPException(status_code=400, detail="Укажите хотя бы одно ключевое слово")
 
-    # Загружаем аккаунт
+    # Проверяем аккаунт
     acc_r = await db.execute(
-        select(TelegramAccount).options(joinedload(TelegramAccount.api_app))
+        select(TelegramAccount)
         .where(TelegramAccount.id == body.account_id, TelegramAccount.user_id == current_user.id)
     )
     acc = acc_r.scalar_one_or_none()
@@ -149,151 +149,19 @@ async def search_channels(
     if not acc.proxy_id:
         raise HTTPException(status_code=400, detail="У аккаунта нет прокси")
 
-    client = await _get_client(acc, db)
-    found = []
-    seen_usernames = set()
+    # Отправляем в Celery
+    from celery_app import celery_app
+    task = celery_app.send_task(
+        "tasks.parser_tasks.run_parser_search",
+        args=[current_user.id, body.account_id, body.model_dump()],
+        queue="ai_dialogs",  # или bulk_actions
+    )
 
-    try:
-        await client.connect()
-        if not await client.is_user_authorized():
-            raise HTTPException(status_code=400, detail="Аккаунт не авторизован")
-
-        from telethon.tl.functions.contacts import SearchRequest as TgSearchRequest
-
-        for kw in keywords:
-            if len(found) >= body.max_channels:
-                break
-
-            logger.info(f"🔍 Telegram поиск: '{kw}'")
-            try:
-                res = await client(TgSearchRequest(q=kw, limit=body.limit_per_keyword))
-                channels_found_kw = 0
-
-                for chat in res.chats:
-                    if len(found) >= body.max_channels:
-                        break
-                    if not hasattr(chat, 'username') or not chat.username:
-                        continue
-                    if chat.username in seen_usernames:
-                        continue
-
-                    # Фильтры username (дёшево — до запроса на канал)
-                    if body.name_endings:
-                        endings = [e.strip().lower() for e in body.name_endings.split(",") if e.strip()]
-                        if not any(chat.username.lower().endswith(e) for e in endings):
-                            continue
-                    if body.name_contains:
-                        parts = [p.strip().lower() for p in body.name_contains.split(",") if p.strip()]
-                        if not any(p in chat.username.lower() for p in parts):
-                            continue
-
-                    # Подписчики — берём participants_count если есть
-                    subs = getattr(chat, 'participants_count', 0) or 0
-
-                    # Если нет в SearchRequest — нужно через get_full
-                    # Если нет количества подписчиков — пропускаем (мелкий/приватный)
-                    if subs == 0:
-                        continue
-
-                    if subs < body.min_subscribers or subs > body.max_subscribers:
-                        continue
-
-                    # Проверка комментариев + активности
-                    has_comments = False
-                    last_post = None
-                    try:
-                        msgs = await client.get_messages(chat, limit=1)
-                        if msgs:
-                            last_post = msgs[0].date
-                            if msgs[0].replies and getattr(msgs[0].replies, 'comments', False):
-                                has_comments = True
-                    except Exception as e:
-                        logger.debug(f"get_messages @{chat.username}: {e}")
-
-                    if body.only_with_comments and not has_comments:
-                        continue
-                    if body.active_hours > 0 and last_post:
-                        cutoff = datetime.utcnow() - timedelta(hours=body.active_hours)
-                        if last_post.replace(tzinfo=None) < cutoff:
-                            continue
-
-                    seen_usernames.add(chat.username)
-                    ch_data = {
-                        "channel_id": chat.id,
-                        "username": chat.username,
-                        "title": chat.title,
-                        "subscribers": subs,
-                        "has_comments": has_comments,
-                        "last_post_date": last_post.isoformat() if last_post else None,
-                        "search_query": kw,
-                        "source": "telegram",
-                    }
-                    found.append(ch_data)
-                    channels_found_kw += 1
-
-                    # ═══ STREAMING: сохраняем в БД СРАЗУ ═══
-                    try:
-                        existing = await db.execute(
-                            select(ParsedChannel).where(
-                                ParsedChannel.user_id == current_user.id,
-                                ParsedChannel.username == chat.username,
-                            )
-                        )
-                        if not existing.scalar_one_or_none():
-                            db.add(ParsedChannel(
-                                user_id=current_user.id,
-                                channel_id=chat.id,
-                                username=chat.username,
-                                title=chat.title,
-                                subscribers=subs,
-                                has_comments=has_comments,
-                                last_post_date=last_post.replace(tzinfo=None) if last_post else None,
-                                search_query=kw,
-                                source="telegram",
-                            ))
-                            await db.commit()
-                            logger.info(f"  + @{chat.username} ({subs} подписчиков) [сохранён]")
-                        else:
-                            logger.info(f"  + @{chat.username} (уже в БД)")
-                    except Exception as e:
-                        logger.warning(f"Save @{chat.username}: {e}")
-                        try: await db.rollback()
-                        except: pass
-
-                    # Rate limit между проверками каналов (кастомный)
-                    await asyncio.sleep(random.uniform(body.pause_between_channels_min, body.pause_between_channels_max))
-
-                logger.info(f"  '{kw}': добавлено {channels_found_kw} каналов")
-            except Exception as e:
-                err = str(e)
-                if "FLOOD_WAIT" in err:
-                    import re
-                    wait = int(re.search(r"(\d+)", err).group(1)) if re.search(r"(\d+)", err) else 60
-                    logger.warning(f"🔍 FLOOD_WAIT_{wait} на '{kw}' — прерываю поиск")
-                    break
-                logger.warning(f"🔍 Ошибка поиска '{kw}': {e}")
-
-            # Пауза между ключевыми словами (кастомная)
-            await asyncio.sleep(random.uniform(body.pause_between_keywords_min, body.pause_between_keywords_max))
-
-        await client.disconnect()
-        logger.info(f"🔍 Telegram: найдено {len(found)} каналов")
-
-    except HTTPException:
-        try: await client.disconnect()
-        except: pass
-        raise
-    except Exception as e:
-        try: await client.disconnect()
-        except: pass
-        logger.error(f"🔍 Ошибка: {e}")
-        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)[:200]}")
-
-    # ═══ Сохраняем в БД ═══
-# Каналы уже сохранены в процессе поиска (streaming)
-    saved = len(found)
-
-    return {"found": len(found), "saved": saved, "channels": found[:100]}
+    return {
+        "task_id": task.id,
+        "status": "started",
+        "message": "Парсинг запущен в фоне. Каналы появятся в списке по мере нахождения."
+    }
 
 # ── Удаление, экспорт, импорт ───────────────────────────────
 
@@ -448,3 +316,100 @@ async def update_channel_folder(
     ch.folder = body.get("folder", "")
     await db.flush()
     return {"id": ch.id, "folder": ch.folder}
+@router.get("/search/progress")
+async def get_search_progress(
+    current_user: User = Depends(get_current_user),
+):
+    """Статус текущего парсинга"""
+    import redis as redis_lib
+    import os
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    progress = r.get(f"parser:progress:{current_user.id}")
+    if not progress:
+        return {"status": "idle"}
+
+    try:
+        parts = progress.decode().split("|")
+        return {
+            "status": parts[0],        # running | done | error
+            "found": int(parts[1]),
+            "saved": int(parts[2]),
+            "total_keywords": int(parts[3]),
+            "current": parts[4] if len(parts) > 4 else "",
+        }
+    except Exception:
+        return {"status": "idle"}
+
+
+@router.post("/search/stop")
+async def stop_search(
+    current_user: User = Depends(get_current_user),
+):
+    """Прерывает текущий парсинг"""
+    import redis as redis_lib
+    import os
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    r.setex(f"parser:stop:{current_user.id}", 300, "1")
+    return {"status": "stop requested"}
+@router.get("/whitelist")
+async def get_whitelist(
+    min_rate: float = 0,  # фильтр по минимальной проходимости
+    sort_by: str = "pass_rate",  # pass_rate | attempts | recent
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Статистика проходимости каналов"""
+    from models.channel_ban_stats import ChannelBanStats
+    from sqlalchemy import func
+
+    result = await db.execute(
+        select(ChannelBanStats).where(ChannelBanStats.user_id == current_user.id)
+    )
+    stats = result.scalars().all()
+
+    out = []
+    for s in stats:
+        pass_rate = 100.0 if s.total_attempts == 0 else round(
+            (s.total_attempts - s.banned_count) / s.total_attempts * 100, 1
+        )
+        if pass_rate < min_rate:
+            continue
+        out.append({
+            "id": s.id,
+            "channel_username": s.channel_username,
+            "total_attempts": s.total_attempts,
+            "banned_count": s.banned_count,
+            "pass_rate": pass_rate,
+            "last_ban_reason": s.last_ban_reason,
+            "last_updated": s.last_updated.isoformat() + "Z",
+        })
+
+    # Сортировка
+    if sort_by == "attempts":
+        out.sort(key=lambda x: x["total_attempts"], reverse=True)
+    elif sort_by == "recent":
+        out.sort(key=lambda x: x["last_updated"], reverse=True)
+    else:
+        out.sort(key=lambda x: x["pass_rate"], reverse=True)
+
+    return out
+
+
+@router.delete("/whitelist/{stat_id}", status_code=204)
+async def delete_whitelist_entry(
+    stat_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Удалить запись (сбросить статистику канала)"""
+    from models.channel_ban_stats import ChannelBanStats
+    result = await db.execute(
+        select(ChannelBanStats).where(
+            ChannelBanStats.id == stat_id,
+            ChannelBanStats.user_id == current_user.id,
+        )
+    )
+    s = result.scalar_one_or_none()
+    if s:
+        await db.delete(s)
+        await db.flush()
