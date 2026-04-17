@@ -108,18 +108,22 @@ async def list_parsed_channels(
     result = await db.execute(q)
     channels = result.scalars().all()
     return [{
-        "id": c.id, "username": c.username, "title": c.title,
-        "subscribers": c.subscribers, "has_comments": c.has_comments,
+        "id": c.id,
+        "username": c.username or "",
+        "title": c.title or "",
+        "subscribers": c.subscribers or 0,
+        "has_comments": bool(c.has_comments),
         "last_post_date": c.last_post_date.isoformat() if c.last_post_date else None,
-        "search_query": c.search_query, "added_at": c.added_at.isoformat(),
-        "folder": c.folder or "",
-        "country": c.country or "",
-        "language": c.language or "",
-        "category": c.category or "",
-        "description": (c.description or "")[:200] if c.description else "",
-        "avg_post_reach": c.avg_post_reach or 0,
-        "err": c.err or 0,
-        "source": c.source or "telegram",
+        "search_query": c.search_query or "",
+        "added_at": c.added_at.isoformat() if c.added_at else None,
+        "folder": getattr(c, 'folder', '') or "",
+        "country": getattr(c, 'country', '') or "",
+        "language": getattr(c, 'language', '') or "",
+        "category": getattr(c, 'category', '') or "",
+        "description": (getattr(c, 'description', '') or "")[:200],
+        "avg_post_reach": getattr(c, 'avg_post_reach', 0) or 0,
+        "err": getattr(c, 'err', 0) or 0,
+        "source": getattr(c, 'source', 'telegram') or "telegram",
     } for c in channels]
 
 

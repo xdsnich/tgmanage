@@ -74,9 +74,10 @@ async def _dispatch_plans():
     try:
         async with Session() as db:
             now = datetime.utcnow()
-            today = now.date()
-            current_hour = (now.hour + 3) % 24  # UTC+3
-            current_minute = now.minute
+            local_now = now + timedelta(hours=3)  # UTC+3 Lviv
+            today = local_now.date()
+            current_hour = local_now.hour
+            current_minute = local_now.minute
 
             # Только сегодняшние активные планы
             from models.campaign import Campaign, CampaignStatus
@@ -415,9 +416,9 @@ async def _execute_plan_session(plan_id: int):
 
                             elif action_type == "set_reaction":
                                 try:
-                                    from telethon.tl.functions.messages import SendReactionRequest
+                                    from telethon.tl.functions.messages import SendReactionRequest, GetMessagesReactionsRequest
                                     from telethon.tl.types import ReactionEmoji
-                                    emoji = action.get("emoji", "👍")
+                                    from telethon.tl.functions.channels import GetFullChannelRequest
                                     channel_name = action.get("channel")
 
                                     if channel_name:
@@ -428,6 +429,24 @@ async def _execute_plan_session(plan_id: int):
                                         if not channels:
                                             continue
                                         entity = random.choice(channels)
+
+                                    # Узнаём разрешённые реакции на канале
+                                    allowed_emojis = []
+                                    try:
+                                        full = await client(GetFullChannelRequest(entity))
+                                        available = getattr(full.full_chat, 'available_reactions', None)
+                                        if available:
+                                            for r in getattr(available, 'reactions', []):
+                                                if hasattr(r, 'emoticon'):
+                                                    allowed_emojis.append(r.emoticon)
+                                    except Exception:
+                                        pass
+
+                                    # Если не удалось — используем стандартные безопасные
+                                    if not allowed_emojis:
+                                        allowed_emojis = ["👍", "❤️", "🔥", "👏", "😢", "🎉", "🤔", "💯"]
+
+                                    emoji = random.choice(allowed_emojis)
 
                                     msgs = await client.get_messages(entity, limit=5)
                                     if msgs:
@@ -673,6 +692,7 @@ async def _execute_plan_session(plan_id: int):
                         pass
 
                 # Логируем конец
+                # Логируем конец
                 logger.info(f"[plan][{phone}] ═══ Сессия {sess_num}/{total_sess} завершена: {done_actions}/{len(actions)} действий ═══")
                 await _safe_log(db,
                     task_id=None, account_id=acc.id,
@@ -680,6 +700,17 @@ async def _execute_plan_session(plan_id: int):
                     detail=f"Сессия завершена: {done_actions} действий (план день {plan.day_number})",
                     success=True, created_at=datetime.utcnow(),
                 )
+
+                # Обновляем счётчики WarmupTask если это прогрев
+                if plan.warmup_task_id:
+                    from models.warmup import WarmupTask
+                    wt = (await db.execute(
+                        select(WarmupTask).where(WarmupTask.id == plan.warmup_task_id)
+                    )).scalar_one_or_none()
+                    if wt:
+                        wt.actions_done = (wt.actions_done or 0) + done_actions
+                        wt.today_actions = (wt.today_actions or 0) + done_actions
+                        logger.info(f"[plan][{phone}] Обновлён WarmupTask #{wt.id}: +{done_actions} действий (всего {wt.actions_done})")
 
                 plan.executed_idx += 1
                 if plan.executed_idx >= len(sessions):
