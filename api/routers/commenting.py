@@ -544,7 +544,16 @@ async def get_comment_logs(
     """История всех комментариев. Можно фильтровать по campaign_id."""
     from models.campaign import CommentLog
 
-    query = select(CommentLog).join(Campaign).where(Campaign.user_id == current_user.id)
+    # Сначала получаем id всех кампаний пользователя
+    user_camps_r = await db.execute(
+        select(Campaign.id).where(Campaign.user_id == current_user.id)
+    )
+    user_camp_ids = [r[0] for r in user_camps_r.all()]
+
+    if not user_camp_ids:
+        return []
+
+    query = select(CommentLog).where(CommentLog.campaign_id.in_(user_camp_ids))
     if campaign_id:
         query = query.where(CommentLog.campaign_id == campaign_id)
     query = query.order_by(CommentLog.created_at.desc()).limit(limit)

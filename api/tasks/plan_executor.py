@@ -618,17 +618,30 @@ async def _execute_plan_session(plan_id: int):
 
                                     logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 💬 @{target_channel}: {comment_text[:60]}")
 
-                                    # CommentLog
+                                    # CommentLog — сразу коммитим чтобы не потерять при ошибке дальше
                                     if campaign:
-                                        campaign.comments_sent += 1
-                                        db.add(CommentLog(
-                                            campaign_id=campaign.id, account_id=acc.id,
-                                            account_phone=phone, channel_username=target_channel,
-                                            channel_title="", post_id=target_post.id,
-                                            post_text=post_text[:500],
-                                            comment_text=comment_text,
-                                            llm_provider=_val(campaign.llm_provider),
-                                        ))
+                                        try:
+                                            campaign.comments_sent += 1
+                                            db.add(CommentLog(
+                                                campaign_id=campaign.id, account_id=acc.id,
+                                                account_phone=phone, channel_username=target_channel,
+                                                channel_title="", post_id=target_post.id,
+                                                post_text=post_text[:500],
+                                                comment_text=comment_text,
+                                                llm_provider=_val(campaign.llm_provider),
+                                            ))
+                                            await db.flush()
+                                            await db.commit()
+                                            logger.info(f"[plan][{phone}] ✅ CommentLog #{campaign.comments_sent} записан в БД (камп {campaign.id})")
+                                        except Exception as log_err:
+                                            logger.error(f"[plan][{phone}] ❌ Ошибка записи CommentLog: {log_err}")
+                                            try: await db.rollback()
+                                            except: pass
+
+                                    # Логируем в warmup_logs тоже — чтобы видеть в активности
+                                    await _safe_log(db, task_id=None, account_id=acc.id, action="smart_comment",
+                                                     detail=f"💬 @{target_channel}: {comment_text[:80]}",
+                                                     channel=target_channel, success=True)
 
                                     done_actions += 1
 
