@@ -10,7 +10,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, desc
+from sqlalchemy import select, func, desc, delete as sa_delete
 
 from database import get_db
 from routers.deps import get_current_user
@@ -395,15 +395,21 @@ async def delete_warmup(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    from sqlalchemy import delete as sa_delete
+    from models.campaign_plan import CampaignPlan
+
     result = await db.execute(
         select(WarmupTask).where(WarmupTask.id == task_id, WarmupTask.user_id == current_user.id)
     )
     t = result.scalar_one_or_none()
     if t:
-        # Удаляем логи
-        await db.execute(
-            select(WarmupLog).where(WarmupLog.task_id == t.id)
-        )
+        # 1. Удаляем связанные планы
+        await db.execute(sa_delete(CampaignPlan).where(CampaignPlan.warmup_task_id == t.id))
+
+        # 2. Удаляем логи прогрева
+        await db.execute(sa_delete(WarmupLog).where(WarmupLog.task_id == t.id))
+
+        # 3. Удаляем саму задачу
         await db.delete(t)
         await db.flush()
 
@@ -445,7 +451,7 @@ async def get_warmup_logs(
         "channel": l.channel,
         "success": l.success,
         "error": l.error,
-        "created_at": l.created_at.isoformat(),
+        "created_at": l.created_at.isoformat() + "Z" if l.created_at else None,
     } for l in logs]
 
 
@@ -498,7 +504,7 @@ async def get_live_logs(
         "channel": l.channel,
         "success": l.success,
         "error": l.error,
-        "created_at": l.created_at.isoformat(),
+        "created_at": l.created_at.isoformat() + "Z" if l.created_at else None,
     } for l in logs]
 
 
@@ -528,6 +534,46 @@ async def get_warmup_plans(
         .order_by(CampaignPlan.plan_date)
     )
     plans = result.scalars().all()
+
+    # Автогенерация планов если задача running, но планов нет
+    if not plans and wt.status == "running":
+        from tasks.plan_generator import generate_daily_plan
+        from tasks.behavior_engine import assign_personality
+        from datetime import date, timedelta
+
+        acc = (await db.execute(
+            select(TelegramAccount).where(TelegramAccount.id == wt.account_id)
+        )).scalar_one_or_none()
+
+        total_days = getattr(wt, 'total_days', 7) or 7
+        personality = assign_personality(str(wt.account_id))
+
+        for day_num in range(1, total_days + 1):
+            plan_date = date.today() + timedelta(days=day_num - 1)
+            plan_data = generate_daily_plan(
+                account_id=wt.account_id,
+                phone=acc.phone if acc else str(wt.account_id),
+                campaign_channels=[],
+                campaign_id=0,
+                day_number=day_num,
+                comments_today=0,
+                personality=personality,
+            )
+            db.add(CampaignPlan(
+                campaign_id=None, warmup_task_id=wt.id,
+                account_id=wt.account_id, plan_date=plan_date,
+                day_number=day_num, plan=plan_data,
+                total_comments=0, executed_idx=0, status="active",
+            ))
+        await db.flush()
+        await db.commit()
+
+        # Перезагружаем
+        result = await db.execute(
+            select(CampaignPlan).where(CampaignPlan.warmup_task_id == task_id)
+            .order_by(CampaignPlan.plan_date)
+        )
+        plans = result.scalars().all()
 
     out = []
     for p in plans:
@@ -620,7 +666,7 @@ async def get_warmup_activity(
         "emoji": l.emoji or "",
         "success": l.success,
         "error": l.error,
-        "created_at": l.created_at.isoformat() if l.created_at else None,
+        "created_at": l.created_at.isoformat() + "Z" if l.created_at else None,
     } for l in all_logs[:limit]]
 @router.post("/batch/{batch_id}/start")
 async def start_batch(

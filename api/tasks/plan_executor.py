@@ -6,6 +6,11 @@ GramGPT — tasks/plan_executor.py
   dispatch_plans (<1с) → execute_plan_session(plan_id) × N параллельно
 
 Все импорты моделей — внутри функций (lazy import).
+
+ЗАЩИТА ОТ ОСИРОТЕВШИХ ПЛАНОВ:
+- dispatch_plans делает JOIN с WarmupTask/Campaign, фильтруя мёртвые
+- execute_plan_session перед выполнением проверяет что задача жива и running
+- Если задача удалена/остановлена — план помечается как orphan и не выполняется
 """
 
 import asyncio
@@ -34,7 +39,6 @@ async def _safe_log(db, **kwargs):
     """Логирует в warmup_logs без краша. Если ошибка — пропускает."""
     try:
         from models.warmup_log import WarmupLog
-        # source по умолчанию 'warmup', проставим если явно передано
         if 'source' not in kwargs:
             kwargs['source'] = 'warmup'
         db.add(WarmupLog(**kwargs))
@@ -55,24 +59,23 @@ def _val(x):
 # ═══════════════════════════════════════════════════════════
 
 async def _dispatch_plans():
-    """
-    Лёгкий (<1с): находит campaign_plans с сессиями которые пора выполнить.
-    Для каждой → отдельная Celery задача.
-    """
+    """Лёгкий (<1с): находит campaign_plans с сессиями которые пора выполнить."""
     if API_DIR not in sys.path:
         sys.path.insert(0, API_DIR)
 
     from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-    from sqlalchemy import select
+    from sqlalchemy import select, delete as sa_delete
     from config import DATABASE_URL
     from models.campaign_plan import CampaignPlan
     from models.campaign import Campaign, CampaignStatus
+    from models.warmup import WarmupTask
 
     engine = create_async_engine(DATABASE_URL, pool_size=2, max_overflow=0)
     Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 
     dispatched = 0
     skipped = 0
+    cleaned = 0
 
     try:
         async with Session() as db:
@@ -82,9 +85,34 @@ async def _dispatch_plans():
             current_hour = local_now.hour
             current_minute = local_now.minute
 
-            # Только сегодняшние активные планы
-            from models.campaign import Campaign, CampaignStatus
-            result = await db.execute(
+            # ═══ САНИТАРИЯ: удалить осиротевшие планы ═══
+            # Планы без живой кампании
+            orphan_camp = await db.execute(
+                sa_delete(CampaignPlan).where(
+                    CampaignPlan.campaign_id != None,
+                    CampaignPlan.campaign_id.notin_(select(Campaign.id)),
+                )
+            )
+            if orphan_camp.rowcount:
+                cleaned += orphan_camp.rowcount
+                logger.warning(f"[plan_dispatch] Удалено осиротевших campaign-планов: {orphan_camp.rowcount}")
+
+            # Планы без живой warmup_task
+            orphan_wt = await db.execute(
+                sa_delete(CampaignPlan).where(
+                    CampaignPlan.warmup_task_id != None,
+                    CampaignPlan.warmup_task_id.notin_(select(WarmupTask.id)),
+                )
+            )
+            if orphan_wt.rowcount:
+                cleaned += orphan_wt.rowcount
+                logger.warning(f"[plan_dispatch] Удалено осиротевших warmup-планов: {orphan_wt.rowcount}")
+
+            if cleaned > 0:
+                await db.commit()
+
+            # ═══ COMMENTING планы: только для active кампаний ═══
+            comm_result = await db.execute(
                 select(CampaignPlan)
                 .join(Campaign, Campaign.id == CampaignPlan.campaign_id)
                 .where(
@@ -93,17 +121,22 @@ async def _dispatch_plans():
                     Campaign.status == CampaignStatus.active,
                 )
             )
-            plans = result.scalars().all()
+            plans = list(comm_result.scalars().all())
+
+            # ═══ WARMUP планы: только для running задач ═══
             warmup_result = await db.execute(
-                select(CampaignPlan).where(
+                select(CampaignPlan)
+                .join(WarmupTask, WarmupTask.id == CampaignPlan.warmup_task_id)
+                .where(
                     CampaignPlan.plan_date == today,
                     CampaignPlan.status == "active",
                     CampaignPlan.campaign_id == None,
                     CampaignPlan.warmup_task_id != None,
+                    WarmupTask.status == "running",
                 )
             )
-            warmup_plans = warmup_result.scalars().all()
-            plans = list(plans) + list(warmup_plans)
+            warmup_plans = list(warmup_result.scalars().all())
+            plans.extend(warmup_plans)
 
             for plan in plans:
                 sessions = plan.plan.get("sessions", [])
@@ -114,7 +147,6 @@ async def _dispatch_plans():
 
                 next_session = sessions[plan.executed_idx]
 
-                # Пропущенная сессия?
                 if next_session.get("skipped"):
                     plan.executed_idx += 1
                     logger.info(f"[plan] Пропуск сессии #{plan.executed_idx} (акк {plan.account_id}): {next_session.get('skip_reason', '?')}")
@@ -123,7 +155,6 @@ async def _dispatch_plans():
                     skipped += 1
                     continue
 
-                # Пора?
                 sess_hour = next_session.get("connect_at_hour", 0)
                 sess_min = next_session.get("connect_at_minute", 0)
 
@@ -152,7 +183,8 @@ async def _dispatch_plans():
                     queue="ai_dialogs",
                 )
                 dispatched += 1
-            from models.campaign import Campaign, CampaignStatus
+
+            # ═══ AUTO-CLOSE кампаний ═══
             from sqlalchemy import func
             active_campaigns = (await db.execute(
                 select(Campaign).where(Campaign.status == CampaignStatus.active)
@@ -165,18 +197,15 @@ async def _dispatch_plans():
 
                 # 1. Время истекло?
                 if camp.started_at and camp.max_hours and camp.max_hours > 0:
-                    # Нормализуем — убираем tzinfo если есть
                     started = camp.started_at
                     if hasattr(started, 'tzinfo') and started.tzinfo is not None:
                         started = started.replace(tzinfo=None)
                     now_utc = datetime.utcnow()
                     delta = now_utc - started
                     elapsed_sec = delta.total_seconds()
-                    logger.info(f"[autoclose]   DEBUG: now={now_utc}, started={started}, delta={delta}, elapsed_sec={elapsed_sec}")
 
-                    # Защита от отрицательных значений (если started_at в будущем)
                     if elapsed_sec < 0:
-                        logger.warning(f"[autoclose]   camp {camp.id}: started_at В БУДУЩЕМ! ({started} > {now_utc}) — пропуск")
+                        logger.warning(f"[autoclose]   camp {camp.id}: started_at В БУДУЩЕМ! — пропуск")
                         continue
 
                     elapsed_hours = elapsed_sec / 3600
@@ -220,15 +249,14 @@ async def _dispatch_plans():
                         logger.info(f"[autoclose] Кампания {camp.id} → finished (все планы выполнены)")
 
             await db.commit()
-            logger.info(f"[plan_dispatch] Отправлено {dispatched}, пропущено {skipped}")
+            logger.info(f"[plan_dispatch] Отправлено {dispatched}, пропущено {skipped}, очищено {cleaned}")
 
     except Exception as e:
         logger.error(f"[plan_dispatch] Ошибка: {e}")
     finally:
         await engine.dispose()
 
-
-    return {"dispatched": dispatched, "skipped": skipped}
+    return {"dispatched": dispatched, "skipped": skipped, "cleaned": cleaned}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -236,14 +264,7 @@ async def _dispatch_plans():
 # ═══════════════════════════════════════════════════════════
 
 async def _execute_plan_session(plan_id: int):
-    """
-    Выполняет одну сессию из плана:
-    1. Загружает plan из БД
-    2. Берёт текущую сессию (executed_idx)
-    3. Подключает аккаунт через прокси
-    4. Выполняет каждое действие по списку
-    5. Обновляет executed_idx
-    """
+    """Выполняет одну сессию из плана."""
     if API_DIR not in sys.path:
         sys.path.insert(0, API_DIR)
 
@@ -256,6 +277,7 @@ async def _execute_plan_session(plan_id: int):
     from models.account import TelegramAccount
     from models.proxy import Proxy
     from models.warmup_log import WarmupLog
+    from models.warmup import WarmupTask
     from utils.telegram import make_telethon_client
     from utils.account_lock import acquire_account_lock, release_account_lock
     from services.llm import generate_comment, build_comment_prompt
@@ -271,12 +293,44 @@ async def _execute_plan_session(plan_id: int):
                 select(CampaignPlan).where(CampaignPlan.id == plan_id)
             )).scalar_one_or_none()
 
-            if not plan or plan.status != "active":
-                return {"status": "skip", "reason": "not active"}
+            if not plan:
+                logger.warning(f"[plan_executor] Plan #{plan_id} не найден — пропуск")
+                return {"status": "plan_not_found"}
+
+            if plan.status != "active":
+                logger.info(f"[plan_executor] Plan #{plan_id} status={plan.status} — пропуск")
+                return {"status": "not_active"}
 
             # Определяем тип плана: warmup или commenting
             plan_source = 'warmup' if plan.warmup_task_id else 'commenting'
             plan_campaign_id = plan.campaign_id if not plan.warmup_task_id else None
+
+            # ═══ ПРОВЕРКА ЖИВОСТИ СВЯЗАННОЙ ЗАДАЧИ ═══
+            if plan.warmup_task_id:
+                wt = (await db.execute(
+                    select(WarmupTask).where(WarmupTask.id == plan.warmup_task_id)
+                )).scalar_one_or_none()
+                if not wt:
+                    logger.warning(f"[plan_executor] Plan #{plan_id} — WarmupTask {plan.warmup_task_id} УДАЛЕНА. Удаляем план.")
+                    await db.delete(plan)
+                    await db.commit()
+                    return {"status": "orphan_warmup_task"}
+                if wt.status != "running":
+                    logger.info(f"[plan_executor] Plan #{plan_id} — WarmupTask {plan.warmup_task_id} status={wt.status}, пропуск")
+                    return {"status": "warmup_not_running"}
+            elif plan.campaign_id:
+                camp = (await db.execute(
+                    select(Campaign).where(Campaign.id == plan.campaign_id)
+                )).scalar_one_or_none()
+                if not camp:
+                    logger.warning(f"[plan_executor] Plan #{plan_id} — Campaign {plan.campaign_id} УДАЛЕНА. Удаляем план.")
+                    await db.delete(plan)
+                    await db.commit()
+                    return {"status": "orphan_campaign"}
+                if _val(camp.status) != "active":
+                    logger.info(f"[plan_executor] Plan #{plan_id} — Campaign {plan.campaign_id} status={_val(camp.status)}, пропуск")
+                    return {"status": "campaign_not_active"}
+
             logger.info(f"[plan_executor] Plan #{plan_id} тип: {plan_source.upper()}")
 
             sessions = plan.plan.get("sessions", [])
@@ -305,13 +359,11 @@ async def _execute_plan_session(plan_id: int):
             if not check_connection_limit(plan.account_id):
                 return {"status": "daily_limit"}
 
-            # ── Acquire lock ──
             if not acquire_account_lock(plan.account_id, ttl=1800):
                 logger.info(f"[plan] Аккаунт {plan.account_id} занят (lock) — пропуск")
                 return {"status": "locked"}
 
             try:
-                # ── Аккаунт + прокси ─────────────────────
                 acc = (await db.execute(
                     select(TelegramAccount).options(joinedload(TelegramAccount.api_app))
                     .where(TelegramAccount.id == plan.account_id)
@@ -334,14 +386,12 @@ async def _execute_plan_session(plan_id: int):
                     await db.commit()
                     return {"status": "no_client"}
 
-                # ── Кампания ──────────────────────────────
                 campaign = None
                 if plan.campaign_id:
                     campaign = (await db.execute(
                         select(Campaign).where(Campaign.id == plan.campaign_id)
                     )).scalar_one_or_none()
 
-                # ── Подключаемся ──────────────────────────
                 phone = acc.phone
                 done_actions = 0
                 sess_num = plan.executed_idx + 1
@@ -350,7 +400,6 @@ async def _execute_plan_session(plan_id: int):
 
                 logger.info(f"[plan][{phone}] ═══ Сессия {sess_num}/{total_sess} (день {plan.day_number}, {mood}) ═══")
 
-                # Логируем начало
                 await _safe_log(db, task_id=None, account_id=acc.id, action="session_start",
                                  detail=f"Старт сессии {sess_num}/{total_sess} (день {plan.day_number}, {mood})",
                                  success=True, source=plan_source, campaign_id=plan_campaign_id)
@@ -369,7 +418,6 @@ async def _execute_plan_session(plan_id: int):
 
                     logger.info(f"[plan][{phone}] Подключен, {len(actions)} действий")
 
-                    # ── Выполняем действия ────────────────
                     for action_num, action in enumerate(actions, 1):
                         try:
                             action_type = action.get("type", "")
@@ -423,7 +471,7 @@ async def _execute_plan_session(plan_id: int):
 
                             elif action_type == "set_reaction":
                                 try:
-                                    from telethon.tl.functions.messages import SendReactionRequest, GetMessagesReactionsRequest
+                                    from telethon.tl.functions.messages import SendReactionRequest
                                     from telethon.tl.types import ReactionEmoji
                                     from telethon.tl.functions.channels import GetFullChannelRequest
                                     channel_name = action.get("channel")
@@ -437,7 +485,6 @@ async def _execute_plan_session(plan_id: int):
                                             continue
                                         entity = random.choice(channels)
 
-                                    # Узнаём разрешённые реакции на канале
                                     allowed_emojis = []
                                     try:
                                         full = await client(GetFullChannelRequest(entity))
@@ -449,7 +496,6 @@ async def _execute_plan_session(plan_id: int):
                                     except Exception:
                                         pass
 
-                                    # Если не удалось — используем стандартные безопасные
                                     if not allowed_emojis:
                                         allowed_emojis = ["👍", "❤️", "🔥", "👏", "😢", "🎉", "🤔", "💯"]
 
@@ -557,7 +603,6 @@ async def _execute_plan_session(plan_id: int):
 
                                 try:
                                     entity = await client.get_entity(target_channel)
-                                    # Читаем последние посты
                                     posts = await client.get_messages(entity, limit=random.randint(3, 8))
                                     for p in posts:
                                         await client.send_read_acknowledge(entity, p)
@@ -566,11 +611,9 @@ async def _execute_plan_session(plan_id: int):
                                     if not posts:
                                         continue
 
-                                    # Берём самый свежий пост
                                     target_post = posts[0]
                                     post_text = target_post.message or ""
 
-                                    # Typing
                                     typing_dur = action.get("pause_before", random.randint(2, 20))
                                     logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] ⌨️ Typing {typing_dur}с в @{target_channel}")
                                     try:
@@ -583,7 +626,6 @@ async def _execute_plan_session(plan_id: int):
                                         pass
                                     await asyncio.sleep(typing_dur)
 
-                                    # Abort? (5-15%)
                                     if random.random() < random.uniform(0.05, 0.15):
                                         logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 🚫 Передумал комментировать @{target_channel}")
                                         await _safe_log(db, task_id=None, account_id=acc.id, action="smart_comment",
@@ -593,7 +635,6 @@ async def _execute_plan_session(plan_id: int):
                                         done_actions += 1
                                         continue
 
-                                    # Генерируем комментарий
                                     style_profile = assign_style_profile(phone)
                                     prompt = build_comment_prompt(post_text, style_profile, plan.plan)
                                     provider = plan.plan.get("personality_data", {}).get("llm_provider", "groq")
@@ -605,10 +646,8 @@ async def _execute_plan_session(plan_id: int):
                                         logger.warning(f"[plan][{phone}]   [{action_num}/{len(actions)}] ❌ LLM вернул пустой ответ")
                                         continue
 
-                                    # Отправляем
                                     await client.send_message(entity=entity, message=comment_text, comment_to=target_post.id)
 
-                                    # Статистика: успешный коммент
                                     try:
                                         from models.channel_ban_stats import ChannelBanStats
                                         st = (await db.execute(
@@ -631,7 +670,6 @@ async def _execute_plan_session(plan_id: int):
 
                                     logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 💬 @{target_channel}: {comment_text[:60]}")
 
-                                    # CommentLog — сразу коммитим чтобы не потерять при ошибке дальше
                                     if campaign:
                                         try:
                                             campaign.comments_sent += 1
@@ -651,7 +689,6 @@ async def _execute_plan_session(plan_id: int):
                                             try: await db.rollback()
                                             except: pass
 
-                                    # Логируем в warmup_logs тоже — чтобы видеть в активности
                                     await _safe_log(db, task_id=None, account_id=acc.id, action="smart_comment",
                                                      detail=f"💬 @{target_channel}: {comment_text[:80]}",
                                                      channel=target_channel, success=True,
@@ -663,7 +700,6 @@ async def _execute_plan_session(plan_id: int):
                                     err = str(e)
                                     logger.warning(f"[plan][{phone}]   [{action_num}/{len(actions)}] ❌ comment error: {err[:100]}")
 
-                                    # Статистика: определяем это бан или нет
                                     ban_errors = [
                                         "YOU_BLOCKED", "USER_BANNED", "CHAT_WRITE_FORBIDDEN",
                                         "USER_RESTRICTED", "BANNED_RIGHTS", "USER_BLOCKED",
@@ -741,11 +777,9 @@ async def _execute_plan_session(plan_id: int):
                                 except Exception:
                                     pass
 
-                            # Пауза после действия
                             pause = action.get("pause_after", random.randint(3, 30))
                             await asyncio.sleep(pause)
 
-                            # Коммитим логи после каждого действия
                             await db.flush()
 
                         except Exception as e:
@@ -774,7 +808,6 @@ async def _execute_plan_session(plan_id: int):
                     except:
                         pass
 
-                # Логируем конец
                 logger.info(f"[plan][{phone}] ═══ Сессия {sess_num}/{total_sess} завершена: {done_actions}/{len(actions)} действий ═══")
                 await _safe_log(db,
                     task_id=None, account_id=acc.id,
@@ -786,7 +819,6 @@ async def _execute_plan_session(plan_id: int):
 
                 # Обновляем счётчики WarmupTask ТОЛЬКО если это прогрев
                 if plan.warmup_task_id and plan_source == 'warmup':
-                    from models.warmup import WarmupTask
                     wt = (await db.execute(
                         select(WarmupTask).where(WarmupTask.id == plan.warmup_task_id)
                     )).scalar_one_or_none()
@@ -822,13 +854,15 @@ async def _execute_plan_session(plan_id: int):
 # CELERY TASKS
 # ═══════════════════════════════════════════════════════════
 
-@celery_app.task(bind=True, name="tasks.plan_executor.dispatch_plans")
+@celery_app.task(bind=True, name="tasks.plan_executor.dispatch_plans",
+                 acks_late=False, reject_on_worker_lost=False)
 def dispatch_plans(self):
     """Диспетчер планов (<1с)."""
     return run_async(_dispatch_plans())
 
 
-@celery_app.task(bind=True, name="tasks.plan_executor.execute_plan_session")
+@celery_app.task(bind=True, name="tasks.plan_executor.execute_plan_session",
+                 acks_late=False, reject_on_worker_lost=False)
 def execute_plan_session(self, plan_id: int):
     """Одна сессия одного аккаунта — параллельно."""
     return run_async(_execute_plan_session(plan_id))

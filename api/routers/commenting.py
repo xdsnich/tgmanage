@@ -571,7 +571,7 @@ async def get_comment_logs(
         "post_text": l.post_text[:200],
         "comment_text": l.comment_text,
         "llm_provider": l.llm_provider,
-        "created_at": l.created_at.isoformat(),
+        "created_at": l.created_at.isoformat() + "Z" if l.created_at else None,
     } for l in logs]
 
 
@@ -685,7 +685,7 @@ async def get_campaign_activity(
             "steps": steps,
             "scheduled_at": q.scheduled_at.isoformat() + "Z" if q.scheduled_at else None,
             "executed_at": q.executed_at.isoformat() + "Z" if q.executed_at else None,
-            "created_at": q.created_at.isoformat() + "Z",
+            "created_at": q.created_at.isoformat() + "Z" if q.executed_at else None,
             "sort_time": (q.executed_at or q.created_at).isoformat(),
         })
 
