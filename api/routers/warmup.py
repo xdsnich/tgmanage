@@ -427,7 +427,10 @@ async def get_warmup_logs(
 
     result = await db.execute(
         select(WarmupLog)
-        .where(WarmupLog.task_id == task_id)
+        .where(
+            WarmupLog.task_id == task_id,
+            (WarmupLog.source == 'warmup') | (WarmupLog.source == None),
+        )
         .order_by(desc(WarmupLog.created_at))
         .limit(limit)
     )
@@ -464,7 +467,10 @@ async def get_live_logs(
 
     result = await db.execute(
         select(WarmupLog)
-        .where(WarmupLog.task_id.in_(task_ids))
+        .where(
+            WarmupLog.task_id.in_(task_ids),
+            (WarmupLog.source == 'warmup') | (WarmupLog.source == None),
+        )
         .order_by(desc(WarmupLog.created_at))
         .limit(limit)
     )
@@ -566,18 +572,22 @@ async def get_warmup_activity(
     started_at = wt.started_at or wt.created_at or datetime.utcnow()
 
     # Логи от plan_executor (task_id=NULL) для этого аккаунта, СОЗДАННЫЕ ПОСЛЕ старта задачи
+    # Только логи warmup для этого аккаунта (исключаем commenting)
     plan_logs = (await db.execute(
         select(WarmupLog).where(
             WarmupLog.account_id == wt.account_id,
             WarmupLog.task_id == None,
             WarmupLog.created_at >= started_at,
+            # Только warmup-логи (NULL = старые записи до миграции, считаем warmup)
+            (WarmupLog.source == 'warmup') | (WarmupLog.source == None),
         ).order_by(WarmupLog.created_at.desc()).limit(limit)
     )).scalars().all()
 
-    # Старые логи от warmup_v2 (по task_id)
+    # Старые логи от warmup_v2 (по task_id) — тоже с фильтром
     old_logs = (await db.execute(
         select(WarmupLog).where(
-            WarmupLog.task_id == task_id
+            WarmupLog.task_id == task_id,
+            (WarmupLog.source == 'warmup') | (WarmupLog.source == None),
         ).order_by(WarmupLog.created_at.desc()).limit(limit)
     )).scalars().all()
 

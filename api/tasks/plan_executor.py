@@ -34,6 +34,9 @@ async def _safe_log(db, **kwargs):
     """Логирует в warmup_logs без краша. Если ошибка — пропускает."""
     try:
         from models.warmup_log import WarmupLog
+        # source по умолчанию 'warmup', проставим если явно передано
+        if 'source' not in kwargs:
+            kwargs['source'] = 'warmup'
         db.add(WarmupLog(**kwargs))
         await db.flush()
     except Exception:
@@ -272,6 +275,11 @@ async def _execute_plan_session(plan_id: int):
             if not plan or plan.status != "active":
                 return {"status": "skip", "reason": "not active"}
 
+            # Определяем тип плана: warmup или commenting
+            plan_source = 'warmup' if plan.warmup_task_id else 'commenting'
+            plan_campaign_id = plan.campaign_id if not plan.warmup_task_id else None
+            logger.info(f"[plan_executor] Plan #{plan_id} тип: {plan_source.upper()}")
+
             sessions = plan.plan.get("sessions", [])
             if plan.executed_idx >= len(sessions):
                 plan.status = "done"
@@ -344,12 +352,9 @@ async def _execute_plan_session(plan_id: int):
                 logger.info(f"[plan][{phone}] ═══ Сессия {sess_num}/{total_sess} (день {plan.day_number}, {mood}) ═══")
 
                 # Логируем начало
-                await _safe_log(db,
-                    task_id=None, account_id=acc.id,
-                    action="session_start",
-                    detail=f"План день {plan.day_number}, сессия {sess_num}/{total_sess} ({mood})",
-                    success=True, created_at=datetime.utcnow(),
-                )
+                await _safe_log(db, task_id=None, account_id=acc.id, action="...",
+                 detail="...", channel=..., success=True,
+                 source=plan_source, campaign_id=plan_campaign_id)
 
                 try:
                     await client.connect()
@@ -357,8 +362,9 @@ async def _execute_plan_session(plan_id: int):
                     if not await client.is_user_authorized():
                         plan.executed_idx += 1
                         logger.warning(f"[plan][{phone}] Не авторизован")
-                        await _safe_log(db, task_id=None, account_id=acc.id, action="error",
-                                         detail="Не авторизован", success=False)
+                        await _safe_log(db, task_id=None, account_id=acc.id, action="...",
+                 detail="...", channel=..., success=True,
+                 source=plan_source, campaign_id=plan_campaign_id)
                         await db.commit()
                         return {"status": "not_authorized"}
 
@@ -395,9 +401,9 @@ async def _execute_plan_session(plan_id: int):
 
                                     name = channel_name or getattr(entity, 'name', '?') or getattr(entity, 'title', '?')
                                     logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 📖 Прочитал {len(msgs)} постов в «{name}»")
-                                    await _safe_log(db, task_id=None, account_id=acc.id, action="read_feed",
-                                                     detail=f"Прочитал {len(msgs)} в «{name}»",
-                                                     channel=str(name), success=True)
+                                    await _safe_log(db, task_id=None, account_id=acc.id, action="...",
+                 detail="...", channel=..., success=True,
+                 source=plan_source, campaign_id=plan_campaign_id)
                                     done_actions += 1
                                 except Exception as e:
                                     logger.warning(f"[plan][{phone}]   [{action_num}/{len(actions)}] 📖 read_feed ошибка: {e}")
@@ -408,8 +414,9 @@ async def _execute_plan_session(plan_id: int):
                                     await client(GetAllReadPeerStoriesRequest())
                                     count = action.get("count", 3)
                                     logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 👁 Stories ({count})")
-                                    await _safe_log(db, task_id=None, account_id=acc.id, action="view_stories",
-                                                     detail=f"Просмотрел stories ({count})", success=True)
+                                    await _safe_log(db, task_id=None, account_id=acc.id, action="...",
+                 detail="...", channel=..., success=True,
+                 source=plan_source, campaign_id=plan_campaign_id)
                                     done_actions += 1
                                 except Exception:
                                     pass
@@ -457,9 +464,9 @@ async def _execute_plan_session(plan_id: int):
                                         ))
                                         name = channel_name or getattr(entity, 'name', '?') or getattr(entity, 'title', '?')
                                         logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 😍 Реакция {emoji} в «{name}»")
-                                        await _safe_log(db, task_id=None, account_id=acc.id, action="set_reaction",
-                                                         detail=f"Поставил {emoji} в «{name}»",
-                                                         channel=str(name), success=True)
+                                        await _safe_log(db, task_id=None, account_id=acc.id, action="...",
+                 detail="...", channel=..., success=True,
+                 source=plan_source, campaign_id=plan_campaign_id)
                                         done_actions += 1
                                 except Exception as e:
                                     logger.warning(f"[plan][{phone}]   [{action_num}/{len(actions)}] 😍 reaction ошибка: {e}")
@@ -473,8 +480,9 @@ async def _execute_plan_session(plan_id: int):
                                         from telethon.tl.functions.users import GetFullUserRequest
                                         await client(GetFullUserRequest(u.input_entity))
                                         logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 👤 Профиль «{u.name or '?'}»")
-                                        await _safe_log(db, task_id=None, account_id=acc.id, action="view_profile",
-                                                         detail=f"Просмотрел профиль «{u.name or '?'}»", success=True)
+                                        await _safe_log(db, task_id=None, account_id=acc.id, action="...",
+                 detail="...", channel=..., success=True,
+                 source=plan_source, campaign_id=plan_campaign_id)
                                         done_actions += 1
                                 except Exception:
                                     pass
@@ -486,8 +494,9 @@ async def _execute_plan_session(plan_id: int):
                                     term = random.choice(terms)
                                     await client(SearchRequest(q=term, limit=5))
                                     logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 🔍 Поиск «{term}»")
-                                    await _safe_log(db, task_id=None, account_id=acc.id, action="search",
-                                                     detail=f"Поиск «{term}»", success=True)
+                                    await _safe_log(db, task_id=None, account_id=acc.id, action="...",
+                 detail="...", channel=..., success=True,
+                 source=plan_source, campaign_id=plan_campaign_id)
                                     done_actions += 1
                                 except Exception:
                                     pass
@@ -498,8 +507,9 @@ async def _execute_plan_session(plan_id: int):
                                     me = await client.get_me()
                                     await client.send_message(me, text)
                                     logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 💬 Saved: {text}")
-                                    await _safe_log(db, task_id=None, account_id=acc.id, action="send_saved",
-                                                     detail=f"Saved: {text}", success=True)
+                                    await _safe_log(db, task_id=None, account_id=acc.id, action="...",
+                 detail="...", channel=..., success=True,
+                 source=plan_source, campaign_id=plan_campaign_id)
                                     done_actions += 1
                                 except Exception:
                                     pass
@@ -515,8 +525,9 @@ async def _execute_plan_session(plan_id: int):
                                             me = await client.get_me()
                                             await client.forward_messages(me, msgs[0])
                                             logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 💾 Переслал из «{ch.name or '?'}»")
-                                            await _safe_log(db, task_id=None, account_id=acc.id, action="forward_saved",
-                                                             detail=f"Переслал из «{ch.name or '?'}»", success=True)
+                                            await _safe_log(db, task_id=None, account_id=acc.id, action="...",
+                 detail="...", channel=..., success=True,
+                 source=plan_source, campaign_id=plan_campaign_id)
                                             done_actions += 1
                                 except Exception:
                                     pass
@@ -531,8 +542,9 @@ async def _execute_plan_session(plan_id: int):
                                         for m in msgs:
                                             await client.send_read_acknowledge(u, m)
                                         logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] ↩️ Прочитал ЛС от «{u.name or '?'}»")
-                                        await _safe_log(db, task_id=None, account_id=acc.id, action="reply_dm",
-                                                         detail=f"Прочитал ЛС от «{u.name or '?'}»", success=True)
+                                        await _safe_log(db, task_id=None, account_id=acc.id, action="...",
+                 detail="...", channel=..., success=True,
+                 source=plan_source, campaign_id=plan_campaign_id)
                                         done_actions += 1
                                 except Exception:
                                     pass
@@ -573,9 +585,9 @@ async def _execute_plan_session(plan_id: int):
                                     # Abort? (5-15%)
                                     if random.random() < random.uniform(0.05, 0.15):
                                         logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 🚫 Передумал комментировать @{target_channel}")
-                                        await _safe_log(db, task_id=None, account_id=acc.id, action="smart_comment",
-                                                         detail=f"Передумал комментировать @{target_channel}",
-                                                         channel=target_channel, success=True)
+                                        await _safe_log(db, task_id=None, account_id=acc.id, action="...",
+                 detail="...", channel=..., success=True,
+                 source=plan_source, campaign_id=plan_campaign_id)
                                         done_actions += 1
                                         continue
 
@@ -639,9 +651,9 @@ async def _execute_plan_session(plan_id: int):
                                             except: pass
 
                                     # Логируем в warmup_logs тоже — чтобы видеть в активности
-                                    await _safe_log(db, task_id=None, account_id=acc.id, action="smart_comment",
-                                                     detail=f"💬 @{target_channel}: {comment_text[:80]}",
-                                                     channel=target_channel, success=True)
+                                    await _safe_log(db, task_id=None, account_id=acc.id, action="...",
+                 detail="...", channel=..., success=True,
+                 source=plan_source, campaign_id=plan_campaign_id)
 
                                     done_actions += 1
 
@@ -681,9 +693,9 @@ async def _execute_plan_session(plan_id: int):
                                         except Exception as se:
                                             logger.warning(f"[stats] Ошибка записи бана: {se}")
 
-                                    await _safe_log(db, task_id=None, account_id=acc.id, action="smart_comment",
-                                                     detail=f"Ошибка: {err[:100]}", channel=target_channel,
-                                                     success=False, error=err[:200])
+                                    await _safe_log(db, task_id=None, account_id=acc.id, action="...",
+                 detail="...", channel=..., success=True,
+                 source=plan_source, campaign_id=plan_campaign_id)
 
                                     import re as _re
                                     if "FLOOD_WAIT" in err:
@@ -705,8 +717,9 @@ async def _execute_plan_session(plan_id: int):
                                     ch = random.choice(popular)
                                     await client(JoinChannelRequest(ch))
                                     logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 📢 Подписался на @{ch}")
-                                    await _safe_log(db, task_id=None, account_id=acc.id, action="join_channel",
-                                                     detail=f"Подписался на @{ch}", channel=ch, success=True)
+                                    await _safe_log(db, task_id=None, account_id=acc.id, action="...",
+                 detail="...", channel=..., success=True,
+                 source=plan_source, campaign_id=plan_campaign_id)
                                     done_actions += 1
                                 except Exception:
                                     pass
@@ -748,8 +761,9 @@ async def _execute_plan_session(plan_id: int):
 
                 except Exception as e:
                     logger.error(f"[plan][{phone}] Session error: {e}")
-                    await _safe_log(db, task_id=None, account_id=acc.id, action="error",
-                                     detail=f"Ошибка сессии: {str(e)[:200]}", success=False)
+                    await _safe_log(db, task_id=None, account_id=acc.id, action="...",
+                 detail="...", channel=..., success=True,
+                 source=plan_source, campaign_id=plan_campaign_id)
                 finally:
                     try:
                         await client.disconnect()
@@ -759,15 +773,13 @@ async def _execute_plan_session(plan_id: int):
                 # Логируем конец
                 # Логируем конец
                 logger.info(f"[plan][{phone}] ═══ Сессия {sess_num}/{total_sess} завершена: {done_actions}/{len(actions)} действий ═══")
-                await _safe_log(db,
-                    task_id=None, account_id=acc.id,
-                    action="session_end",
-                    detail=f"Сессия завершена: {done_actions} действий (план день {plan.day_number})",
-                    success=True, created_at=datetime.utcnow(),
-                )
+                await _safe_log(db, task_id=None, account_id=acc.id, action="...",
+                 detail="...", channel=..., success=True,
+                 source=plan_source, campaign_id=plan_campaign_id)
 
                 # Обновляем счётчики WarmupTask если это прогрев
-                if plan.warmup_task_id:
+                # Обновляем счётчики WarmupTask ТОЛЬКО для warmup-сессий
+                if plan.warmup_task_id and plan_source == 'warmup':
                     from models.warmup import WarmupTask
                     wt = (await db.execute(
                         select(WarmupTask).where(WarmupTask.id == plan.warmup_task_id)
@@ -775,7 +787,9 @@ async def _execute_plan_session(plan_id: int):
                     if wt:
                         wt.actions_done = (wt.actions_done or 0) + done_actions
                         wt.today_actions = (wt.today_actions or 0) + done_actions
-                        logger.info(f"[plan][{phone}] Обновлён WarmupTask #{wt.id}: +{done_actions} действий (всего {wt.actions_done})")
+                        logger.info(f"[plan][{phone}] ✅ Обновлён WarmupTask #{wt.id}: +{done_actions} действий (всего {wt.actions_done})")
+                elif plan.campaign_id and plan_source == 'commenting':
+                    logger.info(f"[plan][{phone}] 📝 Commenting сессия — WarmupTask НЕ трогаем (actions: {done_actions})")
 
                 plan.executed_idx += 1
                 if plan.executed_idx >= len(sessions):

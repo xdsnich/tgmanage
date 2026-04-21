@@ -607,20 +607,21 @@ async def get_campaign_activity(
     # Логи от plan_executor имеют task_id=NULL, ищем по account_id
     account_ids = c.account_ids or []
     
+    # ТОЛЬКО логи комментинга — по source='commenting' ИЛИ по campaign_id=этой кампании
     warmup_logs = []
     if account_ids:
-        # Логи с task_id=NULL (от plan_executor) для аккаунтов кампании
-        plan_logs_result = await db.execute(
+        commenting_logs_result = await db.execute(
             select(WarmupLog)
             .where(
                 WarmupLog.account_id.in_(account_ids),
-                WarmupLog.task_id == None,
                 WarmupLog.created_at >= (c.started_at or c.created_at),
+                # Явная привязка к кампании ИЛИ помечено как commenting
+                (WarmupLog.campaign_id == c.id) | (WarmupLog.source == 'commenting'),
             )
             .order_by(WarmupLog.created_at.desc())
             .limit(limit)
         )
-        warmup_logs.extend(plan_logs_result.scalars().all())
+        warmup_logs.extend(commenting_logs_result.scalars().all())
     
     # Логи от warmup_v2 (с task_id через warmup_tasks)
     wt_result = await db.execute(

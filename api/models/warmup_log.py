@@ -25,6 +25,8 @@ class WarmupLog(Base):
     success:     Mapped[bool]             = mapped_column(Boolean, default=True)
     error:       Mapped[Optional[str]]    = mapped_column(Text, nullable=True)
     created_at:  Mapped[datetime]         = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    source:      Mapped[str]              = mapped_column(String(32), default="warmup", index=True)  # warmup | commenting
+    campaign_id: Mapped[Optional[int]]    = mapped_column(Integer, nullable=True, index=True)
 
     def __repr__(self):
         return f"<WarmupLog task={self.task_id} action={self.action} ok={self.success}>"

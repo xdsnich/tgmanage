@@ -1,18 +1,16 @@
-"""Добавить batch_id для группировки задач прогрева"""
-import asyncio
-import sys, os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy import text
-from config import DATABASE_URL
+"""Миграция 010: Warmup batch — группировка задач прогрева"""
 
-async def migrate():
-    engine = create_async_engine(DATABASE_URL)
-    async with engine.begin() as conn:
-        await conn.execute(text("ALTER TABLE warmup_tasks ADD COLUMN IF NOT EXISTS batch_id VARCHAR(32) NULL"))
-        await conn.execute(text("ALTER TABLE warmup_tasks ADD COLUMN IF NOT EXISTS batch_name VARCHAR(128) NULL"))
-        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_warmup_batch ON warmup_tasks (batch_id)"))
-        print("Done!")
-    await engine.dispose()
+MIGRATION_ID = "010"
+DESCRIPTION = "WarmupTask: batch_id и batch_name для группировки задач прогрева"
 
-asyncio.run(migrate())
+UP_SQL = [
+    "ALTER TABLE warmup_tasks ADD COLUMN IF NOT EXISTS batch_id VARCHAR(64) NULL",
+    "ALTER TABLE warmup_tasks ADD COLUMN IF NOT EXISTS batch_name VARCHAR(128) NULL",
+    "CREATE INDEX IF NOT EXISTS ix_warmup_tasks_batch_id ON warmup_tasks(batch_id) WHERE batch_id IS NOT NULL",
+]
+
+DOWN_SQL = [
+    "DROP INDEX IF EXISTS ix_warmup_tasks_batch_id",
+    "ALTER TABLE warmup_tasks DROP COLUMN IF EXISTS batch_name",
+    "ALTER TABLE warmup_tasks DROP COLUMN IF EXISTS batch_id",
+]
