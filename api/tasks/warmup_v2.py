@@ -607,7 +607,9 @@ async def _run_session(task_row, account, proxy, session_cfg, db):
     try:
         await client.connect()
         from utils.connection_limiter import increment_connection
+        from services.connection_logger import log_connection
         increment_connection(account.id)
+        await log_connection(db, account.id, source='warmup', proxy_id=proxy.id if proxy else None)
         if not await client.is_user_authorized():
             log = WarmupLog(task_id=task_row.id, account_id=account.id,
                             action="error", detail="Не авторизован", success=False)

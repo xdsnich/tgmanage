@@ -2,6 +2,9 @@
 GramGPT — services/llm.py
 LLM провайдеры для генерации комментариев.
 Используется в commenting_tasks.py и run_listener.py
+
+Поддерживает явную передачу api_key из БД (ServiceCredential).
+Если api_key не передан — fallback на env переменные (для обратной совместимости).
 """
 
 import os
@@ -41,27 +44,36 @@ def _check_rate_limit() -> bool:
 
 # ── Провайдеры ───────────────────────────────────────────────
 
-def generate_comment(provider: str, system_prompt: str, post_text: str) -> str:
-    """Генерирует комментарий через выбранный LLM."""
+def generate_comment(provider: str, system_prompt: str, post_text: str, api_key: str = None) -> str:
+    """
+    Генерирует комментарий через выбранный LLM.
+
+    Args:
+        provider: claude | openai | gemini | groq
+        system_prompt: системный промпт
+        post_text: текст поста
+        api_key: явный ключ (из БД). Если None — берётся из env.
+    """
     if not _check_rate_limit():
         return ""
     if provider == "groq":
-        return _call_groq(system_prompt, post_text)
+        return _call_groq(system_prompt, post_text, api_key)
     elif provider == "claude":
-        return _call_claude(system_prompt, post_text)
+        return _call_claude(system_prompt, post_text, api_key)
     elif provider == "openai":
-        return _call_openai(system_prompt, post_text)
+        return _call_openai(system_prompt, post_text, api_key)
     elif provider == "gemini":
-        return _call_gemini(system_prompt, post_text)
+        return _call_gemini(system_prompt, post_text, api_key)
     else:
-        return _call_groq(system_prompt, post_text)
+        return _call_groq(system_prompt, post_text, api_key)
 
 
-def _call_groq(system_prompt: str, post_text: str) -> str:
+def _call_groq(system_prompt: str, post_text: str, api_key: str = None) -> str:
     import httpx
-    api_key = os.getenv("GROQ_API_KEY", "")
     if not api_key:
-        logger.error("GROQ_API_KEY не задан!")
+        api_key = os.getenv("GROQ_API_KEY", "")
+    if not api_key:
+        logger.error("Нет Groq API ключа (ни в БД, ни в env)")
         return ""
     try:
         with httpx.Client(timeout=30) as client:
@@ -84,11 +96,12 @@ def _call_groq(system_prompt: str, post_text: str) -> str:
     return ""
 
 
-def _call_claude(system_prompt: str, post_text: str) -> str:
+def _call_claude(system_prompt: str, post_text: str, api_key: str = None) -> str:
     import httpx
-    api_key = os.getenv("ANTHROPIC_API_KEY", "")
     if not api_key:
-        logger.error("ANTHROPIC_API_KEY не задан!")
+        api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        logger.error("Нет Claude API ключа (ни в БД, ни в env)")
         return ""
     try:
         with httpx.Client(timeout=30) as client:
@@ -111,11 +124,12 @@ def _call_claude(system_prompt: str, post_text: str) -> str:
     return ""
 
 
-def _call_openai(system_prompt: str, post_text: str) -> str:
+def _call_openai(system_prompt: str, post_text: str, api_key: str = None) -> str:
     import httpx
-    api_key = os.getenv("OPENAI_API_KEY", "")
     if not api_key:
-        logger.error("OPENAI_API_KEY не задан!")
+        api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        logger.error("Нет OpenAI API ключа (ни в БД, ни в env)")
         return ""
     try:
         with httpx.Client(timeout=30) as client:
@@ -135,6 +149,35 @@ def _call_openai(system_prompt: str, post_text: str) -> str:
             return resp.json()["choices"][0]["message"]["content"]
     except Exception as e:
         logger.error(f"OpenAI: {e}")
+    return ""
+
+
+def _call_gemini(system_prompt: str, post_text: str, api_key: str = None) -> str:
+    import httpx
+    if not api_key:
+        api_key = os.getenv("GEMINI_API_KEY", "")
+    if not api_key:
+        logger.error("Нет Gemini API ключа (ни в БД, ни в env)")
+        return ""
+    try:
+        with httpx.Client(timeout=30) as client:
+            resp = client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key={api_key}",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "system_instruction": {"parts": [{"text": system_prompt}]},
+                    "contents": [{"parts": [{"text": post_text}]}],
+                    "generationConfig": {"maxOutputTokens": 300},
+                },
+            )
+            resp.raise_for_status()
+            candidates = resp.json().get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if parts:
+                    return parts[0].get("text", "")
+    except Exception as e:
+        logger.error(f"Gemini: {e}")
     return ""
 
 
@@ -209,30 +252,3 @@ Post:
 {post_text}"""
 
     return prompt
-
-def _call_gemini(system_prompt: str, post_text: str) -> str:
-    import httpx
-    api_key = os.getenv("GEMINI_API_KEY", "")
-    if not api_key:
-        logger.error("GEMINI_API_KEY не задан!")
-        return ""
-    try:
-        with httpx.Client(timeout=30) as client:
-            resp = client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key={api_key}",
-                headers={"Content-Type": "application/json"},
-                json={
-                    "system_instruction": {"parts": [{"text": system_prompt}]},
-                    "contents": [{"parts": [{"text": post_text}]}],
-                    "generationConfig": {"maxOutputTokens": 300},
-                },
-            )
-            resp.raise_for_status()
-            candidates = resp.json().get("candidates", [])
-            if candidates:
-                parts = candidates[0].get("content", {}).get("parts", [])
-                if parts:
-                    return parts[0].get("text", "")
-    except Exception as e:
-        logger.error(f"Gemini: {e}")
-    return ""

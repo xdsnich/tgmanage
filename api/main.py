@@ -6,6 +6,16 @@ GramGPT API — main.py
   uvicorn main:app --reload --port 8000
 """
 
+import sys
+
+# Windows console может иметь не-UTF-8 кодировку — принудительно переключаем
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,7 +24,6 @@ from config import APP_NAME, APP_VERSION, DEBUG, CORS_ORIGINS
 from database import create_tables
 from routers import auth, accounts, proxies, tasks
 from routers import tg_auth, analytics, security, channels, actions, inbox, tdata, commenting, warmup, parser, api_apps, reactions, subscribe, service_credentials
-from routers import health
 from routers import health
 
 # ── Lifespan (старт / стоп) ──────────────────────────────────

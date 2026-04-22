@@ -1,14 +1,23 @@
 """
 GramGPT API — routers/proxies.py
 Управление прокси + назначение на аккаунты.
+
+При создании прокси автоматически:
+1. Определяется гео по IP (ip-api.com)
+2. Проверяется TCP-доступность
+3. Если указан срок — сохраняется expires_at (абсолютный timestamp)
 """
+
+import asyncio
+import httpx
+from datetime import datetime, timedelta
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from typing import Optional
-from sqlalchemy.orm import joinedload
+
 from database import get_db
 from schemas.proxy import ProxyCreate, ProxyOut, ProxyBulkCreate
 from models.proxy import Proxy
@@ -23,7 +32,63 @@ router = APIRouter(prefix="/proxies", tags=["proxies"])
 
 class AssignProxyRequest(BaseModel):
     account_id: int
-    proxy_id: Optional[int] = None  # None = снять прокси
+    proxy_id: Optional[int] = None
+
+
+# ── Helpers ──────────────────────────────────────────────────
+
+async def _detect_geo(host: str) -> dict:
+    """Определяет страну/город по IP."""
+    out = {"country": "", "country_code": "", "city": ""}
+    try:
+        async with httpx.AsyncClient(timeout=5) as http:
+            resp = await http.get(
+                f"http://ip-api.com/json/{host}?fields=status,country,countryCode,city"
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("status") == "success":
+                    out["country"] = data.get("country", "")
+                    out["country_code"] = data.get("countryCode", "")
+                    out["city"] = data.get("city", "")
+    except Exception:
+        pass
+    return out
+
+
+async def _tcp_check(host: str, port: int, timeout: float = 8) -> tuple[bool, str]:
+    try:
+        conn = asyncio.open_connection(host, port)
+        reader, writer = await asyncio.wait_for(conn, timeout=timeout)
+        writer.close()
+        await writer.wait_closed()
+        return True, ""
+    except Exception as e:
+        return False, str(e)[:200]
+
+
+async def _check_and_update(proxy: Proxy) -> None:
+    """Проверка + определение гео в одном месте."""
+    geo = await _detect_geo(proxy.host)
+    if geo["country"]:
+        proxy.country = geo["country"]
+    if geo["country_code"]:
+        proxy.country_code = geo["country_code"]
+    if geo["city"]:
+        proxy.city = geo["city"]
+
+    ok, err = await _tcp_check(proxy.host, proxy.port)
+    proxy.is_valid = ok
+    proxy.error = None if ok else err
+    proxy.last_checked = datetime.utcnow()
+
+
+def _compute_expires_at(days: int, hours: int) -> Optional[datetime]:
+    """Возвращает абсолютный timestamp через X дней Y часов. None если 0+0."""
+    total_hours = (days or 0) * 24 + (hours or 0)
+    if total_hours <= 0:
+        return None
+    return datetime.utcnow() + timedelta(hours=total_hours)
 
 
 # ── CRUD ─────────────────────────────────────────────────────
@@ -45,8 +110,24 @@ async def create_proxy(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    proxy = Proxy(user_id=current_user.id, **data.model_dump())
+    """Создаёт прокси + сразу проверяет + устанавливает срок действия."""
+    expires_at = _compute_expires_at(data.duration_days, data.duration_hours)
+
+    proxy = Proxy(
+        user_id=current_user.id,
+        host=data.host,
+        port=data.port,
+        login=data.login,
+        password=data.password,
+        protocol=data.protocol,
+        country=data.country,
+        city=data.city,
+        expires_at=expires_at,
+    )
     db.add(proxy)
+    await db.flush()
+
+    await _check_and_update(proxy)
     await db.flush()
     return proxy
 
@@ -57,15 +138,16 @@ async def create_proxies_bulk(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    added = 0
+    """Массовое добавление + авто-проверка + общий срок действия."""
+    added_proxies = []
     errors = []
+    expires_at = _compute_expires_at(data.duration_days, data.duration_hours)
+
     for line in data.proxies_text.strip().splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
-            errors.append(line)
             continue
 
-        # Парсим форматы: host:port:login:pass | socks5://login:pass@host:port | host:port
         host, port, login, password, protocol = "", 0, "", "", "socks5"
         try:
             if "://" in line:
@@ -86,7 +168,7 @@ async def create_proxies_bulk(
                 else:
                     errors.append(line)
                     continue
-        except:
+        except Exception:
             errors.append(line)
             continue
 
@@ -95,12 +177,89 @@ async def create_proxies_bulk(
             host=host, port=port,
             login=login, password=password,
             protocol=protocol if protocol in ("socks5", "http") else "socks5",
+            expires_at=expires_at,
         )
         db.add(proxy)
-        added += 1
+        added_proxies.append(proxy)
 
     await db.flush()
-    return {"added": added, "errors": errors}
+
+    # Параллельная проверка
+    semaphore = asyncio.Semaphore(10)
+    async def check_one(proxy: Proxy):
+        async with semaphore:
+            await _check_and_update(proxy)
+
+    if added_proxies:
+        await asyncio.gather(*[check_one(p) for p in added_proxies])
+        await db.flush()
+
+    valid_count = sum(1 for p in added_proxies if p.is_valid)
+    return {
+        "added": len(added_proxies),
+        "valid": valid_count,
+        "invalid": len(added_proxies) - valid_count,
+        "errors": errors,
+    }
+
+
+@router.patch("/{proxy_id}", response_model=ProxyOut)
+async def update_proxy(
+    proxy_id: int,
+    data: ProxyCreate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    result = await db.execute(
+        select(Proxy).where(Proxy.id == proxy_id, Proxy.user_id == current_user.id)
+    )
+    proxy = result.scalar_one_or_none()
+    if not proxy:
+        raise HTTPException(status_code=404, detail="Прокси не найден")
+
+    host_changed = (proxy.host != data.host)
+
+    proxy.host = data.host
+    proxy.port = data.port
+    proxy.login = data.login
+    if data.password:
+        proxy.password = data.password
+    proxy.protocol = data.protocol
+    if data.country:
+        proxy.country = data.country
+    if data.city:
+        proxy.city = data.city
+
+    # Срок действия: если задан duration > 0 — обновляем expires_at (продлеваем)
+    new_expires = _compute_expires_at(data.duration_days, data.duration_hours)
+    if new_expires is not None:
+        proxy.expires_at = new_expires
+    # Если duration = 0 — НЕ трогаем (сохраняем существующий срок)
+
+    await db.flush()
+
+    if host_changed:
+        await _check_and_update(proxy)
+        await db.flush()
+    return proxy
+
+
+@router.post("/{proxy_id}/clear-expiration")
+async def clear_expiration(
+    proxy_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Убрать срок действия (сделать бессрочным)."""
+    result = await db.execute(
+        select(Proxy).where(Proxy.id == proxy_id, Proxy.user_id == current_user.id)
+    )
+    proxy = result.scalar_one_or_none()
+    if not proxy:
+        raise HTTPException(status_code=404, detail="Прокси не найден")
+    proxy.expires_at = None
+    await db.flush()
+    return {"success": True, "message": "Срок действия убран"}
 
 
 @router.delete("/{proxy_id}", status_code=204)
@@ -115,127 +274,70 @@ async def delete_proxy(
     proxy = result.scalar_one_or_none()
     if proxy:
         acc_result = await db.execute(
-            select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(TelegramAccount.proxy_id == proxy_id)
+            select(TelegramAccount).where(TelegramAccount.proxy_id == proxy.id)
         )
         for acc in acc_result.scalars().all():
             acc.proxy_id = None
         await db.delete(proxy)
+        await db.flush()
 
 
-class ProxyUpdate(BaseModel):
-    host: Optional[str] = None
-    port: Optional[int] = None
-    login: Optional[str] = None
-    password: Optional[str] = None
-    protocol: Optional[str] = None
-
-
-@router.patch("/{proxy_id}")
-async def update_proxy(
-    proxy_id: int,
-    data: ProxyUpdate,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Редактировать прокси (хост, порт, логин, пароль, протокол)"""
-    result = await db.execute(
-        select(Proxy).where(Proxy.id == proxy_id, Proxy.user_id == current_user.id)
-    )
-    proxy = result.scalar_one_or_none()
-    if not proxy:
-        raise HTTPException(status_code=404, detail="Прокси не найден")
-
-    update_data = data.model_dump(exclude_unset=True)
-    for key, value in update_data.items():
-        setattr(proxy, key, value)
-
-    # Сбрасываем статус проверки при изменении
-    proxy.is_valid = None
-    proxy.error = None
-
-    await db.flush()
-    return {
-        "id": proxy.id, "host": proxy.host, "port": proxy.port,
-        "login": proxy.login, "protocol": proxy.protocol.value if hasattr(proxy.protocol, 'value') else proxy.protocol,
-        "is_valid": proxy.is_valid, "message": "Прокси обновлён",
-    }
-
-
-# ── Назначение прокси на аккаунт ─────────────────────────────
+# ── ASSIGN / AUTO-ASSIGN ─────────────────────────────────────
 
 @router.post("/assign")
 async def assign_proxy(
-    body: AssignProxyRequest,
+    data: AssignProxyRequest,
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db)
 ):
-    """
-    Назначить или снять прокси с аккаунта.
-    proxy_id = null → снять прокси.
-    """
-    # Проверяем аккаунт
-    acc_result = await db.execute(
-        select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(
-            TelegramAccount.id == body.account_id,
+    acc_r = await db.execute(
+        select(TelegramAccount).where(
+            TelegramAccount.id == data.account_id,
             TelegramAccount.user_id == current_user.id,
         )
     )
-    acc = acc_result.scalar_one_or_none()
-    if not acc:
+    account = acc_r.scalar_one_or_none()
+    if not account:
         raise HTTPException(status_code=404, detail="Аккаунт не найден")
 
-    if body.proxy_id:
-        # Проверяем прокси
-        proxy_result = await db.execute(
-            select(Proxy).where(Proxy.id == body.proxy_id, Proxy.user_id == current_user.id)
+    if data.proxy_id is not None:
+        prx_r = await db.execute(
+            select(Proxy).where(Proxy.id == data.proxy_id, Proxy.user_id == current_user.id)
         )
-        proxy = proxy_result.scalar_one_or_none()
-        if not proxy:
+        if not prx_r.scalar_one_or_none():
             raise HTTPException(status_code=404, detail="Прокси не найден")
 
-        acc.proxy_id = body.proxy_id
-        await db.flush()
-        return {
-            "success": True,
-            "account_id": acc.id,
-            "proxy_id": proxy.id,
-            "proxy": f"{proxy.host}:{proxy.port}",
-            "message": f"Прокси {proxy.host}:{proxy.port} назначен на {acc.phone}",
-        }
-    else:
-        acc.proxy_id = None
-        await db.flush()
-        return {
-            "success": True,
-            "account_id": acc.id,
-            "proxy_id": None,
-            "message": f"Прокси снят с {acc.phone}",
-        }
+    account.proxy_id = data.proxy_id
+    await db.flush()
+    return {"success": True, "proxy_id": data.proxy_id}
 
 
 @router.post("/auto-assign")
-async def auto_assign_proxies(
+async def auto_assign(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Автоназначение: распределяет валидные прокси по аккаунтам без прокси."""
-    # Аккаунты без прокси
-    acc_result = await db.execute(
-        select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(
-            TelegramAccount.user_id == current_user.id,
-            TelegramAccount.proxy_id.is_(None),
+    # Берём только валидные И не истёкшие прокси
+    now = datetime.utcnow()
+    proxies_r = await db.execute(
+        select(Proxy).where(
+            Proxy.user_id == current_user.id,
+            Proxy.is_valid == True,
         )
     )
-    unassigned = acc_result.scalars().all()
+    all_valid = proxies_r.scalars().all()
+    valid_proxies = [p for p in all_valid if p.expires_at is None or p.expires_at > now]
 
-    # Валидные прокси
-    proxy_result = await db.execute(
-        select(Proxy).where(Proxy.user_id == current_user.id, Proxy.is_valid == True)
+    accs_r = await db.execute(
+        select(TelegramAccount).where(
+            TelegramAccount.user_id == current_user.id,
+            TelegramAccount.proxy_id == None,
+        )
     )
-    valid_proxies = proxy_result.scalars().all()
+    unassigned = accs_r.scalars().all()
 
     if not valid_proxies:
-        raise HTTPException(status_code=400, detail="Нет валидных прокси. Сначала проверьте прокси.")
+        raise HTTPException(status_code=400, detail="Нет валидных неистёкших прокси.")
     if not unassigned:
         return {"assigned": 0, "message": "Все аккаунты уже имеют прокси"}
 
@@ -249,16 +351,14 @@ async def auto_assign_proxies(
     return {"assigned": assigned, "message": f"Назначено {assigned} прокси на аккаунты"}
 
 
+# ── CHECK ────────────────────────────────────────────────────
+
 @router.post("/{proxy_id}/check")
 async def check_proxy(
     proxy_id: int,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Проверяет доступность прокси + определяет страну по IP"""
-    import asyncio
-    import httpx
-
     result = await db.execute(
         select(Proxy).where(Proxy.id == proxy_id, Proxy.user_id == current_user.id)
     )
@@ -266,54 +366,19 @@ async def check_proxy(
     if not proxy:
         raise HTTPException(status_code=404, detail="Прокси не найден")
 
-    from datetime import datetime
+    await _check_and_update(proxy)
+    await db.flush()
 
-    # Определяем страну по IP (бесплатный API)
-    country = ""
-    country_code = ""
-    city = ""
-    try:
-        async with httpx.AsyncClient(timeout=5) as http:
-            geo = await http.get(f"http://ip-api.com/json/{proxy.host}?fields=status,country,countryCode,city")
-            if geo.status_code == 200:
-                data = geo.json()
-                if data.get("status") == "success":
-                    country = data.get("country", "")
-                    country_code = data.get("countryCode", "")
-                    city = data.get("city", "")
-    except:
-        pass
-
-    try:
-        conn = asyncio.open_connection(proxy.host, proxy.port)
-        reader, writer = await asyncio.wait_for(conn, timeout=10)
-        writer.close()
-        await writer.wait_closed()
-
-        proxy.is_valid = True
-        proxy.error = None
-        proxy.last_checked = datetime.utcnow()
-        await db.flush()
-
-        location = f"{city}, {country}" if city else country
-        return {
-            "success": True, "is_valid": True,
-            "country": country, "country_code": country_code, "city": city,
-            "message": f"✅ {proxy.host}:{proxy.port} — {location or 'OK'}",
-        }
-
-    except Exception as e:
-        proxy.is_valid = False
-        proxy.error = str(e)[:200]
-        proxy.last_checked = datetime.utcnow()
-        await db.flush()
-
-        location = f"{city}, {country}" if city else country
-        return {
-            "success": True, "is_valid": False,
-            "country": country, "country_code": country_code, "city": city,
-            "message": f"❌ {proxy.host}:{proxy.port} — {location or ''} недоступен",
-        }
+    location = f"{proxy.city}, {proxy.country}" if proxy.city else proxy.country
+    return {
+        "success": True,
+        "is_valid": proxy.is_valid,
+        "country": proxy.country,
+        "country_code": proxy.country_code,
+        "city": proxy.city,
+        "location": location,
+        "message": f"{'✅' if proxy.is_valid else '❌'} {proxy.host}:{proxy.port} — {location or ('OK' if proxy.is_valid else 'недоступен')}",
+    }
 
 
 @router.post("/check-all")
@@ -321,10 +386,6 @@ async def check_all_proxies(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Проверяет все прокси + определяет страну"""
-    import asyncio
-    import httpx
-
     result = await db.execute(
         select(Proxy).where(Proxy.user_id == current_user.id)
     )
@@ -332,44 +393,25 @@ async def check_all_proxies(
     if not proxies:
         return {"total": 0, "valid": 0, "invalid": 0, "results": []}
 
-    from datetime import datetime
+    semaphore = asyncio.Semaphore(10)
+    async def check_one(proxy: Proxy):
+        async with semaphore:
+            await _check_and_update(proxy)
 
-    valid_count = 0
-    results = []
-
-    for proxy in proxies:
-        # Гео
-        country, city = "", ""
-        try:
-            async with httpx.AsyncClient(timeout=5) as http:
-                geo = await http.get(f"http://ip-api.com/json/{proxy.host}?fields=status,country,countryCode,city")
-                if geo.status_code == 200:
-                    data = geo.json()
-                    if data.get("status") == "success":
-                        country = data.get("country", "")
-                        city = data.get("city", "")
-        except:
-            pass
-
-        # TCP check
-        try:
-            conn = asyncio.open_connection(proxy.host, proxy.port)
-            reader, writer = await asyncio.wait_for(conn, timeout=8)
-            writer.close()
-            await writer.wait_closed()
-            proxy.is_valid = True
-            proxy.error = None
-            valid_count += 1
-        except Exception as e:
-            proxy.is_valid = False
-            proxy.error = str(e)[:200]
-        proxy.last_checked = datetime.utcnow()
-
-        location = f"{city}, {country}" if city else country
-        results.append({
-            "id": proxy.id, "host": proxy.host, "port": proxy.port,
-            "is_valid": proxy.is_valid, "country": country, "city": city, "location": location,
-        })
-
+    await asyncio.gather(*[check_one(p) for p in proxies])
     await db.flush()
-    return {"total": len(proxies), "valid": valid_count, "invalid": len(proxies) - valid_count, "results": results}
+
+    valid_count = sum(1 for p in proxies if p.is_valid)
+    results = [{
+        "id": p.id, "host": p.host, "port": p.port,
+        "is_valid": p.is_valid,
+        "country": p.country, "city": p.city,
+        "location": f"{p.city}, {p.country}" if p.city else p.country,
+    } for p in proxies]
+
+    return {
+        "total": len(proxies),
+        "valid": valid_count,
+        "invalid": len(proxies) - valid_count,
+        "results": results,
+    }

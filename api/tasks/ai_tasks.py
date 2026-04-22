@@ -79,25 +79,25 @@ def _check_rate_limit() -> bool:
 
 # ── LLM Providers (для диалогов) ─────────────────────────────
 
-def call_llm_dialog(provider: str, system_prompt: str, messages_history: list[dict]) -> str:
+def call_llm_dialog(provider: str, system_prompt: str, messages_history: list[dict], api_key: str = None) -> str:
     """Вызывает выбранный LLM с проверкой rate limit"""
     if not _check_rate_limit():
         return ""
     if provider == "openai":
-        return _call_openai_dialog(system_prompt, messages_history)
+        return _call_openai_dialog(system_prompt, messages_history, api_key)
     elif provider == "gemini":
-        return _call_gemini_dialog(system_prompt, messages_history)
+        return _call_gemini_dialog(system_prompt, messages_history, api_key)
     elif provider == "groq":
-        return _call_groq_dialog(system_prompt, messages_history)
+        return _call_groq_dialog(system_prompt, messages_history, api_key)
     else:
-        return _call_claude_dialog(system_prompt, messages_history)
+        return _call_claude_dialog(system_prompt, messages_history, api_key)
 
-
-def _call_claude_dialog(system_prompt: str, messages_history: list[dict]) -> str:
+def _call_claude_dialog(system_prompt: str, messages_history: list[dict], api_key: str = None) -> str:
     import httpx
-    api_key = os.getenv("ANTHROPIC_API_KEY", "")
     if not api_key:
-        logger.error("ANTHROPIC_API_KEY не задан в .env!")
+        api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        logger.error("Нет Claude API ключа (ни в БД, ни в env)")
         return ""
 
     recent = messages_history[-20:]
@@ -126,11 +126,12 @@ def _call_claude_dialog(system_prompt: str, messages_history: list[dict]) -> str
     return ""
 
 
-def _call_openai_dialog(system_prompt: str, messages_history: list[dict]) -> str:
+def _call_openai_dialog(system_prompt: str, messages_history: list[dict], api_key: str = None) -> str:
     import httpx
-    api_key = os.getenv("OPENAI_API_KEY", "")
     if not api_key:
-        logger.error("OPENAI_API_KEY не задан!")
+        api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        logger.error("Нет OpenAI API ключа (ни в БД, ни в env)")
         return ""
 
     recent = messages_history[-20:]
@@ -149,15 +150,19 @@ def _call_openai_dialog(system_prompt: str, messages_history: list[dict]) -> str
     return ""
 
 
-def _call_gemini_dialog(system_prompt: str, messages_history: list[dict]) -> str:
+def _call_gemini_dialog(system_prompt: str, messages_history: list[dict], api_key: str = None) -> str:
     import httpx
-    api_key = os.getenv("GEMINI_API_KEY", "")
     if not api_key:
-        logger.error("GEMINI_API_KEY не задан!")
+        api_key = os.getenv("GEMINI_API_KEY", "")
+    if not api_key:
+        logger.error("Нет Gemini API ключа (ни в БД, ни в env)")
         return ""
 
     recent = messages_history[-20:]
-    conversation = "\n".join([f"{'Я' if m['role']=='assistant' else 'Собеседник'}: {m['content']}" for m in recent])
+    conversation = "\n".join([
+        f"{'Я' if m['role']=='assistant' else 'Собеседник'}: {m['content']}"
+        for m in recent
+    ])
 
     try:
         with httpx.Client(timeout=30) as client:
@@ -181,11 +186,12 @@ def _call_gemini_dialog(system_prompt: str, messages_history: list[dict]) -> str
     return ""
 
 
-def _call_groq_dialog(system_prompt: str, messages_history: list[dict]) -> str:
+def _call_groq_dialog(system_prompt: str, messages_history: list[dict], api_key: str = None) -> str:
     import httpx
-    api_key = os.getenv("GROQ_API_KEY", "")
     if not api_key:
-        logger.error("GROQ_API_KEY не задан!")
+        api_key = os.getenv("GROQ_API_KEY", "")
+    if not api_key:
+        logger.error("Нет Groq API ключа (ни в БД, ни в env)")
         return ""
 
     recent = messages_history[-20:]
@@ -202,7 +208,6 @@ def _call_groq_dialog(system_prompt: str, messages_history: list[dict]) -> str:
     except Exception as e:
         logger.error(f"Groq error: {e}")
     return ""
-
 
 # ── Основная логика ──────────────────────────────────────────
 
@@ -237,7 +242,12 @@ async def _process_dialog_with_client(client, account_row, ai_dialog_row, db_ses
             history.append({"role": "assistant" if m.out else "user", "content": m.text})
 
         provider = getattr(ai_dialog_row, 'llm_provider', 'claude') or 'claude'
-        reply = call_llm_dialog(provider, system_prompt, history)
+
+        # Берём API ключ из БД (или fallback на env)
+        from services.service_credentials import get_api_key
+        api_key = await get_api_key(db_session, account_row.user_id, provider)
+
+        reply = call_llm_dialog(provider, system_prompt, history, api_key=api_key)
 
         if not reply:
             logger.warning(f"[{phone}] LLM ({provider}) вернул пустой ответ для msg #{last_msg.id}")
@@ -318,7 +328,12 @@ async def _process_single_dialog(account_row, ai_dialog_row, db_session, proxy_r
 
         # Вызываем LLM — ОДИН раз
         provider = getattr(ai_dialog_row, 'llm_provider', 'claude') or 'claude'
-        reply = call_llm_dialog(provider, system_prompt, history)
+
+        # Берём API ключ из БД (или fallback на env)
+        from services.service_credentials import get_api_key
+        api_key = await get_api_key(db_session, account_row.user_id, provider)
+
+        reply = call_llm_dialog(provider, system_prompt, history, api_key=api_key)
 
         if not reply:
             logger.warning(f"[{phone}] LLM ({provider}) вернул пустой ответ для msg #{last_msg.id}")
@@ -408,6 +423,12 @@ async def _process_all_dialogs():
 
                 try:
                     await client.connect()
+                    # Учёт подключений (лимит + история)
+                    from utils.connection_limiter import increment_connection
+                    from services.connection_logger import log_connection
+                    increment_connection(account.id)
+                    await log_connection(db, account.id, source='ai_dialog', proxy_id=proxy.id if proxy else None)
+
                     if not await client.is_user_authorized():
                         continue
 

@@ -34,6 +34,12 @@ class Proxy(Base):
     is_valid:     Mapped[Optional[bool]]  = mapped_column(Boolean, nullable=True)
     last_checked: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     error:        Mapped[Optional[str]]   = mapped_column(String(255), nullable=True)
+    # Гео-информация (определяется при создании / проверке)
+    country:      Mapped[str]             = mapped_column(String(64), default="", server_default="")
+    country_code: Mapped[str]             = mapped_column(String(8), default="", server_default="")
+    city:         Mapped[str]             = mapped_column(String(64), default="", server_default="")
+    # Срок действия (абсолютный timestamp; NULL = бессрочно)
+    expires_at:   Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
     created_at:   Mapped[datetime]        = mapped_column(DateTime, default=datetime.utcnow)
 
     user:     Mapped[User]                  = relationship("User", back_populates="proxies")
@@ -43,5 +49,15 @@ class Proxy(Base):
     def address(self) -> str:
         return f"{self.host}:{self.port}"
 
+    @property
+    def location(self) -> str:
+        if self.city and self.country:
+            return f"{self.city}, {self.country}"
+        return self.country or ""
+
+    @property
+    def is_expired(self) -> bool:
+        return self.expires_at is not None and self.expires_at < datetime.utcnow()
+
     def __repr__(self):
-        return f"<Proxy {self.host}:{self.port} [{self.protocol}]>"
+        return f"<Proxy {self.host}:{self.port} [{self.protocol}] {self.country_code}>"

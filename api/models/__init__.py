@@ -13,7 +13,7 @@ from .subscribe_task import SubscribeTask
 from .comment_queue import CommentQueue
 from .account_behavior import AccountBehavior
 from .service_credential import ServiceCredential
-
+from .account_connection import AccountConnection
 __all__ = [
     "User", "RefreshToken", "PlanEnum",
     "TelegramAccount", "AccountStatus", "AccountRole",
@@ -22,5 +22,5 @@ __all__ = [
     "Campaign", "TargetChannel", "CampaignStatus", "TriggerMode", "LLMProvider", "CommentTone",
     "WarmupTask", "ParsedChannel","ReactionTask","WarmupLog","SubscribeTask",
     "CommentQueue", "AccountBehavior",
-    "ServiceCredential",
+    "ServiceCredential","AccountConnection",
 ]

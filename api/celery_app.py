@@ -1,6 +1,15 @@
 """
 GramGPT API — celery_app.py
 """
+import sys
+
+# Windows console может иметь не-UTF-8 кодировку — принудительно переключаем
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
 
 from celery import Celery
 import os

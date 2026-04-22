@@ -841,3 +841,153 @@ async def import_tdata_batch(
     print(f"📦 Batch импорт: {success}/{len(results)} успешно")
 
     return {"total": len(results), "success": success, "results": results}
+
+# ── ПОДКЛЮЧЕНИЯ (история + статистика) ──────────────────────
+
+@router.get("/connections/stats-today")
+async def get_all_connections_today(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Сколько подключений сегодня у каждого аккаунта + последнее время."""
+    from datetime import datetime, timedelta
+    from sqlalchemy import func
+    from models.account_connection import AccountConnection
+    from utils.connection_limiter import MAX_DAILY_CONNECTIONS
+
+    # "Сегодня" считаем по локальному времени UTC+3 (Lviv)
+    local_now = datetime.utcnow() + timedelta(hours=3)
+    today_local = local_now.date()
+    today_start_utc = datetime(today_local.year, today_local.month, today_local.day) - timedelta(hours=3)
+
+    # Получаем ID аккаунтов пользователя
+    accs_r = await db.execute(
+        select(TelegramAccount.id).where(TelegramAccount.user_id == current_user.id)
+    )
+    account_ids = [r[0] for r in accs_r.all()]
+    if not account_ids:
+        return {}
+
+    result = await db.execute(
+        select(
+            AccountConnection.account_id,
+            func.count(AccountConnection.id).label("cnt"),
+            func.max(AccountConnection.connected_at).label("last_at"),
+        )
+        .where(
+            AccountConnection.account_id.in_(account_ids),
+            AccountConnection.connected_at >= today_start_utc,
+        )
+        .group_by(AccountConnection.account_id)
+    )
+
+    out = {}
+    for row in result.all():
+        out[str(row[0])] = {
+            "count": row[1],
+            "limit": MAX_DAILY_CONNECTIONS,
+            "last_at": row[2].isoformat() + "Z" if row[2] else None,
+        }
+    return out
+
+
+@router.get("/{account_id}/connections")
+async def get_account_connections(
+    account_id: int,
+    limit: int = 100,
+    days: int = 7,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """История подключений аккаунта за последние N дней."""
+    from datetime import datetime, timedelta
+    from models.account_connection import AccountConnection
+
+    # Проверяем что аккаунт принадлежит пользователю
+    acc = (await db.execute(
+        select(TelegramAccount).where(
+            TelegramAccount.id == account_id,
+            TelegramAccount.user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="Аккаунт не найден")
+
+    since = datetime.utcnow() - timedelta(days=days)
+
+    result = await db.execute(
+        select(AccountConnection).where(
+            AccountConnection.account_id == account_id,
+            AccountConnection.connected_at >= since,
+        ).order_by(AccountConnection.connected_at.desc()).limit(limit)
+    )
+    conns = result.scalars().all()
+
+    return [{
+        "id": c.id,
+        "connected_at": c.connected_at.isoformat() + "Z" if c.connected_at else None,
+        "source": c.source,
+        "success": c.success,
+        "error": c.error,
+        "proxy_id": c.proxy_id,
+    } for c in conns]
+
+
+@router.get("/{account_id}/connections/stats")
+async def get_account_connections_stats(
+    account_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Статистика подключений: сегодня, неделя, по источникам."""
+    from datetime import datetime, timedelta
+    from sqlalchemy import func
+    from models.account_connection import AccountConnection
+    from utils.connection_limiter import MAX_DAILY_CONNECTIONS
+
+    acc = (await db.execute(
+        select(TelegramAccount).where(
+            TelegramAccount.id == account_id,
+            TelegramAccount.user_id == current_user.id,
+        )
+    )).scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="Аккаунт не найден")
+
+    local_now = datetime.utcnow() + timedelta(hours=3)
+    today_local = local_now.date()
+    today_start_utc = datetime(today_local.year, today_local.month, today_local.day) - timedelta(hours=3)
+    week_start = datetime.utcnow() - timedelta(days=7)
+
+    today_count = (await db.execute(
+        select(func.count(AccountConnection.id)).where(
+            AccountConnection.account_id == account_id,
+            AccountConnection.connected_at >= today_start_utc,
+        )
+    )).scalar() or 0
+
+    week_count = (await db.execute(
+        select(func.count(AccountConnection.id)).where(
+            AccountConnection.account_id == account_id,
+            AccountConnection.connected_at >= week_start,
+        )
+    )).scalar() or 0
+
+    # По источникам за сегодня
+    by_source = (await db.execute(
+        select(
+            AccountConnection.source,
+            func.count(AccountConnection.id),
+        ).where(
+            AccountConnection.account_id == account_id,
+            AccountConnection.connected_at >= today_start_utc,
+        ).group_by(AccountConnection.source)
+    )).all()
+
+    return {
+        "today": today_count,
+        "limit": MAX_DAILY_CONNECTIONS,
+        "remaining": max(0, MAX_DAILY_CONNECTIONS - today_count),
+        "week": week_count,
+        "by_source_today": {row[0]: row[1] for row in by_source},
+    }

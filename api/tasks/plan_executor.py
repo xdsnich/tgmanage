@@ -407,6 +407,9 @@ async def _execute_plan_session(plan_id: int):
                 try:
                     await client.connect()
                     increment_connection(plan.account_id)
+                    # История подключений в БД
+                    from services.connection_logger import log_connection
+                    await log_connection(db, plan.account_id, source=plan_source, proxy_id=proxy.id if proxy else None)
                     if not await client.is_user_authorized():
                         plan.executed_idx += 1
                         logger.warning(f"[plan][{phone}] Не авторизован")
@@ -641,7 +644,11 @@ async def _execute_plan_session(plan_id: int):
                                     if campaign:
                                         provider = _val(campaign.llm_provider)
 
-                                    comment_text = generate_comment(provider, prompt, post_text)
+                                    # Берём API ключ из БД (или fallback на env)
+                                    from services.service_credentials import get_api_key
+                                    api_key = await get_api_key(db, campaign.user_id, provider) if campaign else None
+
+                                    comment_text = generate_comment(provider, prompt, post_text, api_key=api_key)
                                     if not comment_text:
                                         logger.warning(f"[plan][{phone}]   [{action_num}/{len(actions)}] ❌ LLM вернул пустой ответ")
                                         continue

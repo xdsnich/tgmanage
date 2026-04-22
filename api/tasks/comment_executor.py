@@ -207,12 +207,17 @@ async def _execute_queue_item(item, db):
     behavior = await get_or_create_behavior(db, account.id, account.phone)
 
     # Генерируем комментарий через LLM
+    # Генерируем комментарий через LLM
     from services.llm import build_comment_prompt
+    from services.service_credentials import get_api_key
     style_profile = item.style or {}
     personality = item.personality or {}
 
     prompt = build_comment_prompt(item.post_text, style_profile, personality)
-    comment_text = generate_comment(_val(campaign.llm_provider), prompt, item.post_text)
+
+    provider = _val(campaign.llm_provider)
+    api_key = await get_api_key(db, campaign.user_id, provider)
+    comment_text = generate_comment(provider, prompt, item.post_text, api_key=api_key)
 
     if not comment_text:
         item.status = "failed"
@@ -231,6 +236,10 @@ async def _execute_queue_item(item, db):
     try:
         await client.connect()
         if not await client.is_user_authorized():
+            from services.connection_logger import log_connection
+            from utils.connection_limiter import increment_connection
+            increment_connection(account.id)
+            await log_connection(db, account.id, source='commenting', proxy_id=proxy.id if proxy else None)
             item.status = "failed"
             item.error = "Не авторизован"
             item.executed_at = now

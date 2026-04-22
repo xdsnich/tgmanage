@@ -96,6 +96,8 @@ async def list_parsed_channels(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    from models.channel_ban_stats import ChannelBanStats
+
     q = select(ParsedChannel).where(ParsedChannel.user_id == current_user.id)
     if folder is not None:
         q = q.where(ParsedChannel.folder == folder)
@@ -107,6 +109,27 @@ async def list_parsed_channels(
 
     result = await db.execute(q)
     channels = result.scalars().all()
+
+    # ── Загружаем pass_rate для всех каналов одним запросом ──
+    usernames = [c.username for c in channels if c.username]
+    stats_map = {}
+    if usernames:
+        stats_r = await db.execute(
+            select(ChannelBanStats).where(
+                ChannelBanStats.user_id == current_user.id,
+                ChannelBanStats.channel_username.in_(usernames),
+            )
+        )
+        for s in stats_r.scalars().all():
+            pass_rate = 100.0 if s.total_attempts == 0 else round(
+                (s.total_attempts - s.banned_count) / s.total_attempts * 100, 1
+            )
+            stats_map[s.channel_username] = {
+                "pass_rate": pass_rate,
+                "total_attempts": s.total_attempts,
+                "banned_count": s.banned_count,
+            }
+
     return [{
         "id": c.id,
         "username": c.username or "",
@@ -124,8 +147,11 @@ async def list_parsed_channels(
         "avg_post_reach": getattr(c, 'avg_post_reach', 0) or 0,
         "err": getattr(c, 'err', 0) or 0,
         "source": getattr(c, 'source', 'telegram') or "telegram",
+        # Проходимость (из ChannelBanStats)
+        "pass_rate": stats_map.get(c.username, {}).get("pass_rate"),  # None если нет статы
+        "total_attempts": stats_map.get(c.username, {}).get("total_attempts", 0),
+        "banned_count": stats_map.get(c.username, {}).get("banned_count", 0),
     } for c in channels]
-
 
 @router.post("/search")
 async def search_channels(
@@ -265,6 +291,8 @@ async def get_folder_channels(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    from models.channel_ban_stats import ChannelBanStats
+
     result = await db.execute(
         select(ParsedChannel).where(
             ParsedChannel.user_id == current_user.id,
@@ -272,9 +300,28 @@ async def get_folder_channels(
         )
     )
     channels = result.scalars().all()
-    return [{"id": c.id, "username": c.username, "title": c.title,
-             "subscribers": c.subscribers, "has_comments": c.has_comments} for c in channels]
 
+    usernames = [c.username for c in channels if c.username]
+    stats_map = {}
+    if usernames:
+        stats_r = await db.execute(
+            select(ChannelBanStats).where(
+                ChannelBanStats.user_id == current_user.id,
+                ChannelBanStats.channel_username.in_(usernames),
+            )
+        )
+        for s in stats_r.scalars().all():
+            pass_rate = 100.0 if s.total_attempts == 0 else round(
+                (s.total_attempts - s.banned_count) / s.total_attempts * 100, 1
+            )
+            stats_map[s.channel_username] = pass_rate
+
+    return [{
+        "id": c.id, "username": c.username, "title": c.title,
+        "subscribers": c.subscribers, "has_comments": c.has_comments,
+        "pass_rate": stats_map.get(c.username),
+        "folder": c.folder,
+    } for c in channels]
 
 class SetFolderRequest(BaseModel):
     channel_ids: list[int]
@@ -413,3 +460,173 @@ async def delete_whitelist_entry(
     if s:
         await db.delete(s)
         await db.flush()
+
+# ══════════════════════════════════════════════════════════
+# Similar channels crawler (обход графа похожих каналов)
+# ══════════════════════════════════════════════════════════
+
+class SimilarCrawlRequest(BaseModel):
+    account_id: int
+    seeds: list[str]                   # username каналов (без @)
+    max_depth: int = 2                 # 1 = только 1 уровень, 2 = с похожих тоже идём дальше, 3 = ещё глубже
+    max_channels: int = 1000
+    folder: str = ""
+    pause_min: float = 2.0
+    pause_max: float = 5.0
+
+
+@router.post("/similar/start")
+async def start_similar_crawl(
+    body: SimilarCrawlRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Запускает обход графа похожих каналов в фоне."""
+    if not body.seeds:
+        raise HTTPException(status_code=400, detail="Укажи хотя бы один seed-канал")
+
+    # Проверка аккаунта
+    acc_r = await db.execute(
+        select(TelegramAccount).where(
+            TelegramAccount.id == body.account_id,
+            TelegramAccount.user_id == current_user.id,
+        )
+    )
+    acc = acc_r.scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="Аккаунт не найден")
+    if not acc.proxy_id:
+        raise HTTPException(status_code=400, detail="У аккаунта нет прокси")
+
+    from celery_app import celery_app
+    task = celery_app.send_task(
+        "tasks.parser_similar_tasks.run_similar_crawler",
+        args=[current_user.id, body.account_id, body.model_dump()],
+        queue="ai_dialogs",
+    )
+
+    return {
+        "task_id": task.id,
+        "status": "started",
+        "message": f"Crawler запущен: {len(body.seeds)} seeds, глубина {body.max_depth}",
+    }
+
+
+@router.get("/similar/progress")
+async def get_similar_progress(
+    current_user: User = Depends(get_current_user),
+):
+    """Прогресс обхода похожих."""
+    import redis as redis_lib
+    import os
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    progress = r.get(f"parser:similar:progress:{current_user.id}")
+    if not progress:
+        return {"status": "idle"}
+
+    try:
+        parts = progress.decode().split("|")
+        return {
+            "status": parts[0],        # running | done | error
+            "found": int(parts[1]),
+            "saved": int(parts[2]),
+            "queue": int(parts[3]),    # размер очереди
+            "current": parts[4] if len(parts) > 4 else "",
+        }
+    except Exception:
+        return {"status": "idle"}
+
+
+@router.post("/similar/stop")
+async def stop_similar_crawl(
+    current_user: User = Depends(get_current_user),
+):
+    import redis as redis_lib
+    import os
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    r.setex(f"parser:similar:stop:{current_user.id}", 300, "1")
+    return {"status": "stopping"}# ══════════════════════════════════════════════════════════
+# Similar channels crawler (обход графа похожих каналов)
+# ══════════════════════════════════════════════════════════
+
+class SimilarCrawlRequest(BaseModel):
+    account_id: int
+    seeds: list[str]                   # username каналов (без @)
+    max_depth: int = 2                 # 1 = только 1 уровень, 2 = с похожих тоже идём дальше, 3 = ещё глубже
+    max_channels: int = 1000
+    folder: str = ""
+    pause_min: float = 2.0
+    pause_max: float = 5.0
+
+
+@router.post("/similar/start")
+async def start_similar_crawl(
+    body: SimilarCrawlRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Запускает обход графа похожих каналов в фоне."""
+    if not body.seeds:
+        raise HTTPException(status_code=400, detail="Укажи хотя бы один seed-канал")
+
+    # Проверка аккаунта
+    acc_r = await db.execute(
+        select(TelegramAccount).where(
+            TelegramAccount.id == body.account_id,
+            TelegramAccount.user_id == current_user.id,
+        )
+    )
+    acc = acc_r.scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="Аккаунт не найден")
+    if not acc.proxy_id:
+        raise HTTPException(status_code=400, detail="У аккаунта нет прокси")
+
+    from celery_app import celery_app
+    task = celery_app.send_task(
+        "tasks.parser_similar_tasks.run_similar_crawler",
+        args=[current_user.id, body.account_id, body.model_dump()],
+        queue="ai_dialogs",
+    )
+
+    return {
+        "task_id": task.id,
+        "status": "started",
+        "message": f"Crawler запущен: {len(body.seeds)} seeds, глубина {body.max_depth}",
+    }
+
+
+@router.get("/similar/progress")
+async def get_similar_progress(
+    current_user: User = Depends(get_current_user),
+):
+    """Прогресс обхода похожих."""
+    import redis as redis_lib
+    import os
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    progress = r.get(f"parser:similar:progress:{current_user.id}")
+    if not progress:
+        return {"status": "idle"}
+
+    try:
+        parts = progress.decode().split("|")
+        return {
+            "status": parts[0],        # running | done | error
+            "found": int(parts[1]),
+            "saved": int(parts[2]),
+            "queue": int(parts[3]),    # размер очереди
+            "current": parts[4] if len(parts) > 4 else "",
+        }
+    except Exception:
+        return {"status": "idle"}
+
+
+@router.post("/similar/stop")
+async def stop_similar_crawl(
+    current_user: User = Depends(get_current_user),
+):
+    import redis as redis_lib
+    import os
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    r.setex(f"parser:similar:stop:{current_user.id}", 300, "1")
+    return {"status": "stopping"}
