@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, func
 from sqlalchemy.orm import joinedload
 
 from database import get_db
@@ -80,6 +80,8 @@ class SearchRequest(BaseModel):
     pause_between_keywords_max: float = 6.0
     pause_between_channels_min: float = 0.8
     pause_between_channels_max: float = 1.5
+    precise_check: bool = True
+    flood_threshold: int = 300
 
 
 class ImportRequest(BaseModel):
@@ -630,3 +632,450 @@ async def stop_similar_crawl(
     r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
     r.setex(f"parser:similar:stop:{current_user.id}", 300, "1")
     return {"status": "stopping"}
+# ══════════════════════════════════════════════════════════
+# Comments Verifier — проверка has_comments пачками
+# ══════════════════════════════════════════════════════════
+
+class VerifyCommentsRequest(BaseModel):
+    account_id: int
+    folder: str = ""                # пусто = все каналы
+    limit: int = 200                # сколько за раз
+    pause_min: float = 2.0
+    pause_max: float = 4.0
+    only_unverified: bool = True    # только каналы с has_comments=False
+
+
+@router.post("/verify/start")
+async def start_verify_comments(
+    body: VerifyCommentsRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Запускает проверку реальных has_comments через GetFullChannel."""
+    acc_r = await db.execute(
+        select(TelegramAccount).where(
+            TelegramAccount.id == body.account_id,
+            TelegramAccount.user_id == current_user.id,
+        )
+    )
+    acc = acc_r.scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="Аккаунт не найден")
+    if not acc.proxy_id:
+        raise HTTPException(status_code=400, detail="У аккаунта нет прокси")
+
+    from celery_app import celery_app
+    task = celery_app.send_task(
+        "tasks.parser_similar_tasks.run_verify_comments",
+        args=[current_user.id, body.account_id, body.model_dump()],
+        queue="ai_dialogs",
+    )
+
+    return {
+        "task_id": task.id,
+        "status": "started",
+        "message": f"Проверка запущена (лимит {body.limit})",
+    }
+
+
+@router.get("/verify/progress")
+async def get_verify_progress(
+    current_user: User = Depends(get_current_user),
+):
+    """Прогресс проверки комментов."""
+    import redis as redis_lib
+    import os
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    progress = r.get(f"parser:verify:progress:{current_user.id}")
+    if not progress:
+        return {"status": "idle"}
+
+    try:
+        parts = progress.decode().split("|")
+        return {
+            "status": parts[0],          # running | done | error
+            "checked": int(parts[1]),
+            "with_comments": int(parts[2]),
+            "remaining": int(parts[3]),
+            "current": parts[4] if len(parts) > 4 else "",
+        }
+    except Exception:
+        return {"status": "idle"}
+
+
+@router.post("/verify/stop")
+async def stop_verify_comments(
+    current_user: User = Depends(get_current_user),
+):
+    """Прерывает текущую проверку."""
+    import redis as redis_lib
+    import os
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    r.setex(f"parser:verify:stop:{current_user.id}", 300, "1")
+    return {"status": "stopping"}
+
+# ══════════════════════════════════════════════════════════
+# Keyword Expander — расширение ключевых слов
+# ══════════════════════════════════════════════════════════
+
+class ExpandKeywordsRequest(BaseModel):
+    seeds: list[str]                              # исходные keywords
+    target_geos: Optional[list[str]] = None       # ["en", "ru", "ua"...] или None = все
+    include_translit: bool = True
+    include_translations: bool = True
+    include_geo_variants: bool = True
+    include_prefixes_suffixes: bool = True
+    include_topic_synonyms: bool = True
+    max_per_seed: int = 100
+
+
+@router.post("/keywords/expand")
+async def expand_keywords_endpoint(
+    body: ExpandKeywordsRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Расширяет seed-ключевики в десятки вариантов.
+    Возвращает группированный результат: {seed: {category: [keywords...]}}
+    """
+    from utils.keyword_expander import expand_keywords
+
+    if not body.seeds:
+        raise HTTPException(status_code=400, detail="Укажите хотя бы один seed")
+
+    seeds_clean = [s.strip() for s in body.seeds if s.strip()]
+    if not seeds_clean:
+        raise HTTPException(status_code=400, detail="Все seeds пустые")
+
+    expanded = expand_keywords(
+        seeds=seeds_clean,
+        target_geos=body.target_geos,
+        include_translit=body.include_translit,
+        include_translations=body.include_translations,
+        include_geo_variants=body.include_geo_variants,
+        include_prefixes_suffixes=body.include_prefixes_suffixes,
+        include_topic_synonyms=body.include_topic_synonyms,
+        max_per_seed=body.max_per_seed,
+    )
+
+    # Преобразуем в JSON-friendly формат с группировкой по категориям
+    result = {}
+    total = 0
+    for seed, keywords in expanded.items():
+        by_category = {}
+        for kw in keywords:
+            by_category.setdefault(kw.category, []).append({
+                "keyword": kw.keyword,
+                "geo": kw.geo,
+                "rating": kw.rating,
+            })
+        result[seed] = {
+            "total": len(keywords),
+            "categories": by_category,
+            "flat": [kw.keyword for kw in keywords],  # плоский список для copy-paste
+        }
+        total += len(keywords)
+
+    return {
+        "seeds_count": len(seeds_clean),
+        "total_keywords": total,
+        "results": result,
+    }
+
+
+@router.get("/keywords/geos")
+async def list_keyword_geos(
+    current_user: User = Depends(get_current_user),
+):
+    """Возвращает доступные гео + готовые пресеты."""
+    from utils.keyword_expander import list_available_geos, get_geo_presets
+    return {
+        "geos": list_available_geos(),
+        "presets": get_geo_presets(),
+    }
+
+# ══════════════════════════════════════════════════════════
+# Parser Metrics / Stats — дашборд парсера
+# ══════════════════════════════════════════════════════════
+# Требует:
+#   from datetime import datetime, timedelta
+#   from sqlalchemy import func, and_
+#   from models.parser_event import ParserEvent
+#
+# Если этих импортов ещё нет — добавь в начало parser.py
+
+
+@router.get("/stats/overview")
+async def get_parser_stats_overview(
+    period: str = "all",  # "today" | "all"
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    KPI-метрики парсера: общее + сегодня.
+    Возвращает:
+      - total_channels
+      - today_added
+      - today_flood_events
+      - today_flood_wait_sum (секунды)
+      - avg_speed (каналов в минуту, по последним session_done)
+      - by_source: {search, similar, import}
+    """
+    from datetime import datetime, timedelta, timezone
+    from sqlalchemy import func, and_
+    from models.parser_event import ParserEvent
+
+    # ── общее: каналы в БД + по source ──
+    total_q = await db.execute(
+        select(func.count(ParsedChannel.id)).where(ParsedChannel.user_id == current_user.id)
+    )
+    total_channels = total_q.scalar() or 0
+
+    by_src_q = await db.execute(
+        select(
+            func.coalesce(ParsedChannel.source, 'telegram'),
+            func.count(ParsedChannel.id),
+        ).where(ParsedChannel.user_id == current_user.id)
+         .group_by(func.coalesce(ParsedChannel.source, 'telegram'))
+    )
+    by_source = {row[0] or 'unknown': row[1] for row in by_src_q.fetchall()}
+
+    # ── сегодня: каналы добавленные сегодня ──
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_added_q = await db.execute(
+        select(func.count(ParsedChannel.id)).where(
+            ParsedChannel.user_id == current_user.id,
+            ParsedChannel.added_at >= today_start,
+        )
+    )
+    today_added = today_added_q.scalar() or 0
+
+    # ── сегодня: FLOOD события ──
+    flood_q = await db.execute(
+        select(
+            func.count(ParserEvent.id),
+            func.coalesce(func.sum(ParserEvent.wait_seconds), 0),
+        ).where(
+            ParserEvent.user_id == current_user.id,
+            ParserEvent.event_type == "flood_wait",
+            ParserEvent.created_at >= today_start,
+        )
+    )
+    row = flood_q.fetchone()
+    today_flood_events = row[0] or 0
+    today_flood_wait_sum = int(row[1] or 0)
+
+    # ── Avg speed (каналов в минуту) — из последних 10 session_done сегодня ──
+    speed_q = await db.execute(
+        select(ParserEvent.channels_saved, ParserEvent.duration_sec).where(
+            ParserEvent.user_id == current_user.id,
+            ParserEvent.event_type == "session_done",
+            ParserEvent.created_at >= today_start,
+            ParserEvent.duration_sec > 0,
+            ParserEvent.channels_saved > 0,
+        ).order_by(ParserEvent.created_at.desc()).limit(10)
+    )
+    rows = speed_q.fetchall()
+    if rows:
+        # каналов в минуту = sum(saved) / sum(duration_in_min)
+        total_saved = sum(r[0] for r in rows)
+        total_minutes = sum(r[1] for r in rows) / 60
+        avg_speed = round(total_saved / total_minutes, 1) if total_minutes > 0 else 0
+    else:
+        avg_speed = 0
+
+    # ── Всего FLOOD за всё время ──
+    total_flood_q = await db.execute(
+        select(func.count(ParserEvent.id)).where(
+            ParserEvent.user_id == current_user.id,
+            ParserEvent.event_type == "flood_wait",
+        )
+    )
+    total_flood = total_flood_q.scalar() or 0
+
+    return {
+        "total_channels": total_channels,
+        "today_added": today_added,
+        "today_flood_events": today_flood_events,
+        "today_flood_wait_seconds": today_flood_wait_sum,
+        "total_flood_events": total_flood,
+        "avg_speed_per_min": avg_speed,
+        "by_source": by_source,
+    }
+
+
+@router.get("/stats/activity")
+async def get_parser_activity(
+    days: int = 7,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """График активности: сколько каналов добавлено в БД по дням."""
+    from datetime import datetime, timedelta
+    from sqlalchemy import func, cast, Date
+
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    q = await db.execute(
+        select(
+            cast(ParsedChannel.added_at, Date).label("day"),
+            func.count(ParsedChannel.id),
+        ).where(
+            ParsedChannel.user_id == current_user.id,
+            ParsedChannel.added_at >= cutoff,
+        ).group_by("day").order_by("day")
+    )
+
+    # заполним дыры нулями
+    by_day = {row[0].isoformat(): row[1] for row in q.fetchall()}
+    result = []
+    today = datetime.utcnow().date()
+    for i in range(days, -1, -1):
+        d = today - timedelta(days=i)
+        result.append({
+            "date": d.isoformat(),
+            "count": by_day.get(d.isoformat(), 0),
+        })
+
+    return {"days": result}
+
+
+@router.get("/stats/flood-events")
+async def get_flood_events(
+    limit: int = 20,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Последние FLOOD_WAIT события."""
+    from models.parser_event import ParserEvent
+
+    q = await db.execute(
+        select(ParserEvent).where(
+            ParserEvent.user_id == current_user.id,
+            ParserEvent.event_type == "flood_wait",
+        ).order_by(ParserEvent.created_at.desc()).limit(limit)
+    )
+    events = q.scalars().all()
+
+    return [
+        {
+            "id": e.id,
+            "source": e.source,
+            "wait_seconds": e.wait_seconds,
+            "seed": e.seed,
+            "details": e.details,
+            "account_id": e.account_id,
+            "created_at": e.created_at.isoformat() + "Z",
+        }
+        for e in events
+    ]
+
+
+@router.get("/stats/top-seeds")
+async def get_top_seeds(
+    limit: int = 10,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Топ seeds — какие source_seed дали больше всего каналов.
+    Считаем из parsed_channels.search_query (формат "similar:@seed" или обычное keyword).
+    """
+    from sqlalchemy import func
+
+    q = await db.execute(
+        select(
+            ParsedChannel.search_query,
+            func.count(ParsedChannel.id).label("cnt"),
+        ).where(
+            ParsedChannel.user_id == current_user.id,
+            ParsedChannel.search_query != "",
+        ).group_by(ParsedChannel.search_query)
+         .order_by(func.count(ParsedChannel.id).desc())
+         .limit(limit)
+    )
+
+    return [
+        {"seed": row[0] or "(пусто)", "count": row[1]}
+        for row in q.fetchall()
+    ]
+
+
+@router.get("/stats/by-account")
+async def get_stats_by_account(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Сколько каналов нашёл каждый аккаунт (через parser_events.account_id)."""
+    from sqlalchemy import func
+    from models.parser_event import ParserEvent
+    from models.account import TelegramAccount
+
+    q = await db.execute(
+        select(
+            ParserEvent.account_id,
+            func.coalesce(func.sum(ParserEvent.channels_saved), 0).label("saved"),
+            func.coalesce(func.sum(ParserEvent.channels_found), 0).label("found"),
+            func.count(ParserEvent.id).label("sessions"),
+        ).where(
+            ParserEvent.user_id == current_user.id,
+            ParserEvent.event_type == "session_done",
+            ParserEvent.account_id.isnot(None),
+        ).group_by(ParserEvent.account_id)
+         .order_by(func.sum(ParserEvent.channels_saved).desc())
+    )
+
+    rows = q.fetchall()
+    if not rows:
+        return []
+
+    # Подтягиваем имена аккаунтов
+    acc_ids = [r[0] for r in rows]
+    acc_q = await db.execute(
+        select(TelegramAccount).where(TelegramAccount.id.in_(acc_ids))
+    )
+    acc_map = {a.id: a for a in acc_q.scalars().all()}
+
+    result = []
+    for r in rows:
+        acc = acc_map.get(r[0])
+        result.append({
+            "account_id": r[0],
+            "name": (acc.first_name or acc.phone or f"#{r[0]}") if acc else f"#{r[0]}",
+            "saved": int(r[1]),
+            "found": int(r[2]),
+            "sessions": int(r[3]),
+        })
+    return result
+
+
+@router.get("/stats/sessions")
+async def get_recent_sessions(
+    limit: int = 20,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Последние завершённые сессии парсинга."""
+    from models.parser_event import ParserEvent
+
+    q = await db.execute(
+        select(ParserEvent).where(
+            ParserEvent.user_id == current_user.id,
+            ParserEvent.event_type == "session_done",
+        ).order_by(ParserEvent.created_at.desc()).limit(limit)
+    )
+    events = q.scalars().all()
+
+    return [
+        {
+            "id": e.id,
+            "source": e.source,
+            "account_id": e.account_id,
+            "found": e.channels_found,
+            "saved": e.channels_saved,
+            "duration_sec": e.duration_sec,
+            "speed_per_min": round(e.channels_saved / (e.duration_sec / 60), 1) if e.duration_sec > 0 else 0,
+            "details": e.details,
+            "created_at": e.created_at.isoformat() + "Z",
+        }
+        for e in events
+    ]

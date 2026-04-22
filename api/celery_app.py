@@ -34,7 +34,8 @@ celery_app = Celery(
         "tasks.warmup_v2",
         "tasks.subscribe_tasks",
         "tasks.plan_executor",
-        "tasks.parser_tasks", 
+        "tasks.parser_tasks",
+        "tasks.parser_similar_tasks",   # ← ДОБАВЛЕНО: crawler похожих каналов
     ]
 )
 
@@ -46,12 +47,14 @@ celery_app.conf.update(
     enable_utc=True,
 
     task_routes={
-        "tasks.account_tasks.*":    {"queue": "high_priority"},
-        "tasks.proxy_tasks.*":      {"queue": "high_priority"},
-        "tasks.bulk_tasks.*":       {"queue": "bulk_actions"},
-        "tasks.ai_tasks.*":         {"queue": "ai_dialogs"},
-        "tasks.commenting_tasks.*": {"queue": "ai_dialogs"},
-        "tasks.comment_executor.*": {"queue": "ai_dialogs"},
+        "tasks.account_tasks.*":         {"queue": "high_priority"},
+        "tasks.proxy_tasks.*":           {"queue": "high_priority"},
+        "tasks.bulk_tasks.*":            {"queue": "bulk_actions"},
+        "tasks.ai_tasks.*":              {"queue": "ai_dialogs"},
+        "tasks.commenting_tasks.*":      {"queue": "ai_dialogs"},
+        "tasks.comment_executor.*":      {"queue": "ai_dialogs"},
+        "tasks.parser_tasks.*":          {"queue": "ai_dialogs"},
+        "tasks.parser_similar_tasks.*":  {"queue": "ai_dialogs"},   # ← маршрут для crawler
     },
 
     result_expires=3600,
