@@ -795,50 +795,58 @@ async def list_keyword_geos(
     }
 
 # ══════════════════════════════════════════════════════════
-# Parser Metrics / Stats — дашборд парсера
-# ══════════════════════════════════════════════════════════
+# Parser Metrics / Stats — дашборд парсера (v2, без ParsedChannel.source)
+#
+# Эти endpoints ЗАМЕНЯЮТ предыдущие /parser/stats/* в api/routers/parser.py
+# Удали старые (если уже вставил) и вставь эти.
+#
 # Требует:
 #   from datetime import datetime, timedelta
-#   from sqlalchemy import func, and_
+#   from sqlalchemy import func, case, cast, Date
 #   from models.parser_event import ParserEvent
-#
-# Если этих импортов ещё нет — добавь в начало parser.py
+# ══════════════════════════════════════════════════════════
+
+
+def _classify_source_sql():
+    """SQL CASE-выражение: определяет source канала по search_query."""
+    from sqlalchemy import case, func
+    # similar:@xxx → similar
+    # import → import
+    # всё остальное → search (telegram)
+    return case(
+        (func.coalesce(ParsedChannel.search_query, '').like('similar:%'), 'similar'),
+        (func.coalesce(ParsedChannel.search_query, '') == 'import', 'import'),
+        else_='search',
+    )
 
 
 @router.get("/stats/overview")
 async def get_parser_stats_overview(
-    period: str = "all",  # "today" | "all"
+    period: str = "all",
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    KPI-метрики парсера: общее + сегодня.
-    Возвращает:
-      - total_channels
-      - today_added
-      - today_flood_events
-      - today_flood_wait_sum (секунды)
-      - avg_speed (каналов в минуту, по последним session_done)
-      - by_source: {search, similar, import}
-    """
-    from datetime import datetime, timedelta, timezone
-    from sqlalchemy import func, and_
+    """KPI-метрики парсера: общее + сегодня."""
+    from datetime import datetime, timedelta
+    from sqlalchemy import func, case
     from models.parser_event import ParserEvent
 
-    # ── общее: каналы в БД + по source ──
+    # ── общее: каналы в БД ──
     total_q = await db.execute(
         select(func.count(ParsedChannel.id)).where(ParsedChannel.user_id == current_user.id)
     )
     total_channels = total_q.scalar() or 0
 
+    # ── по source (определяем через search_query) ──
+    source_case = _classify_source_sql()
     by_src_q = await db.execute(
         select(
-            func.coalesce(ParsedChannel.source, 'telegram'),
-            func.count(ParsedChannel.id),
+            source_case.label("source"),
+            func.count(ParsedChannel.id).label("cnt"),
         ).where(ParsedChannel.user_id == current_user.id)
-         .group_by(func.coalesce(ParsedChannel.source, 'telegram'))
+         .group_by(source_case)
     )
-    by_source = {row[0] or 'unknown': row[1] for row in by_src_q.fetchall()}
+    by_source = {row[0]: row[1] for row in by_src_q.fetchall()}
 
     # ── сегодня: каналы добавленные сегодня ──
     today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -865,7 +873,7 @@ async def get_parser_stats_overview(
     today_flood_events = row[0] or 0
     today_flood_wait_sum = int(row[1] or 0)
 
-    # ── Avg speed (каналов в минуту) — из последних 10 session_done сегодня ──
+    # ── Avg speed (каналов/мин) — из последних 10 session_done сегодня ──
     speed_q = await db.execute(
         select(ParserEvent.channels_saved, ParserEvent.duration_sec).where(
             ParserEvent.user_id == current_user.id,
@@ -877,7 +885,6 @@ async def get_parser_stats_overview(
     )
     rows = speed_q.fetchall()
     if rows:
-        # каналов в минуту = sum(saved) / sum(duration_in_min)
         total_saved = sum(r[0] for r in rows)
         total_minutes = sum(r[1] for r in rows) / 60
         avg_speed = round(total_saved / total_minutes, 1) if total_minutes > 0 else 0
@@ -925,7 +932,6 @@ async def get_parser_activity(
         ).group_by("day").order_by("day")
     )
 
-    # заполним дыры нулями
     by_day = {row[0].isoformat(): row[1] for row in q.fetchall()}
     result = []
     today = datetime.utcnow().date()
@@ -976,10 +982,7 @@ async def get_top_seeds(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Топ seeds — какие source_seed дали больше всего каналов.
-    Считаем из parsed_channels.search_query (формат "similar:@seed" или обычное keyword).
-    """
+    """Топ seeds — какие search_query дали больше всего каналов."""
     from sqlalchemy import func
 
     q = await db.execute(
@@ -1008,7 +1011,6 @@ async def get_stats_by_account(
     """Сколько каналов нашёл каждый аккаунт (через parser_events.account_id)."""
     from sqlalchemy import func
     from models.parser_event import ParserEvent
-    from models.account import TelegramAccount
 
     q = await db.execute(
         select(
@@ -1028,7 +1030,6 @@ async def get_stats_by_account(
     if not rows:
         return []
 
-    # Подтягиваем имена аккаунтов
     acc_ids = [r[0] for r in rows]
     acc_q = await db.execute(
         select(TelegramAccount).where(TelegramAccount.id.in_(acc_ids))

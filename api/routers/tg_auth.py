@@ -2,6 +2,11 @@
 GramGPT API — routers/tg_auth.py
 Веб-авторизация Telegram аккаунтов.
 python-socks (async) + dict формат — работает напрямую в uvicorn без потоков.
+
+Мульти-API поддержка:
+  - api_app_id передаётся с фронта → используем этот api_id/hash/platform
+  - api_app_id не передан → используем глобальный config
+  - platform определяет пул устройств (android/ios/desktop/macos)
 """
 
 import asyncio
@@ -10,6 +15,7 @@ import os
 import importlib.util
 import logging
 from pathlib import Path
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -20,6 +26,7 @@ from database import get_db
 from routers.deps import get_current_user
 from models.user import User
 from models.proxy import Proxy
+from models.api_app import ApiApp
 from services.accounts import get_account_by_phone, sync_from_dict
 
 logger = logging.getLogger(__name__)
@@ -53,7 +60,8 @@ def _session_key(user_id: int, phone: str) -> str:
 
 class SendCodeRequest(BaseModel):
     phone: str
-    proxy_id: int | None = None
+    proxy_id: Optional[int] = None
+    api_app_id: Optional[int] = None   # Мульти-API: какой api_id использовать
 
 class ConfirmCodeRequest(BaseModel):
     phone: str
@@ -98,24 +106,36 @@ def _make_proxy(proxy_row):
     return proxy
 
 
-def _make_client(phone, proxy_dict=None):
-    if not proxy_dict:
-        raise ValueError("Proxy is required for Telegram connection")
+def _make_client(phone, proxy_dict=None, api_id=None, api_hash=None, platform="android"):
+    """
+    Создаёт Telethon клиент для авторизации.
+    api_id/hash — если не переданы, берутся из глобального config.
+    platform — для выбора device из DEVICE_POOLS.
+    """
+    from utils.telegram import _get_device_for_platform
     from telethon import TelegramClient
-    import sys
-    api_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    if api_dir not in sys.path:
-        sys.path.insert(0, api_dir)
-    from utils.telegram import _get_device_fingerprint
-    cli_config = load_cli_config()
-    session_path = str(cli_config.SESSIONS_DIR / phone.replace("+", ""))
-    
-    # Проверяем есть ли уже fingerprint в БД
-    # При авторизации — используем fingerprint по хешу (новый или существующий)
-    fingerprint = _get_device_fingerprint(phone)
-    
+
+    # Device из пула платформы
+    fingerprint = _get_device_for_platform(phone, platform)
+
+    # API credentials
+    if not api_id or not api_hash:
+        cli_config = load_cli_config()
+        api_id = api_id or cli_config.API_ID
+        api_hash = api_hash or cli_config.API_HASH
+
+    # Session path
+    sessions_dir = os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "..", "sessions"
+    ))
+    os.makedirs(sessions_dir, exist_ok=True)
+    session_path = os.path.join(sessions_dir, phone.replace("+", "")) + ".session"
+
+    print(f"🔑 _make_client: api_id={api_id}, platform={platform}, device={fingerprint['device']}")
+
     return TelegramClient(
-        session_path, cli_config.API_ID, cli_config.API_HASH,
+        session_path.replace(".session", ""),
+        api_id, api_hash,
         proxy=proxy_dict,
         device_model=fingerprint["device"],
         system_version=fingerprint["system"],
@@ -126,10 +146,36 @@ def _make_client(phone, proxy_dict=None):
     )
 
 
+async def _load_api_app_creds(db, api_app_id: int, user_id: int):
+    """
+    Загружает api_app по ID, возвращает (api_id, api_hash, platform).
+    Если api_app_id = None → возвращает (None, None, 'android').
+    Если не найден → HTTPException.
+    """
+    if not api_app_id:
+        return None, None, "android"
+
+    app_r = await db.execute(
+        select(ApiApp).where(
+            ApiApp.id == api_app_id,
+            ApiApp.user_id == user_id,
+            ApiApp.is_active == True,
+        )
+    )
+    api_app = app_r.scalar_one_or_none()
+    if not api_app:
+        raise HTTPException(status_code=404, detail="API app не найден или неактивен")
+
+    platform = getattr(api_app, 'platform', 'android') or 'android'
+    print(f"🔑 Используем API app #{api_app_id}: api_id={api_app.api_id}, platform={platform}")
+    return api_app.api_id, api_app.api_hash, platform
+
+
 # ── Storage ──────────────────────────────────────────────────
 
-ACTIVE_CLIENTS = {}  # phone → TelegramClient (живой, подключённый)
-PENDING_PROXY = {}   # phone → proxy_id
+ACTIVE_CLIENTS = {}    # phone → TelegramClient (живой, подключённый)
+PENDING_PROXY = {}     # phone → proxy_id
+PENDING_API_APP = {}   # phone → api_app_id (для привязки к аккаунту после confirm)
 
 
 # ── Endpoints ────────────────────────────────────────────────
@@ -143,7 +189,7 @@ async def send_code(
     phone = body.phone.strip()
     if not phone.startswith("+"): phone = "+" + phone
 
-    print(f"🔑 SEND-CODE: phone={phone}, proxy_id={body.proxy_id}")
+    print(f"🔑 SEND-CODE: phone={phone}, proxy_id={body.proxy_id}, api_app_id={body.api_app_id}")
 
     # Очищаем старого клиента
     if phone in ACTIVE_CLIENTS:
@@ -170,8 +216,20 @@ async def send_code(
     if not proxy_dict:
         raise HTTPException(status_code=400, detail="Прокси обязателен. Выберите прокси перед авторизацией.")
 
+    # Загружаем API app если передан
+    api_id_use, api_hash_use, platform_use = await _load_api_app_creds(
+        db, body.api_app_id, current_user.id
+    )
+    if body.api_app_id:
+        PENDING_API_APP[phone] = body.api_app_id
+
     print(f"🔑 proxy_dict = {proxy_dict}")
-    client = _make_client(phone, proxy_dict)
+    client = _make_client(
+        phone, proxy_dict,
+        api_id=api_id_use,
+        api_hash=api_hash_use,
+        platform=platform_use,
+    )
 
     try:
         await asyncio.wait_for(client.connect(), timeout=45)
@@ -252,7 +310,17 @@ async def confirm_code(
             result = await db.execute(select(Proxy).where(Proxy.id == proxy_id))
             proxy_row = result.scalar_one_or_none()
             if proxy_row: proxy_dict = _make_proxy(proxy_row)
-        client = _make_client(phone, proxy_dict)
+
+        # Загружаем api_app чтобы использовать правильный api_id/platform при реконнекте
+        api_app_id = PENDING_API_APP.get(phone)
+        api_id_use, api_hash_use, platform_use = await _load_api_app_creds(
+            db, api_app_id, current_user.id
+        )
+
+        client = _make_client(
+            phone, proxy_dict,
+            api_id=api_id_use, api_hash=api_hash_use, platform=platform_use,
+        )
         await client.connect()
     else:
         print(f"🔑 CONFIRM: используем живого клиента")
@@ -277,9 +345,18 @@ async def confirm_code(
 
         db_account = await _save_account(db, current_user, phone, me)
 
+        # Привязываем прокси
         proxy_id = PENDING_PROXY.pop(phone, None)
         if proxy_id and db_account:
             db_account.proxy_id = proxy_id
+
+        # Привязываем api_app
+        api_app_id = PENDING_API_APP.pop(phone, None)
+        if api_app_id and db_account:
+            db_account.api_app_id = api_app_id
+            print(f"🔑 Аккаунт #{db_account.id} привязан к API app #{api_app_id}")
+
+        if proxy_id or api_app_id:
             await db.flush()
 
         return AuthResult(success=True, phone=phone, first_name=me.first_name or "",
@@ -311,7 +388,17 @@ async def confirm_2fa(
             result = await db.execute(select(Proxy).where(Proxy.id == proxy_id))
             proxy_row = result.scalar_one_or_none()
             if proxy_row: proxy_dict = _make_proxy(proxy_row)
-        client = _make_client(phone, proxy_dict)
+
+        # Загружаем api_app
+        api_app_id = PENDING_API_APP.get(phone)
+        api_id_use, api_hash_use, platform_use = await _load_api_app_creds(
+            db, api_app_id, current_user.id
+        )
+
+        client = _make_client(
+            phone, proxy_dict,
+            api_id=api_id_use, api_hash=api_hash_use, platform=platform_use,
+        )
         await client.connect()
 
     try:
@@ -331,9 +418,18 @@ async def confirm_2fa(
 
         db_account = await _save_account(db, current_user, phone, me)
 
+        # Привязываем прокси
         proxy_id = PENDING_PROXY.pop(phone, None)
         if proxy_id and db_account:
             db_account.proxy_id = proxy_id
+
+        # Привязываем api_app
+        api_app_id = PENDING_API_APP.pop(phone, None)
+        if api_app_id and db_account:
+            db_account.api_app_id = api_app_id
+            print(f"🔑 Аккаунт #{db_account.id} привязан к API app #{api_app_id}")
+
+        if proxy_id or api_app_id:
             await db.flush()
 
         return AuthResult(success=True, phone=phone, first_name=me.first_name or "",
@@ -365,7 +461,15 @@ async def add_already_authorized(
         proxy_row = result.scalar_one_or_none()
         if proxy_row: proxy_dict = _make_proxy(proxy_row)
 
-    client = _make_client(phone, proxy_dict)
+    # Загружаем api_app если передан
+    api_id_use, api_hash_use, platform_use = await _load_api_app_creds(
+        db, body.api_app_id, current_user.id
+    )
+
+    client = _make_client(
+        phone, proxy_dict,
+        api_id=api_id_use, api_hash=api_hash_use, platform=platform_use,
+    )
 
     try:
         await asyncio.wait_for(client.connect(), timeout=45)
@@ -377,8 +481,14 @@ async def add_already_authorized(
         await client.disconnect()
 
         db_account = await _save_account(db, current_user, phone, me)
+
+        # Привязываем прокси и api_app
         if body.proxy_id and db_account:
             db_account.proxy_id = body.proxy_id
+        if body.api_app_id and db_account:
+            db_account.api_app_id = body.api_app_id
+
+        if (body.proxy_id or body.api_app_id) and db_account:
             await db.flush()
 
         return {"success": True, "account_id": db_account.id, "phone": phone,
@@ -413,6 +523,21 @@ async def _save_account(db, current_user, phone, me):
     account_dict["session_file"] = str(cli_config.SESSIONS_DIR / phone.replace("+", "")) + ".session"
     account_dict["status"] = "active"
     account_dict["trust_score"] = trust_module.calculate(account_dict)
-    from utils.telegram import _get_device_fingerprint
-    fp = _get_device_fingerprint(phone)
+
+    # Device fingerprint — выбираем по платформе api_app если есть
+    api_app_id = PENDING_API_APP.get(phone)
+    platform_for_fp = "android"
+    if api_app_id:
+        app_r = await db.execute(select(ApiApp).where(ApiApp.id == api_app_id))
+        api_app = app_r.scalar_one_or_none()
+        if api_app:
+            platform_for_fp = getattr(api_app, 'platform', 'android') or 'android'
+
+    from utils.telegram import _get_device_for_platform
+    fp = _get_device_for_platform(phone, platform_for_fp)
     account_dict["device_fingerprint"] = f"{fp['device']}|{fp['system']}|{fp['app_version']}"
+
+    print(f"🔑 Device fingerprint (platform={platform_for_fp}): {fp['device']} / {fp['system']}")
+
+    db_account = await sync_from_dict(db, current_user.id, account_dict)
+    return db_account

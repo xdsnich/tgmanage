@@ -3,6 +3,12 @@ GramGPT API — models/api_app.py
 Telegram API приложения (api_id + api_hash).
 Позволяет распределять аккаунты по разным API-ключам,
 чтобы избежать массового бана при масштабировании.
+
+platform:
+  - 'android'  → Samsung/Xiaomi/Pixel/OnePlus/Honor, Android 13/14
+  - 'ios'      → iPhone 12-15 Pro/Max, iPad, iOS 17
+  - 'desktop'  → PC, Windows 10/11, Linux
+  - 'macos'    → MacBook Pro/Air/iMac, macOS 14
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ class ApiApp(Base):
     api_id:        Mapped[int]      = mapped_column(Integer, nullable=False)
     api_hash:      Mapped[str]      = mapped_column(String(64), nullable=False)
     title:         Mapped[str]      = mapped_column(String(128), default="")
+    platform:      Mapped[str]      = mapped_column(String(16), default="android", server_default="android", index=True)
     max_accounts:  Mapped[int]      = mapped_column(Integer, default=100)
     is_active:     Mapped[bool]     = mapped_column(Boolean, default=True)
     notes:         Mapped[str]      = mapped_column(Text, default="")
@@ -45,4 +52,4 @@ class ApiApp(Base):
         return self.accounts_count >= self.max_accounts
 
     def __repr__(self):
-        return f"<ApiApp #{self.id} '{self.title}' api_id={self.api_id} [{self.accounts_count}/{self.max_accounts}]>"
+        return f"<ApiApp #{self.id} '{self.title}' api_id={self.api_id} platform={self.platform} [{self.accounts_count}/{self.max_accounts}]>"
