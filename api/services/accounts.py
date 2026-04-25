@@ -118,25 +118,44 @@ async def update_account(db: AsyncSession, account: TelegramAccount,
 
 
 async def delete_account(db: AsyncSession, account: TelegramAccount):
-    """Удаляет аккаунт из БД + удаляет .session файл с диска"""
-    # Удаляем .session файл если есть
+    """
+    Удаляет аккаунт из БД + удаляет .session файл с диска.
+    Если session_file в БД пустой — всё равно пытается найти файл
+    по номеру телефона (sessions/<phone>.session).
+    """
+    files_to_delete = []
+ 
+    # 1) Файл из БД (основной путь)
     if account.session_file:
-        session_path = Path(account.session_file)
-        if session_path.exists():
+        files_to_delete.append(Path(account.session_file))
+        files_to_delete.append(Path(str(account.session_file) + "-journal"))
+ 
+    # 2) Файл по номеру телефона (fallback — если в БД пусто или путь невалидный)
+    if account.phone:
+        import os as _os
+        sessions_dir = Path(_os.path.abspath(_os.path.join(
+            _os.path.dirname(__file__), "..", "..", "sessions"
+        )))
+        phone_clean = account.phone.replace("+", "")
+        fallback_session = sessions_dir / f"{phone_clean}.session"
+        fallback_journal = sessions_dir / f"{phone_clean}.session-journal"
+ 
+        # Добавляем если ещё не в списке
+        if fallback_session not in files_to_delete:
+            files_to_delete.append(fallback_session)
+        if fallback_journal not in files_to_delete:
+            files_to_delete.append(fallback_journal)
+ 
+    # Удаляем все найденные файлы
+    for path in files_to_delete:
+        if path.exists():
             try:
-                session_path.unlink()
-                logger.info(f"Удалён session файл: {session_path}")
+                path.unlink()
+                logger.info(f"Удалён файл: {path}")
             except Exception as e:
-                logger.warning(f"Не удалось удалить session файл {session_path}: {e}")
-
-        # Также удаляем .session-journal если есть
-        journal_path = Path(str(account.session_file) + "-journal")
-        if journal_path.exists():
-            try:
-                journal_path.unlink()
-            except:
-                pass
-
+                logger.warning(f"Не удалось удалить {path}: {e}")
+ 
+    # Удаляем запись из БД
     await db.delete(account)
     await db.flush()
 

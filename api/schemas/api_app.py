@@ -55,6 +55,12 @@ KNOWN_PUBLIC_APIS = {
         "platform": "android",
         "description": "Экспериментальный Android клиент от Telegram.",
     },
+    2496: {
+    "title": "Telegram Web K",
+    "api_hash": "8da85b0d5bfe62527e5b244c209159c3",
+    "platform": "desktop",
+    "description": "Веб-клиент Telegram (web.telegram.org/k). Подходит для аккаунтов из браузера.",
+},
 }
 
 

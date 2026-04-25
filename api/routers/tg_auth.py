@@ -1,7 +1,6 @@
 """
 GramGPT API — routers/tg_auth.py
 Веб-авторизация Telegram аккаунтов.
-python-socks (async) + dict формат — работает напрямую в uvicorn без потоков.
 
 Мульти-API поддержка:
   - api_app_id передаётся с фронта → используем этот api_id/hash/platform
@@ -27,7 +26,8 @@ from routers.deps import get_current_user
 from models.user import User
 from models.proxy import Proxy
 from models.api_app import ApiApp
-from services.accounts import get_account_by_phone, sync_from_dict
+from models.account import TelegramAccount
+from services.accounts import get_account_by_phone
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,7 @@ def _session_key(user_id: int, phone: str) -> str:
 class SendCodeRequest(BaseModel):
     phone: str
     proxy_id: Optional[int] = None
-    api_app_id: Optional[int] = None   # Мульти-API: какой api_id использовать
+    api_app_id: Optional[int] = None
 
 class ConfirmCodeRequest(BaseModel):
     phone: str
@@ -89,7 +89,6 @@ class AuthResult(BaseModel):
 # ── Proxy + Client ───────────────────────────────────────────
 
 def _make_proxy(proxy_row):
-    """Dict формат для python-socks — проверено, работает"""
     if not proxy_row:
         return None
     proto_str = proxy_row.protocol.value if hasattr(proxy_row.protocol, 'value') else str(proxy_row.protocol)
@@ -107,24 +106,17 @@ def _make_proxy(proxy_row):
 
 
 def _make_client(phone, proxy_dict=None, api_id=None, api_hash=None, platform="android"):
-    """
-    Создаёт Telethon клиент для авторизации.
-    api_id/hash — если не переданы, берутся из глобального config.
-    platform — для выбора device из DEVICE_POOLS.
-    """
+    """Создаёт Telethon клиент для авторизации."""
     from utils.telegram import _get_device_for_platform
     from telethon import TelegramClient
 
-    # Device из пула платформы
     fingerprint = _get_device_for_platform(phone, platform)
 
-    # API credentials
     if not api_id or not api_hash:
         cli_config = load_cli_config()
         api_id = api_id or cli_config.API_ID
         api_hash = api_hash or cli_config.API_HASH
 
-    # Session path
     sessions_dir = os.path.abspath(os.path.join(
         os.path.dirname(__file__), "..", "..", "sessions"
     ))
@@ -147,11 +139,7 @@ def _make_client(phone, proxy_dict=None, api_id=None, api_hash=None, platform="a
 
 
 async def _load_api_app_creds(db, api_app_id: int, user_id: int):
-    """
-    Загружает api_app по ID, возвращает (api_id, api_hash, platform).
-    Если api_app_id = None → возвращает (None, None, 'android').
-    Если не найден → HTTPException.
-    """
+    """Загружает api_app по ID. Возвращает (api_id, api_hash, platform)."""
     if not api_app_id:
         return None, None, "android"
 
@@ -173,9 +161,9 @@ async def _load_api_app_creds(db, api_app_id: int, user_id: int):
 
 # ── Storage ──────────────────────────────────────────────────
 
-ACTIVE_CLIENTS = {}    # phone → TelegramClient (живой, подключённый)
-PENDING_PROXY = {}     # phone → proxy_id
-PENDING_API_APP = {}   # phone → api_app_id (для привязки к аккаунту после confirm)
+ACTIVE_CLIENTS = {}
+PENDING_PROXY = {}
+PENDING_API_APP = {}
 
 
 # ── Endpoints ────────────────────────────────────────────────
@@ -191,13 +179,11 @@ async def send_code(
 
     print(f"🔑 SEND-CODE: phone={phone}, proxy_id={body.proxy_id}, api_app_id={body.api_app_id}")
 
-    # Очищаем старого клиента
     if phone in ACTIVE_CLIENTS:
         try: await ACTIVE_CLIENTS[phone].disconnect()
         except: pass
         del ACTIVE_CLIENTS[phone]
 
-    # Загружаем прокси
     proxy_dict = None
     if body.proxy_id:
         result = await db.execute(
@@ -209,26 +195,22 @@ async def send_code(
             PENDING_PROXY[phone] = body.proxy_id
             print(f"🔑 ПРОКСИ: {proxy_row.host}:{proxy_row.port} ({proxy_row.protocol})")
         else:
-            print(f"🔑 ПРОКСИ НЕ НАЙДЕН в БД: id={body.proxy_id}")
+            print(f"🔑 ПРОКСИ НЕ НАЙДЕН: id={body.proxy_id}")
     else:
-        print("🔑 БЕЗ ПРОКСИ — proxy_id не передан с фронта!")
+        print("🔑 БЕЗ ПРОКСИ")
 
     if not proxy_dict:
         raise HTTPException(status_code=400, detail="Прокси обязателен. Выберите прокси перед авторизацией.")
 
-    # Загружаем API app если передан
     api_id_use, api_hash_use, platform_use = await _load_api_app_creds(
         db, body.api_app_id, current_user.id
     )
     if body.api_app_id:
         PENDING_API_APP[phone] = body.api_app_id
 
-    print(f"🔑 proxy_dict = {proxy_dict}")
     client = _make_client(
         phone, proxy_dict,
-        api_id=api_id_use,
-        api_hash=api_hash_use,
-        platform=platform_use,
+        api_id=api_id_use, api_hash=api_hash_use, platform=platform_use,
     )
 
     try:
@@ -240,11 +222,8 @@ async def send_code(
                                     message="Аккаунт уже авторизован.")
 
         sent = await client.send_code_request(phone)
-
-        # Сохраняем клиента — нужен для confirm
         ACTIVE_CLIENTS[phone] = client
 
-        # Сохраняем hash в Redis
         r = _redis()
         r.setex(_session_key(current_user.id, phone), 600,
                 json.dumps({"phone_code_hash": sent.phone_code_hash, "phone": phone}))
@@ -268,6 +247,17 @@ async def send_code(
         import traceback
         print(f"🔑 ❌ SEND-CODE EXCEPTION: {type(e).__name__}: {err}")
         print(f"🔑 ❌ TRACEBACK:\n{traceback.format_exc()}")
+        if "RECAPTCHA" in err:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "⚠ Telegram требует пройти капчу для этого номера/прокси. "
+                    "Причины: подозрительная активность на этом IP, номер с плохой репутацией, "
+                    "или слишком много попыток. "
+                    "РЕШЕНИЕ: попробуй другой прокси (желательно резидентский) "
+                    "или войди в аккаунт через официальный Telegram и экспортни TData."
+                )
+            )
         if "PHONE_NUMBER_INVALID" in err:
             raise HTTPException(status_code=400, detail="Неверный номер телефона")
         if "FLOOD_WAIT" in err:
@@ -299,19 +289,16 @@ async def confirm_code(
     session_data = json.loads(raw)
     phone_code_hash = session_data["phone_code_hash"]
 
-    # Берём живого клиента
     client = ACTIVE_CLIENTS.get(phone)
     if not client:
         print(f"🔑 CONFIRM: нет живого клиента, создаю нового")
         proxy_dict = None
         proxy_id = PENDING_PROXY.get(phone)
-        print(f"🔑 CONFIRM: PENDING_PROXY={proxy_id}")
         if proxy_id:
             result = await db.execute(select(Proxy).where(Proxy.id == proxy_id))
             proxy_row = result.scalar_one_or_none()
             if proxy_row: proxy_dict = _make_proxy(proxy_row)
 
-        # Загружаем api_app чтобы использовать правильный api_id/platform при реконнекте
         api_app_id = PENDING_API_APP.get(phone)
         api_id_use, api_hash_use, platform_use = await _load_api_app_creds(
             db, api_app_id, current_user.id
@@ -337,7 +324,6 @@ async def confirm_code(
         except errors.PhoneCodeExpiredError:
             raise HTTPException(status_code=400, detail="Код истёк — запроси новый")
 
-        # Успех
         me = await client.get_me()
         await client.disconnect()
         ACTIVE_CLIENTS.pop(phone, None)
@@ -345,19 +331,16 @@ async def confirm_code(
 
         db_account = await _save_account(db, current_user, phone, me)
 
-        # Привязываем прокси
         proxy_id = PENDING_PROXY.pop(phone, None)
         if proxy_id and db_account:
             db_account.proxy_id = proxy_id
 
-        # Привязываем api_app
         api_app_id = PENDING_API_APP.pop(phone, None)
         if api_app_id and db_account:
             db_account.api_app_id = api_app_id
             print(f"🔑 Аккаунт #{db_account.id} привязан к API app #{api_app_id}")
 
-        if proxy_id or api_app_id:
-            await db.flush()
+        await db.flush()
 
         return AuthResult(success=True, phone=phone, first_name=me.first_name or "",
                           username=me.username or "", account_id=db_account.id,
@@ -368,6 +351,9 @@ async def confirm_code(
         try: await client.disconnect()
         except: pass
         ACTIVE_CLIENTS.pop(phone, None)
+        import traceback
+        print(f"🔑 ❌ CONFIRM EXCEPTION: {type(e).__name__}: {e}")
+        print(f"🔑 ❌ TRACEBACK:\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)[:200]}")
 
 
@@ -389,7 +375,6 @@ async def confirm_2fa(
             proxy_row = result.scalar_one_or_none()
             if proxy_row: proxy_dict = _make_proxy(proxy_row)
 
-        # Загружаем api_app
         api_app_id = PENDING_API_APP.get(phone)
         api_id_use, api_hash_use, platform_use = await _load_api_app_creds(
             db, api_app_id, current_user.id
@@ -418,19 +403,16 @@ async def confirm_2fa(
 
         db_account = await _save_account(db, current_user, phone, me)
 
-        # Привязываем прокси
         proxy_id = PENDING_PROXY.pop(phone, None)
         if proxy_id and db_account:
             db_account.proxy_id = proxy_id
 
-        # Привязываем api_app
         api_app_id = PENDING_API_APP.pop(phone, None)
         if api_app_id and db_account:
             db_account.api_app_id = api_app_id
             print(f"🔑 Аккаунт #{db_account.id} привязан к API app #{api_app_id}")
 
-        if proxy_id or api_app_id:
-            await db.flush()
+        await db.flush()
 
         return AuthResult(success=True, phone=phone, first_name=me.first_name or "",
                           username=me.username or "", account_id=db_account.id,
@@ -441,6 +423,9 @@ async def confirm_2fa(
         try: await client.disconnect()
         except: pass
         ACTIVE_CLIENTS.pop(phone, None)
+        import traceback
+        print(f"🔑 ❌ CONFIRM-2FA EXCEPTION: {type(e).__name__}: {e}")
+        print(f"🔑 ❌ TRACEBACK:\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)[:200]}")
 
 
@@ -461,7 +446,6 @@ async def add_already_authorized(
         proxy_row = result.scalar_one_or_none()
         if proxy_row: proxy_dict = _make_proxy(proxy_row)
 
-    # Загружаем api_app если передан
     api_id_use, api_hash_use, platform_use = await _load_api_app_creds(
         db, body.api_app_id, current_user.id
     )
@@ -482,14 +466,12 @@ async def add_already_authorized(
 
         db_account = await _save_account(db, current_user, phone, me)
 
-        # Привязываем прокси и api_app
         if body.proxy_id and db_account:
             db_account.proxy_id = body.proxy_id
         if body.api_app_id and db_account:
             db_account.api_app_id = body.api_app_id
 
-        if (body.proxy_id or body.api_app_id) and db_account:
-            await db.flush()
+        await db.flush()
 
         return {"success": True, "account_id": db_account.id, "phone": phone,
                 "first_name": me.first_name or "", "username": me.username or ""}
@@ -504,27 +486,17 @@ async def add_already_authorized(
 # ── Helper ───────────────────────────────────────────────────
 
 async def _save_account(db, current_user, phone, me):
-    """Сохраняет авторизованный аккаунт в БД"""
+    """
+    Сохраняет авторизованный аккаунт в БД.
+
+    ВАЖНО: пишет session_file НАПРЯМУЮ в модель TelegramAccount,
+    а не через sync_from_dict — чтобы избежать багов с user.id.
+    """
+    # Путь к session файлу
     cli_config = load_cli_config()
-    import sys
-    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-    if root_dir not in sys.path: sys.path.insert(0, root_dir)
-    api_config_cache = sys.modules.pop('config', None)
-    import trust as trust_module
-    from db import make_account_template
-    if api_config_cache: sys.modules['config'] = api_config_cache
+    session_file_path = str(cli_config.SESSIONS_DIR / phone.replace("+", "")) + ".session"
 
-    account_dict = make_account_template(phone)
-    account_dict["id"] = me.id
-    account_dict["first_name"] = me.first_name or ""
-    account_dict["last_name"] = me.last_name or ""
-    account_dict["username"] = me.username or ""
-    account_dict["has_photo"] = bool(me.photo)
-    account_dict["session_file"] = str(cli_config.SESSIONS_DIR / phone.replace("+", "")) + ".session"
-    account_dict["status"] = "active"
-    account_dict["trust_score"] = trust_module.calculate(account_dict)
-
-    # Device fingerprint — выбираем по платформе api_app если есть
+    # Device fingerprint по платформе api_app
     api_app_id = PENDING_API_APP.get(phone)
     platform_for_fp = "android"
     if api_app_id:
@@ -535,9 +507,48 @@ async def _save_account(db, current_user, phone, me):
 
     from utils.telegram import _get_device_for_platform
     fp = _get_device_for_platform(phone, platform_for_fp)
-    account_dict["device_fingerprint"] = f"{fp['device']}|{fp['system']}|{fp['app_version']}"
+    device_fingerprint = f"{fp['device']}|{fp['system']}|{fp['app_version']}"
 
+    print(f"🔑 _save_account: phone={phone}, session_file={session_file_path}")
     print(f"🔑 Device fingerprint (platform={platform_for_fp}): {fp['device']} / {fp['system']}")
 
-    db_account = await sync_from_dict(db, current_user.id, account_dict)
-    return db_account
+    # Ищем аккаунт в БД
+    existing = await get_account_by_phone(db, phone, current_user.id)
+
+    if existing:
+        # Обновляем
+        existing.tg_id = me.id
+        existing.first_name = me.first_name or ""
+        existing.last_name = me.last_name or ""
+        existing.username = me.username or ""
+        existing.has_photo = bool(me.photo)
+        existing.session_file = session_file_path
+        existing.status = "active"
+        existing.device_fingerprint = device_fingerprint
+        existing.trust_score = max(existing.trust_score or 0, 50)
+
+        from datetime import datetime
+        existing.updated_at = datetime.utcnow()
+
+        await db.flush()
+        print(f"🔑 Аккаунт #{existing.id} обновлён (session_file записан)")
+        return existing
+
+    # Создаём новый
+    account = TelegramAccount(
+        user_id=current_user.id,
+        phone=phone,
+        tg_id=me.id,
+        first_name=me.first_name or "",
+        last_name=me.last_name or "",
+        username=me.username or "",
+        has_photo=bool(me.photo),
+        session_file=session_file_path,
+        status="active",
+        trust_score=50,
+        device_fingerprint=device_fingerprint,
+    )
+    db.add(account)
+    await db.flush()
+    print(f"🔑 Аккаунт #{account.id} создан (session_file записан)")
+    return account

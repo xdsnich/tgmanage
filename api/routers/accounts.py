@@ -1092,3 +1092,94 @@ async def get_account_connections_stats(
         "week": week_count,
         "by_source_today": {row[0]: row[1] for row in by_source},
     }
+
+# ═══════════════════════════════════════════════════════════
+# DEBUG — что Telegram реально видит про нашу сессию
+# ═══════════════════════════════════════════════════════════
+
+@router.get("/{account_id}/debug/telegram-sees")
+async def debug_telegram_sees(
+    account_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Подключается к Telegram и показывает что он видит про нашу сессию."""
+    from telethon.tl.functions.account import GetAuthorizationsRequest
+
+    acc, client = await _get_acc_and_client(account_id, current_user.id, db)
+
+    fp_in_db = acc.device_fingerprint or "(none)"
+    api_app_info = None
+    if acc.api_app:
+        api_app_info = {
+            "id": acc.api_app.id,
+            "title": acc.api_app.title,
+            "api_id": acc.api_app.api_id,
+            "platform": getattr(acc.api_app, 'platform', 'android'),
+        }
+
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            return {"error": "Сессия не активна", "db_fingerprint": fp_in_db, "api_app": api_app_info}
+
+        result = await client(GetAuthorizationsRequest())
+
+        sessions = []
+        current_session = None
+        for auth in result.authorizations:
+            sess = {
+                "hash": str(auth.hash),
+                "current": auth.current,
+                "device_model": auth.device_model,
+                "system_version": auth.system_version,
+                "app_name": auth.app_name,
+                "app_version": auth.app_version,
+                "platform": auth.platform,
+                "country": auth.country,
+                "region": auth.region,
+                "ip": auth.ip,
+                "date_created": str(auth.date_created),
+                "date_active": str(auth.date_active),
+            }
+            sessions.append(sess)
+            if auth.current:
+                current_session = sess
+
+        await client.disconnect()
+
+        analysis = {"match": False, "reason": ""}
+        if current_session and fp_in_db and "|" in fp_in_db:
+            db_device = fp_in_db.split("|")[0]
+            tg_device = current_session["device_model"]
+            if db_device == tg_device:
+                analysis["match"] = True
+                analysis["reason"] = f"OK: БД и Telegram совпадают: {db_device}"
+            else:
+                analysis["match"] = False
+                analysis["reason"] = (
+                    f"MISMATCH: в БД '{db_device}', Telegram видит '{tg_device}'. "
+                    f"device_model не применился при connect()."
+                )
+
+        return {
+            "account_id": acc.id,
+            "phone": acc.phone,
+            "db_fingerprint": fp_in_db,
+            "api_app": api_app_info,
+            "current_telegram_session": current_session,
+            "all_telegram_sessions": sessions,
+            "analysis": analysis,
+        }
+
+    except Exception as e:
+        try: await client.disconnect()
+        except: pass
+        import traceback
+        return {
+            "error": f"{type(e).__name__}: {e}",
+            "traceback": traceback.format_exc()[-2000:],
+            "db_fingerprint": fp_in_db,
+            "api_app": api_app_info,
+        }

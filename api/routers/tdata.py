@@ -48,30 +48,85 @@ def _get_sessions_dir():
 
 # ── Session file import ──────────────────────────────────────
 
+# ── Helpers (новые) ──────────────────────────────────────────
+
+async def _resolve_proxy(db, proxy_id: int, user_id: int):
+    """Загружает прокси по ID и возвращает (proxy_row, proxy_dict)."""
+    from sqlalchemy import select as _sel
+    from models.proxy import Proxy as _Proxy
+    from routers.tg_auth import _make_proxy
+
+    proxy_r = await db.execute(
+        _sel(_Proxy).where(_Proxy.id == proxy_id, _Proxy.user_id == user_id)
+    )
+    proxy_row = proxy_r.scalar_one_or_none()
+    if not proxy_row:
+        raise HTTPException(status_code=404, detail=f"Прокси #{proxy_id} не найден")
+    return proxy_row, _make_proxy(proxy_row)
+
+
+async def _resolve_api_app(db, api_app_id: Optional[int], user_id: int):
+    """
+    Загружает api_app. Возвращает (api_id, api_hash, platform, api_app_id_to_save).
+    Если api_app_id=None → fallback на глобальный config + api_app_id_to_save=None.
+    """
+    if not api_app_id:
+        cli_config = _get_cli_config()
+        return cli_config.API_ID, cli_config.API_HASH, "android", None
+
+    from sqlalchemy import select as _sel
+    app_r = await db.execute(
+        _sel(ApiApp).where(
+            ApiApp.id == api_app_id,
+            ApiApp.user_id == user_id,
+            ApiApp.is_active == True,
+        )
+    )
+    api_app = app_r.scalar_one_or_none()
+    if not api_app:
+        raise HTTPException(status_code=404, detail="API app не найден или неактивен")
+
+    platform = getattr(api_app, 'platform', 'android') or 'android'
+    return api_app.api_id, api_app.api_hash, platform, api_app.id
+
+
+# ── Session file import (одиночный) ──────────────────────────
+
 @router.post("/session")
 async def import_session_file(
     file: UploadFile = File(...),
-    phone: str = Form(None),
+    phone: str = Form(""),
+    proxy_id: int = Form(...),                 # ← теперь ОБЯЗАТЕЛЕН
+    api_app_id: Optional[int] = Form(None),    # ← НОВОЕ
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Импорт .session файла (Telethon/Pyrogram).
-    Файл загружается, копируется в sessions/, подключается к TG для проверки.
+    Проверяет сессию через выбранный прокси + api_app, сохраняет в БД.
     """
     if not file.filename.endswith(".session"):
         raise HTTPException(status_code=400, detail="Файл должен быть .session формата")
 
     await acc_svc.check_limit(db, current_user)
 
-    sessions_dir = _get_sessions_dir()
-    cli_config = _get_cli_config()
+    # 1. Загружаем прокси
+    proxy_row, proxy_dict = await _resolve_proxy(db, proxy_id, current_user.id)
+    if not proxy_dict:
+        raise HTTPException(status_code=400, detail="Не удалось построить прокси")
 
-    # Определяем имя файла
+    # 2. Загружаем api_app (или fallback на global)
+    api_id_use, api_hash_use, platform_use, api_app_id_save = await _resolve_api_app(
+        db, api_app_id, current_user.id
+    )
+
+    sessions_dir = _get_sessions_dir()
+
+    # Имя файла: либо явный phone, либо берём из имени файла
     if phone:
         clean_phone = phone.strip().replace("+", "")
     else:
-        clean_phone = file.filename.replace(".session", "")
+        clean_phone = file.filename.replace(".session", "").replace("+", "")
 
     session_path = sessions_dir / f"{clean_phone}.session"
 
@@ -80,99 +135,82 @@ async def import_session_file(
     with open(session_path, "wb") as f:
         f.write(content)
 
-    # Пробуем подключиться и получить данные
+    # Подключаемся через Telethon с правильным device fingerprint для платформы
     from telethon import TelegramClient
+    from utils.telegram import _get_device_for_platform
 
-    # Require proxy for Telegram connection
-    from sqlalchemy import select as _select
-    from models.proxy import Proxy as _Proxy
-    proxy_dict = None
-    # Try to find any proxy for this user
-    _proxy_r = await db.execute(
-        _select(_Proxy).where(_Proxy.user_id == current_user.id).limit(1)
-    )
-    _proxy_row = _proxy_r.scalar_one_or_none()
-    if not _proxy_row:
-        raise HTTPException(status_code=400, detail="Прокси обязателен для импорта сессий. Добавьте прокси.")
-    from routers.tg_auth import _make_proxy
-    proxy_dict = _make_proxy(_proxy_row)
-
-    # Use consistent device fingerprint
-    import sys as _sys
-    _api_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    if _api_dir not in _sys.path:
-        _sys.path.insert(0, _api_dir)
-    from utils.telegram import _get_device_fingerprint
-    _phone_for_fp = phone or clean_phone
-    _fp = _get_device_fingerprint(f"+{_phone_for_fp}" if not _phone_for_fp.startswith("+") else _phone_for_fp)
+    fp = _get_device_for_platform(clean_phone, platform_use)
+    print(f"📄 Session import: api_id={api_id_use}, platform={platform_use}, device={fp['device']}")
 
     client = TelegramClient(
         str(session_path).replace(".session", ""),
-        cli_config.API_ID,
-        cli_config.API_HASH,
+        api_id_use, api_hash_use,
         proxy=proxy_dict,
-        device_model=_fp["device"],
-        system_version=_fp["system"],
-        app_version=_fp["app_version"],
+        device_model=fp["device"],
+        system_version=fp["system"],
+        app_version=fp["app_version"],
+        lang_code="en", system_lang_code="en",
+        timeout=30,
     )
 
     try:
-        await client.connect()
+        await asyncio.wait_for(client.connect(), timeout=45)
 
         if not await client.is_user_authorized():
             await client.disconnect()
-            # Файл сохранён, но сессия не активна — создаём аккаунт со статусом pending
-            real_phone = f"+{clean_phone}" if not clean_phone.startswith("+") else clean_phone
-            account = TelegramAccount(
-                user_id=current_user.id,
-                phone=real_phone,
-                session_file=str(session_path),
-                status="unknown",
+            try:
+                Path(session_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code=400,
+                detail="Сессия не авторизована. Возможно файл повреждён или сессия истекла."
             )
-            db.add(account)
-            await db.flush()
-            return {
-                "success": True,
-                "account_id": account.id,
-                "phone": real_phone,
-                "status": "unknown",
-                "message": "Файл загружен, но сессия не активна. Попробуйте авторизовать аккаунт.",
-            }
 
         me = await client.get_me()
         await client.disconnect()
 
         real_phone = f"+{me.phone}" if me.phone else f"+{clean_phone}"
 
-        # Переименовываем если нужно
+        # Переименовываем session по реальному телефону, если отличается
         correct_path = sessions_dir / f"{me.phone}.session"
-        if session_path != correct_path and me.phone:
+        if me.phone and session_path != correct_path:
             try:
                 shutil.move(str(session_path), str(correct_path))
                 session_path = correct_path
             except Exception:
                 pass
 
-        # Проверяем дубликат
+        # Device fingerprint для сохранения
+        device_fp = f"{fp['device']}|{fp['system']}|{fp['app_version']}"
+
+        # Дубликат?
         existing = await acc_svc.get_account_by_phone(db, real_phone, current_user.id)
         if existing:
             existing.session_file = str(session_path)
             existing.status = "active"
             existing.first_name = me.first_name or existing.first_name
+            existing.last_name = me.last_name or existing.last_name
             existing.username = me.username or existing.username
             existing.has_photo = bool(me.photo)
             existing.tg_id = me.id
+            existing.proxy_id = proxy_id
+            if api_app_id_save:
+                existing.api_app_id = api_app_id_save
+            existing.device_fingerprint = device_fp
             await db.flush()
             return {
                 "success": True,
                 "account_id": existing.id,
                 "phone": real_phone,
+                "first_name": me.first_name or "",
+                "username": me.username or "",
                 "status": "active",
-                "message": f"Аккаунт {real_phone} обновлён",
                 "already_existed": True,
+                "message": f"Аккаунт {real_phone} обновлён",
             }
 
-        # Создаём новый
+        # Новый
         account = TelegramAccount(
             user_id=current_user.id,
             phone=real_phone,
@@ -184,6 +222,9 @@ async def import_session_file(
             session_file=str(session_path),
             status="active",
             trust_score=50,
+            proxy_id=proxy_id,
+            api_app_id=api_app_id_save,
+            device_fingerprint=device_fp,
         )
         db.add(account)
         await db.flush()
@@ -195,122 +236,205 @@ async def import_session_file(
             "first_name": me.first_name or "",
             "username": me.username or "",
             "status": "active",
-            "message": f"Аккаунт {real_phone} успешно импортирован",
+            "message": f"Аккаунт {real_phone} импортирован",
         }
 
+    except HTTPException:
+        raise
+    except asyncio.TimeoutError:
+        try: await client.disconnect()
+        except: pass
+        try: Path(session_path).unlink(missing_ok=True)
+        except: pass
+        raise HTTPException(status_code=504, detail="Таймаут подключения. Проверь прокси.")
     except Exception as e:
-        try:
-            await client.disconnect()
-        except:
-            pass
-        raise HTTPException(status_code=500, detail=f"Ошибка при подключении: {str(e)}")
+        try: await client.disconnect()
+        except: pass
+        try: Path(session_path).unlink(missing_ok=True)
+        except: pass
+        err = str(e)
+        print(f"📄 ❌ Session import error: {type(e).__name__}: {err}")
+        if "AUTH_KEY" in err.upper() or "UNREGISTERED" in err.upper():
+            raise HTTPException(status_code=400, detail="Auth key не валиден — сессия мёртвая")
+        raise HTTPException(status_code=500, detail=f"Ошибка: {err[:200]}")
 
 
-# ── Batch session import ─────────────────────────────────────
+# ── Batch session import (несколько файлов сразу) ────────────
 
 @router.post("/sessions-batch")
 async def import_session_files_batch(
     files: list[UploadFile] = File(...),
+    proxy_id: int = Form(...),                 # ← ОБЯЗАТЕЛЕН (один прокси на всю пачку)
+    api_app_id: Optional[int] = Form(None),    # ← НОВОЕ
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Пакетный импорт нескольких .session файлов.
+    Все файлы получают один и тот же proxy_id + api_app_id.
+
+    Возвращает:
+      - imported: количество успешных
+      - errors: список ошибок
+      - results: детали по каждому файлу
     """
+    if not files:
+        raise HTTPException(status_code=400, detail="Нет файлов")
+
+    await acc_svc.check_limit(db, current_user)
+
+    proxy_row, proxy_dict = await _resolve_proxy(db, proxy_id, current_user.id)
+    if not proxy_dict:
+        raise HTTPException(status_code=400, detail="Не удалось построить прокси")
+
+    api_id_use, api_hash_use, platform_use, api_app_id_save = await _resolve_api_app(
+        db, api_app_id, current_user.id
+    )
+
+    sessions_dir = _get_sessions_dir()
+
+    from telethon import TelegramClient
+    from utils.telegram import _get_device_for_platform
+
     results = []
     imported = 0
     errors = []
 
-    # Load proxy for verification
-    from sqlalchemy import select as _sel
-    from models.proxy import Proxy as _Proxy
-    _proxy_r = await db.execute(
-        _sel(_Proxy).where(_Proxy.user_id == current_user.id).limit(1)
-    )
-    _proxy_row = _proxy_r.scalar_one_or_none()
-    proxy_dict = None
-    if _proxy_row:
-        from routers.tg_auth import _make_proxy
-        proxy_dict = _make_proxy(_proxy_row)
-
-    cli_config = _get_cli_config()
-
     for file in files:
         if not file.filename.endswith(".session"):
             errors.append({"file": file.filename, "error": "Не .session файл"})
+            results.append({"file": file.filename, "status": "error", "error": "Не .session файл"})
             continue
 
         try:
-            clean_phone = file.filename.replace(".session", "")
-            sessions_dir = _get_sessions_dir()
+            clean_phone = file.filename.replace(".session", "").replace("+", "")
             session_path = sessions_dir / f"{clean_phone}.session"
 
             content = await file.read()
             with open(session_path, "wb") as f:
                 f.write(content)
 
-            real_phone = f"+{clean_phone}" if not clean_phone.startswith("+") else clean_phone
+            fp = _get_device_for_platform(clean_phone, platform_use)
+            device_fp = f"{fp['device']}|{fp['system']}|{fp['app_version']}"
 
-            # Verify session by connecting with proxy (timeout 15s)
+            client = TelegramClient(
+                str(session_path).replace(".session", ""),
+                api_id_use, api_hash_use,
+                proxy=proxy_dict,
+                device_model=fp["device"],
+                system_version=fp["system"],
+                app_version=fp["app_version"],
+                lang_code="en", system_lang_code="en",
+                timeout=30,
+            )
+
+            real_phone = f"+{clean_phone}"
             status = "unknown"
             tg_id = None
             first_name = ""
+            last_name = ""
             username = ""
             has_photo = False
 
-            if proxy_dict:
-                from telethon import TelegramClient
-                try:
-                    verify_client = TelegramClient(
-                        str(session_path).replace(".session", ""),
-                        cli_config.API_ID,
-                        cli_config.API_HASH,
-                        proxy=proxy_dict,
-                        timeout=15,
-                    )
-                    await verify_client.connect()
-                    if await verify_client.is_user_authorized():
-                        me = await verify_client.get_me()
-                        status = "active"
-                        tg_id = me.id
-                        first_name = me.first_name or ""
-                        username = me.username or ""
-                        has_photo = bool(me.photo)
-                        if me.phone:
-                            real_phone = f"+{me.phone}"
-                    await verify_client.disconnect()
-                except Exception:
-                    try:
-                        await verify_client.disconnect()
-                    except Exception:
-                        pass
+            try:
+                await asyncio.wait_for(client.connect(), timeout=45)
 
-            account = TelegramAccount(
-                user_id=current_user.id,
-                phone=real_phone,
-                tg_id=tg_id,
-                first_name=first_name,
-                username=username,
-                has_photo=has_photo,
-                session_file=str(session_path),
-                status=status,
-            )
-            db.add(account)
-            imported += 1
-            results.append({"file": file.filename, "phone": real_phone, "status": status})
+                if not await client.is_user_authorized():
+                    await client.disconnect()
+                    try: Path(session_path).unlink(missing_ok=True)
+                    except: pass
+                    errors.append({"file": file.filename, "error": "Сессия не авторизована"})
+                    results.append({"file": file.filename, "phone": real_phone, "status": "error", "error": "Не авторизована"})
+                    continue
+
+                me = await client.get_me()
+                status = "active"
+                tg_id = me.id
+                first_name = me.first_name or ""
+                last_name = me.last_name or ""
+                username = me.username or ""
+                has_photo = bool(me.photo)
+                if me.phone:
+                    real_phone = f"+{me.phone}"
+                    correct_path = sessions_dir / f"{me.phone}.session"
+                    if session_path != correct_path:
+                        try:
+                            await client.disconnect()
+                            shutil.move(str(session_path), str(correct_path))
+                            session_path = correct_path
+                        except Exception:
+                            pass
+                await client.disconnect()
+            except asyncio.TimeoutError:
+                try: await client.disconnect()
+                except: pass
+                errors.append({"file": file.filename, "error": "Таймаут — прокси не отвечает"})
+                results.append({"file": file.filename, "status": "error", "error": "Таймаут"})
+                continue
+            except Exception as e:
+                try: await client.disconnect()
+                except: pass
+                err = str(e)
+                errors.append({"file": file.filename, "error": err[:150]})
+                results.append({"file": file.filename, "status": "error", "error": err[:150]})
+                continue
+
+            # Сохраняем в БД
+            existing = await acc_svc.get_account_by_phone(db, real_phone, current_user.id)
+            if existing:
+                existing.session_file = str(session_path)
+                existing.status = status
+                existing.first_name = first_name or existing.first_name
+                existing.last_name = last_name or existing.last_name
+                existing.username = username or existing.username
+                existing.has_photo = has_photo
+                existing.tg_id = tg_id
+                existing.proxy_id = proxy_id
+                if api_app_id_save:
+                    existing.api_app_id = api_app_id_save
+                existing.device_fingerprint = device_fp
+                imported += 1
+                results.append({
+                    "file": file.filename, "phone": real_phone, "status": status,
+                    "account_id": existing.id, "updated": True,
+                })
+            else:
+                account = TelegramAccount(
+                    user_id=current_user.id,
+                    phone=real_phone,
+                    tg_id=tg_id,
+                    first_name=first_name,
+                    last_name=last_name,
+                    username=username,
+                    has_photo=has_photo,
+                    session_file=str(session_path),
+                    status=status,
+                    trust_score=50,
+                    proxy_id=proxy_id,
+                    api_app_id=api_app_id_save,
+                    device_fingerprint=device_fp,
+                )
+                db.add(account)
+                await db.flush()
+                imported += 1
+                results.append({
+                    "file": file.filename, "phone": real_phone, "status": status,
+                    "account_id": account.id, "updated": False,
+                })
 
         except Exception as e:
-            errors.append({"file": file.filename, "error": str(e)})
+            errors.append({"file": file.filename, "error": str(e)[:150]})
+            results.append({"file": file.filename, "status": "error", "error": str(e)[:150]})
 
     await db.flush()
 
     return {
         "imported": imported,
+        "total": len(files),
         "errors": errors,
         "results": results,
-        "message": f"Импортировано {imported} файлов. Ошибок: {len(errors)}",
+        "message": f"Импортировано {imported}/{len(files)}. Ошибок: {len(errors)}",
     }
-
 
 # ── TData import ─────────────────────────────────────────────
 
