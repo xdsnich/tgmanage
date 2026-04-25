@@ -2,17 +2,17 @@
 GramGPT API — routers/web_session.py
 Конвертация сессий из Telegram Web K (localStorage) в Telethon .session файлы.
 
-Web K хранит auth_key в localStorage в полях accountN = JSON{dcId, dc{N}_auth_key, ...}
-Этот endpoint:
-  1. Парсит JSON-блок аккаунта
-  2. Извлекает auth_key для главного DC
-  3. Создаёт SQLite .session файл совместимый с Telethon
-  4. Подключается через прокси, проверяет авторизацию, сохраняет в БД
+ОБНОВЛЕНИЯ:
+  - Использует WEB_K_DEVICES (реальные браузеры) для api_id=2496
+  - Seed для fingerprint = userId (стабильный)
+  - Не перезаписывает device_fingerprint при повторном импорте
+  - Таймаут на коннект
 """
 
 import asyncio
 import os
 import sqlite3
+import hashlib
 from pathlib import Path
 from typing import Optional
 
@@ -41,9 +41,36 @@ DC_IPS = {
     5: ("91.108.56.130",   443),
 }
 
-# Public Telegram Web K credentials (one of multiple known)
+# Public Telegram Web K credentials
 TG_WEB_API_ID = 2496
 TG_WEB_API_HASH = "8da85b0d5bfe62527e5b244c209159c3"
+
+
+# ── Web K реалистичные браузерные fingerprints ──────────────
+WEB_K_DEVICES = [
+    {"device": "Chrome 131", "system": "Windows 11",   "app_version": "2.4.0 K"},
+    {"device": "Chrome 131", "system": "macOS 15.1",   "app_version": "2.4.0 K"},
+    {"device": "Chrome 131", "system": "Linux x86_64", "app_version": "2.4.0 K"},
+    {"device": "Firefox 132","system": "Windows 11",   "app_version": "2.4.0 K"},
+    {"device": "Firefox 132","system": "Linux x86_64", "app_version": "2.4.0 K"},
+    {"device": "Safari 18",  "system": "macOS 15.1",   "app_version": "2.4.0 K"},
+    {"device": "Edge 131",   "system": "Windows 11",   "app_version": "2.4.0 K"},
+]
+
+
+def get_web_k_device(seed: str) -> dict:
+    """Детерминированный browser-fingerprint по seed (user_id или auth_key)."""
+    h = int(hashlib.md5(str(seed).encode()).hexdigest(), 16)
+    return WEB_K_DEVICES[h % len(WEB_K_DEVICES)]
+
+
+def _safe_set_attr(obj, name: str, value):
+    """Записать в атрибут только если он существует в модели."""
+    if hasattr(obj, name):
+        try:
+            setattr(obj, name, value)
+        except Exception as e:
+            print(f"⚠ _safe_set_attr({name}): {e}")
 
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -121,25 +148,24 @@ def _create_telethon_session_file(session_path: Path, dc_id: int, auth_key_hex: 
 
 class WebSessionImportRequest(BaseModel):
     """Импорт одного аккаунта из Web localStorage."""
-    dc_id: int                      # из поля dcId внутри accountN
-    auth_key: str                   # hex-строка из dc{dc_id}_auth_key
-    proxy_id: int                   # обязательный прокси
-    api_app_id: Optional[int] = None  # если None → используем 2496 (Telegram Web K)
-    phone: Optional[str] = None     # опционально, авто-определится через get_me()
+    dc_id: int
+    auth_key: str
+    proxy_id: int
+    api_app_id: Optional[int] = None
+    phone: Optional[str] = None
+    user_id: Optional[int] = None       # ← НОВОЕ: для seed fingerprint
 
 
 class WebAccountPreview(BaseModel):
-    """Превью одного аккаунта при парсинге блоба localStorage."""
-    label: str          # account1 / account2 / ...
+    label: str
     dc_id: int
     user_id: Optional[int] = None
-    auth_key: str       # hex для главного DC
+    auth_key: str
     fingerprint: Optional[str] = None
 
 
 class WebStorageParseRequest(BaseModel):
-    """Принимает текстовый блоб из localStorage и возвращает превью аккаунтов."""
-    storage_blob: str   # сырой JSON-блок (либо просто экспорт всего localStorage)
+    storage_blob: str
 
 
 # ── Endpoints ────────────────────────────────────────────────
@@ -149,18 +175,13 @@ async def parse_web_storage(
     body: WebStorageParseRequest,
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Парсит блоб из localStorage Telegram Web K и возвращает список аккаунтов.
-    Не подключается к Telegram, не сохраняет в БД — просто превью.
-    """
+    """Парсит блоб localStorage Telegram Web K → возвращает превью аккаунтов."""
     import json
     import re
 
     blob = body.storage_blob.strip()
     accounts = []
 
-    # Пытаемся разными способами найти account1, account2, ... в блобе
-    # Способ 1: блоб уже валидный JSON-словарь с ключами accountN
     parsed_dict = None
     try:
         parsed_dict = json.loads(blob)
@@ -178,7 +199,6 @@ async def parse_web_storage(
                     continue
             accounts.append((key, val))
 
-    # Способ 2: ищем регуляркой подстроки accountN{...} в сыром тексте
     if not accounts:
         pattern = re.compile(r'account(\d+)\s*({[^}]*"dcId"[^}]*})', re.DOTALL)
         for m in pattern.finditer(blob):
@@ -227,10 +247,7 @@ async def import_web_session(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Импорт одного аккаунта из Web. Создаёт .session, подключается через прокси,
-    делает get_me(), сохраняет аккаунт в БД.
-    """
+    """Импорт одного аккаунта из Web."""
     await acc_svc.check_limit(db, current_user)
 
     # 1. Прокси
@@ -246,7 +263,7 @@ async def import_web_session(
     if not proxy_dict:
         raise HTTPException(status_code=400, detail="Не удалось построить прокси")
 
-    # 2. API app — если не выбран, используем Telegram Web K (2496)
+    # 2. API app
     api_id_use = TG_WEB_API_ID
     api_hash_use = TG_WEB_API_HASH
     platform_use = "desktop"
@@ -270,7 +287,6 @@ async def import_web_session(
 
     # 3. Создаём .session файл
     sessions_dir = _get_sessions_dir()
-    # Временное имя — переименуем после get_me()
     tmp_phone = body.phone.strip().replace("+", "") if body.phone else f"web_{body.dc_id}_{body.auth_key[:8]}"
     session_path = Path(sessions_dir) / f"{tmp_phone}.session"
 
@@ -279,13 +295,23 @@ async def import_web_session(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Ошибка формирования сессии: {e}")
 
-    # 4. Подключаемся, проверяем
-    from telethon import TelegramClient
-    from utils.telegram import _get_device_for_platform
+    # 4. Fingerprint — реальный, не temp
+    if body.user_id:
+        fp_seed = str(body.user_id)
+    else:
+        fp_seed = f"{body.dc_id}_{body.auth_key[:32]}"
 
-    # Для Web K device_model должен быть desktop-style
-    fp = _get_device_for_platform(tmp_phone, platform_use)
-    print(f"🌐 Web import: dc={body.dc_id}, api_id={api_id_use}, platform={platform_use}, device={fp['device']}")
+    if api_id_use == TG_WEB_API_ID:
+        fp = get_web_k_device(fp_seed)
+        print(f"🌐 Web K device: {fp['device']} / {fp['system']} (seed={fp_seed[:16]})")
+    else:
+        from utils.telegram import _get_device_for_platform
+        fp = _get_device_for_platform(fp_seed, platform_use)
+        print(f"🌐 Custom api device: {fp['device']} / {fp['system']} (seed={fp_seed[:16]})")
+
+    # 5. Подключаемся
+    from telethon import TelegramClient
+    print(f"🌐 Web import: dc={body.dc_id}, api_id={api_id_use}, platform={platform_use}")
 
     client = TelegramClient(
         str(session_path).replace(".session", ""),
@@ -346,7 +372,12 @@ async def import_web_session(
             existing.proxy_id = body.proxy_id
             if api_app_id_save:
                 existing.api_app_id = api_app_id_save
-            existing.device_fingerprint = device_fp
+            # ✅ НЕ перезаписываем fingerprint если уже есть
+            if not existing.device_fingerprint:
+                existing.device_fingerprint = device_fp
+                print(f"🌐 Установлен fingerprint впервые")
+            else:
+                print(f"🌐 Сохраняем существующий fingerprint: {existing.device_fingerprint}")
             await db.flush()
             return {
                 "success": True,
