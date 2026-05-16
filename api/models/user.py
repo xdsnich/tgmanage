@@ -33,7 +33,7 @@ class User(Base):
     plan:          Mapped[PlanEnum] = mapped_column(Enum(PlanEnum), default=PlanEnum.starter)
     created_at:    Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at:    Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
+    is_superuser: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false", default=False)
     @property
     def account_limit(self) -> int:
         limits = {

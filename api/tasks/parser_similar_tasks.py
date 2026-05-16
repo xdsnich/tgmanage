@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 API_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
+
+
 def run_async(coro):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -41,7 +43,7 @@ async def _log_event(user_id, event_type, **kwargs):
     if API_DIR not in sys.path:
         sys.path.insert(0, API_DIR)
     try:
-        from utils.parser_events import log_event
+        from utils.parser_events_helper import log_event
         await log_event(user_id=user_id, event_type=event_type, **kwargs)
     except Exception as e:
         logger.warning(f"[parser_events] skip: {e}")
@@ -348,15 +350,46 @@ async def _run_similar_crawler(user_id: int, account_id: int, params: dict):
 # COMMENTS VERIFIER
 # ═══════════════════════════════════════════════════════════
 
-async def _check_channel_has_comments(client, username) -> tuple[bool, int]:
-    from telethon.tl.functions.channels import GetFullChannelRequest
-    from telethon.errors import FloodWaitError, UsernameNotOccupiedError, ChannelPrivateError
+async def _check_activity_via_web(username: str, active_hours: int) -> tuple[bool, str]:
+    """Перевіряє дату останнього поста через t.me/s/ без навантаження на акаунт."""
+    if active_hours <= 0:
+        return True, "активність не важлива"
+        
+    url = f"https://t.me/s/{username}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10) as resp:
+                if resp.status == 404:
+                    return False, "web: канал не знайдено"
+                if resp.status != 200:
+                    return True, "web: помилка доступу (перевіримо через API)"
+                html = await resp.text()
 
+        # Шукаємо тег <time datetime="2026-05-14T12:34:56+00:00"
+        times = re.findall(r'<time[^>]+datetime="([^"]+)"', html)
+        if not times:
+            return False, "web: немає постів або приватний"
+
+        last_time_str = times[-1]
+        last_date = datetime.fromisoformat(last_time_str.replace('Z', '+00:00'))
+        
+        delta_hours = (datetime.now(timezone.utc) - last_date).total_seconds() / 3600.0
+        if delta_hours > active_hours:
+            return False, f"web: мертвий ({int(delta_hours)}ч тому)"
+
+        return True, f"web: живий ({int(delta_hours)}ч тому)"
+    except Exception as e:
+        logger.warning(f"[web_check] @{username} error: {e}")
+        return True, "web: помилка парсингу"
+
+async def _check_channel_has_comments(client, username) -> tuple[bool, int]:
+    from telethon.errors import FloodWaitError, UsernameNotOccupiedError, ChannelPrivateError
     try:
         entity = await client.get_entity(username)
-        full = await client(GetFullChannelRequest(channel=entity))
-        linked_id = getattr(full.full_chat, 'linked_chat_id', 0) or 0
-        return (linked_id > 0, 0)
+        msgs = await client.get_messages(entity, limit=1)
+        if msgs and msgs[0].replies and getattr(msgs[0].replies, 'comments', False):
+            return (True, 0)
+        return (False, 0)
     except FloodWaitError as e:
         return (False, e.seconds)
     except (UsernameNotOccupiedError, ChannelPrivateError):
@@ -365,6 +398,40 @@ async def _check_channel_has_comments(client, username) -> tuple[bool, int]:
         logger.warning(f"[verify] @{username}: {str(e)[:100]}")
         return (False, 0)
 
+import aiohttp
+import re
+from datetime import datetime, timezone
+
+async def _check_channel_activity(username: str, active_hours: int) -> tuple[bool, str]:
+    """Проверка активности через веб-версию t.me/s/ (без нагрузки на аккаунт)."""
+    if active_hours <= 0:
+        return True, "активность не важна"
+        
+    url = f"https://t.me/s/{username}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10) as resp:
+                if resp.status == 404:
+                    return False, "web: канал не найден"
+                if resp.status != 200:
+                    return True, "web: ошибка доступа"
+                html = await resp.text()
+
+        times = re.findall(r'<time[^>]+datetime="([^"]+)"', html)
+        if not times:
+            return False, "web: нет постов или приватный"
+
+        last_time_str = times[-1]
+        last_date = datetime.fromisoformat(last_time_str.replace('Z', '+00:00'))
+        
+        delta_hours = (datetime.now(timezone.utc) - last_date).total_seconds() / 3600.0
+        if delta_hours > active_hours:
+            return False, f"web: мертвый ({int(delta_hours)}ч назад)"
+
+        return True, f"web: живой ({int(delta_hours)}ч назад)"
+    except Exception as e:
+        logger.warning(f"[web_check] @{username} error: {e}")
+        return True, "web: ошибка парсинга"
 
 async def _update_channel_has_comments(channel_id: int, has_comments: bool, subscribers: int = None):
     if API_DIR not in sys.path:
@@ -384,6 +451,7 @@ async def _update_channel_has_comments(channel_id: int, has_comments: bool, subs
             ch = r.scalar_one_or_none()
             if ch:
                 ch.has_comments = has_comments
+                ch.last_verification = datetime.utcnow() # <--- ДОБАВЛЕНО ТОЛЬКО ЭТО
                 if subscribers is not None and subscribers > 0:
                     ch.subscribers = subscribers
                 await db.commit()
@@ -405,6 +473,9 @@ async def _run_verify_comments(user_id: int, account_id: int, params: dict):
     pause_min = float(params.get("pause_min", 2.0))
     pause_max = float(params.get("pause_max", 4.0))
     only_unverified = bool(params.get("only_unverified", True))
+    
+    # НОВОЕ ПОЛЕ: извлекаем часы активности (по умолчанию 0 = отключено)
+    active_hours = int(params.get("active_hours", 0))
 
     if API_DIR not in sys.path:
         sys.path.insert(0, API_DIR)
@@ -415,13 +486,23 @@ async def _run_verify_comments(user_id: int, account_id: int, params: dict):
 
     engine = create_async_engine(DATABASE_URL, pool_size=1, max_overflow=0)
     Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+    from datetime import datetime, timedelta
 
+    min_days = int(params.get("min_verify_interval_days", 0))
     async with Session() as db:
         q = select(ParsedChannel).where(ParsedChannel.user_id == user_id)
         if folder:
             q = q.where(ParsedChannel.folder == folder)
         if only_unverified:
             q = q.where(ParsedChannel.has_comments == False)
+
+        if min_days > 0:
+            threshold = datetime.utcnow() - timedelta(days=min_days)
+            # Выбираем каналы, которые никогда не проверялись ИЛИ проверялись давно
+            q = q.where(
+                (ParsedChannel.last_verification == None) | 
+                (ParsedChannel.last_verification < threshold)
+            )
         q = q.limit(limit)
         result = await db.execute(q)
         channels = result.scalars().all()
@@ -437,7 +518,7 @@ async def _run_verify_comments(user_id: int, account_id: int, params: dict):
     # Start event
     start_time = time.time()
     await _log_event(user_id, "session_start", source="verify", account_id=account_id,
-                     details=f"folder={folder or 'ALL'} limit={limit} unverified_only={only_unverified}")
+                     details=f"folder={folder or 'ALL'} limit={limit} unverified_only={only_unverified} active_hours={active_hours}")
 
     logger.info(f"[verify] Старт проверки {total} каналов в папке '{folder or 'ALL'}'")
     r.setex(progress_key, 3600, f"running|0|0|{total}|старт")
@@ -463,33 +544,53 @@ async def _run_verify_comments(user_id: int, account_id: int, params: dict):
         except Exception:
             pass
 
+        # НОВЫЙ ЦИКЛ ОБХОДА
         for ch_id, username in channels_data:
             if r.get(stop_key):
                 logger.info("[verify] Stop signal")
                 break
+            logger.info(f"👉 Починаю перевірку каналу: @{username}")
+            reason = ""
+            has_comments = False
+            needs_api_check = True
 
-            has_comments, flood_wait = await _check_channel_has_comments(client, username)
+            # 1. ПРОВЕРКА АКТИВНОСТИ ЧЕРЕЗ ВЕБ (без API телеграма)
+            if active_hours > 0:
+                is_active, web_reason = await _check_channel_activity(username, active_hours)
+                reason = web_reason
+                if not is_active:
+                    needs_api_check = False # Канал мертвый, Telethon не дергаем
 
-            if flood_wait > 0:
-                flood_events += 1
-                await _log_event(user_id, "flood_wait", source="verify",
-                                 account_id=account_id, wait_seconds=flood_wait, seed=username)
-                if flood_wait > 300:
-                    r.setex(progress_key, 300, f"error|{checked}|{with_comments}|{total - checked}|FLOOD {flood_wait}s")
-                    break
-                flood_total_wait += flood_wait
-                await asyncio.sleep(flood_wait + 2)
-                has_comments, flood_wait2 = await _check_channel_has_comments(client, username)
-                if flood_wait2 > 0:
-                    continue
+            # 2. ЛЕГКАЯ ПЕРЕВЕРКА КОММЕНТОВ (через оригинальное название функции)
+            if needs_api_check:
+                has_comments, flood_wait = await _check_channel_has_comments(client, username)
 
+                if flood_wait > 0:
+                    flood_events += 1
+                    await _log_event(user_id, "flood_wait", source="verify",
+                                     account_id=account_id, wait_seconds=flood_wait, seed=username)
+                    if flood_wait > 300:
+                        r.setex(progress_key, 300, f"error|{checked}|{with_comments}|{total - checked}|FLOOD {flood_wait}s")
+                        has_critical_error = True
+                        break 
+                    logger.info(f"💬 Коментарі @{username}: has_comments={has_comments}, flood_wait={flood_wait}")
+                    flood_total_wait += flood_wait
+                    await asyncio.sleep(flood_wait + 2)
+                    has_comments, flood_wait2 = await _check_channel_has_comments(client, username)
+
+                if has_comments:
+                    reason += " | есть комменты"
+                else:
+                    reason += " | без комментов"
+
+            # 3. СОХРАНЕНИЕ
             await _update_channel_has_comments(ch_id, has_comments)
             checked += 1
             if has_comments:
                 with_comments += 1
-                logger.info(f"  ✅ @{username} → есть комменты")
+                logger.info(f"  ✅ @{username} → {reason}")
             else:
-                logger.info(f"  ❌ @{username} → без комментов")
+                logger.info(f"  ❌ @{username} → {reason}")
 
             r.setex(progress_key, 3600,
                     f"running|{checked}|{with_comments}|{total - checked}|{username}")

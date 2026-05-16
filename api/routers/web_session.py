@@ -284,6 +284,27 @@ async def import_web_session(
         api_hash_use = api_app.api_hash
         platform_use = getattr(api_app, 'platform', 'desktop') or 'desktop'
         api_app_id_save = api_app.id
+    else:
+        # АВТОМАТИЧНИЙ ДЕФОЛТ: Шукаємо Web K (api_id=2496) у базі
+        app_r = await db.execute(
+            select(ApiApp).where(
+                ApiApp.api_id == TG_WEB_API_ID, # Це 2496
+                ApiApp.user_id == current_user.id
+            )
+        )
+        web_app = app_r.scalar_one_or_none()
+        
+        if web_app:
+            api_id_use = web_app.api_id
+            api_hash_use = web_app.api_hash
+            platform_use = getattr(web_app, 'platform', 'desktop') or 'desktop'
+            api_app_id_save = web_app.id  # Ось тут збережеться твоя цифра 7 з БД
+        else:
+            raise HTTPException(
+                status_code=400, 
+                detail="В базі даних не знайдено дефолтний додаток Telegram Web K (api_id=2496)"
+            )
+
 
     # 3. Создаём .session файл
     sessions_dir = _get_sessions_dir()

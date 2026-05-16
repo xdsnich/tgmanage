@@ -139,6 +139,7 @@ async def list_parsed_channels(
         "subscribers": c.subscribers or 0,
         "has_comments": bool(c.has_comments),
         "last_post_date": c.last_post_date.isoformat() if c.last_post_date else None,
+        "last_verification": getattr(c, 'last_verification').isoformat() if getattr(c, 'last_verification', None) else None,
         "search_query": c.search_query or "",
         "added_at": c.added_at.isoformat() if c.added_at else None,
         "folder": getattr(c, 'folder', '') or "",
@@ -638,11 +639,13 @@ async def stop_similar_crawl(
 
 class VerifyCommentsRequest(BaseModel):
     account_id: int
-    folder: str = ""                # пусто = все каналы
-    limit: int = 200                # сколько за раз
+    folder: str = ""
+    limit: int = 200
     pause_min: float = 2.0
     pause_max: float = 4.0
-    only_unverified: bool = True    # только каналы с has_comments=False
+    only_unverified: bool = True
+    active_hours: int = 0
+    min_verify_interval_days: int = 0
 
 
 @router.post("/verify/start")

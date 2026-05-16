@@ -78,18 +78,33 @@ async def get_stats(db: AsyncSession, user_id: int) -> dict:
     }
 
 
-async def check_limit(db: AsyncSession, user: User):
-    """Проверяет не превышен ли лимит аккаунтов по тарифу"""
+async def check_limit(db: AsyncSession, user: User) -> None:
+    """Проверяет что юзер не превысил лимит аккаунтов по тарифу."""
+    
+    # ✅ НОВОЕ: суперюзер без лимитов
+    if getattr(user, 'is_superuser', False):
+        return
+    
+    # Существующая логика лимитов по тарифам
+    plan_limits = {
+        PlanEnum.starter: 10,
+        PlanEnum.pro: 50,
+        PlanEnum.enterprise: 500,
+    }
+    
+    max_accounts = plan_limits.get(user.plan, 10)
+    
     result = await db.execute(
-        select(func.count()).where(TelegramAccount.user_id == user.id)
+        select(func.count(TelegramAccount.id)).where(TelegramAccount.user_id == user.id)
     )
-    count = result.scalar()
-    if count >= user.account_limit:
+    current_count = result.scalar() or 0
+    
+    if current_count >= max_accounts:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Достигнут лимит аккаунтов для тарифа {user.plan} ({user.account_limit} акк.). Обновите тариф."
+            status_code=403,
+            detail=f"Достигнут лимит аккаунтов ({current_count}/{max_accounts}) для тарифа {user.plan.value}. "
+                   f"Обнови тариф для увеличения лимита."
         )
-
 
 async def create_account(db: AsyncSession, user: User, phone: str) -> TelegramAccount:
     await check_limit(db, user)
