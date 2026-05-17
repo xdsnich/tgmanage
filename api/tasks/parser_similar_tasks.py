@@ -648,3 +648,131 @@ def run_similar_crawler(self, user_id: int, account_id: int, params: dict):
 )
 def run_verify_comments(self, user_id: int, account_id: int, params: dict):
     return run_async(_run_verify_comments(user_id, account_id, params))
+
+import aiohttp
+from bs4 import BeautifulSoup
+from langdetect import detect, LangDetectException
+import asyncio
+
+async def _detect_channel_language(username: str) -> tuple[str, str]:
+    """Асинхронний парсинг веб-сторінки каналу для визначення мови."""
+    url = f"https://t.me/s/{username}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            # timeout 10 сек щоб не висіти на мертвих каналах
+            async with session.get(url, timeout=10) as resp:
+                if resp.status == 404: return None, "не знайдено"
+                if resp.status != 200: return None, f"помилка {resp.status}"
+                html = await resp.text()
+
+        soup = BeautifulSoup(html, 'html.parser')
+        # Беремо всі тексти повідомлень
+        messages = soup.find_all('div', class_='tgme_widget_message_text')
+        if not messages:
+            return None, "немає тексту"
+
+        # Об'єднуємо останні 15 повідомлень
+        combined_text = " ".join([m.get_text(separator=' ') for m in messages[-15:]])
+        
+        if len(combined_text.strip()) < 30:
+            return None, "замало тексту"
+
+        # Визначаємо мову
+        lang = detect(combined_text)
+        return lang, "ок"
+    except LangDetectException:
+        return None, "не визначено"
+    except Exception as e:
+        return None, f"помилка: {str(e)[:20]}"
+
+
+@celery_app.task(name="tasks.parser_similar_tasks.run_detect_language")
+def run_detect_language(user_id: int, params: dict):
+    """Синхронна обгортка для запуску."""
+    asyncio.run(_run_detect_language(user_id, params))
+
+
+async def _run_detect_language(user_id: int, params: dict):
+    import redis
+    import time
+    
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    r = redis.from_url(redis_url)
+    progress_key = f"parser:lang:progress:{user_id}"
+    stop_key = f"parser:lang:stop:{user_id}"
+    r.delete(stop_key)
+
+    folder = params.get("folder", "")
+    limit = int(params.get("limit", 500))
+    auto_folder = bool(params.get("auto_folder", True))
+    only_unknown = bool(params.get("only_unknown", True))
+
+    if API_DIR not in sys.path: sys.path.insert(0, API_DIR)
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+    from sqlalchemy import select
+    from config import DATABASE_URL
+    from models.parsed_channel import ParsedChannel
+
+    engine = create_async_engine(DATABASE_URL, pool_size=5, max_overflow=10)
+    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+
+    async with Session() as db:
+        q = select(ParsedChannel).where(ParsedChannel.user_id == user_id)
+        if folder:
+            q = q.where(ParsedChannel.folder == folder)
+        if only_unknown:
+            q = q.where((ParsedChannel.language == None) | (ParsedChannel.language == ""))
+        q = q.limit(limit)
+        result = await db.execute(q)
+        channels = result.scalars().all()
+        channels_data = [(c.id, c.username) for c in channels if c.username]
+
+    total = len(channels_data)
+    if total == 0:
+        r.setex(progress_key, 300, "done|0|0|0|немає каналів")
+        return
+
+    r.setex(progress_key, 3600, f"running|0|0|{total}|старт")
+    logger.info(f"[lang] Старт перевірки {total} каналів")
+
+    checked = 0
+    detected = 0
+    start_time = time.time()
+    
+    # Семафор: скільки каналів обробляти одночасно. 5 - безпечно і дуже швидко.
+    semaphore = asyncio.Semaphore(5)
+
+    async def process_channel(ch_id, username):
+        async with semaphore:
+            lang, reason = await _detect_channel_language(username)
+            return ch_id, username, lang, reason
+
+    # Створюємо пул тасок
+    tasks = [process_channel(ch_id, username) for ch_id, username in channels_data]
+    
+    # Виконуємо їх конкурентно і оновлюємо прогрес як тільки якась таска завершиться
+    for future in asyncio.as_completed(tasks):
+        if r.get(stop_key):
+            break
+            
+        ch_id, username, lang, reason = await future
+        checked += 1
+        
+        if lang:
+            detected += 1
+            async with Session() as db:
+                res = await db.execute(select(ParsedChannel).where(ParsedChannel.id == ch_id))
+                ch = res.scalar_one_or_none()
+                if ch:
+                    ch.language = lang
+                    if auto_folder:
+                        ch.folder = lang  # АВТОМАТИЧНИЙ РОЗПОДІЛ ПО ПАПКАХ
+                    await db.commit()
+            logger.info(f" 🌍 @{username} → {lang}")
+        
+        r.setex(progress_key, 3600, f"running|{checked}|{detected}|{total - checked}|{username}")
+
+    await engine.dispose()
+    duration = int(time.time() - start_time)
+    r.setex(progress_key, 300, f"done|{checked}|{detected}|0|готово за {duration}с")
+    logger.info(f"[lang] Готово: {checked} перевірено, {detected} визначено")

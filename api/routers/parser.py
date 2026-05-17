@@ -136,6 +136,7 @@ async def list_parsed_channels(
         "id": c.id,
         "username": c.username or "",
         "title": c.title or "",
+        "language": getattr(c, 'language', '') or "",
         "subscribers": c.subscribers or 0,
         "has_comments": bool(c.has_comments),
         "last_post_date": c.last_post_date.isoformat() if c.last_post_date else None,
@@ -1083,3 +1084,52 @@ async def get_recent_sessions(
         }
         for e in events
     ]
+
+# ══════════════════════════════════════════════════════════
+# Language Detector
+# ══════════════════════════════════════════════════════════
+
+class DetectLanguageRequest(BaseModel):
+    folder: str = ""
+    limit: int = 500
+    auto_folder: bool = True
+    only_unknown: bool = True
+
+@router.post("/language/start")
+async def start_detect_language(
+    body: DetectLanguageRequest,
+    current_user: User = Depends(get_current_user)
+):
+    from celery_app import celery_app
+    task = celery_app.send_task(
+        "tasks.parser_similar_tasks.run_detect_language",
+        args=[current_user.id, body.model_dump()],
+        queue="ai_dialogs",
+    )
+    return {"task_id": task.id, "status": "started"}
+
+@router.get("/language/progress")
+async def get_language_progress(current_user: User = Depends(get_current_user)):
+    import redis as redis_lib
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    progress = r.get(f"parser:lang:progress:{current_user.id}")
+    if not progress: return {"status": "idle"}
+    
+    try:
+        parts = progress.decode().split("|")
+        return {
+            "status": parts[0],
+            "checked": int(parts[1]),
+            "detected": int(parts[2]),
+            "remaining": int(parts[3]),
+            "current": parts[4] if len(parts) > 4 else "",
+        }
+    except Exception:
+        return {"status": "idle"}
+
+@router.post("/language/stop")
+async def stop_language(current_user: User = Depends(get_current_user)):
+    import redis as redis_lib
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    r.setex(f"parser:lang:stop:{current_user.id}", 300, "1")
+    return {"status": "stopping"}

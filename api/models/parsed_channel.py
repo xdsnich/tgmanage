@@ -23,6 +23,7 @@ class ParsedChannel(Base):
     has_comments:    Mapped[bool]             = mapped_column(Boolean, default=False)
     last_post_date:  Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     last_verification: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    language:        Mapped[Optional[str]]    = mapped_column(String(10), nullable=True)
     search_query:    Mapped[str]              = mapped_column(String(256), default="")
     folder:          Mapped[str]              = mapped_column(String(128), default="", server_default="")
     added_at:        Mapped[datetime]         = mapped_column(DateTime, default=datetime.utcnow)
