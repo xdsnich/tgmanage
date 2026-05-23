@@ -14,6 +14,7 @@ GramGPT — tasks/plan_generator.py
   - "Активные дни": 15% шанс сделать в 1.5 раза больше
   - Паузы между действиями: от 3с до 120с
   - Иногда "отлучился" посреди сессии (30-180с пауза)
+  - ДО 3 КОММЕНТАРИЕВ И РЕАКЦИЙ ЗА ОДНУ СЕССИЮ В РАЗНЫЕ КАНАЛЫ
 """
 
 import random
@@ -90,25 +91,25 @@ def distribute_day_comments(comments_today, accounts_with_personalities):
 
         name = personality.get("name", "active_reader")
         if name == "lurker":
-            count = random.choices([0, 1], weights=[55, 45])[0]
+            count = random.choices([0, 1, 2], weights=[50, 40, 10])[0]
         elif name == "reactor":
-            count = random.choices([0, 1], weights=[65, 35])[0]
+            count = random.choices([0, 1, 2], weights=[60, 30, 10])[0]
         elif name == "active_reader":
-            count = random.choices([0, 1, 2], weights=[20, 55, 25])[0]
+            count = random.choices([0, 1, 2, 3], weights=[15, 45, 25, 15])[0]
         elif name == "commenter":
-            count = random.choices([1, 2, 3], weights=[25, 50, 25])[0]
+            count = random.choices([1, 2, 3, 4, 5], weights=[15, 30, 30, 15, 10])[0]
         elif name == "night_owl":
-            count = random.choices([0, 1, 2], weights=[25, 50, 25])[0]
+            count = random.choices([0, 1, 2, 3], weights=[20, 40, 25, 15])[0]
         else:
-            count = random.randint(0, 2)
+            count = random.randint(0, 3)
 
-        count = min(count, 3, remaining)
+        count = min(count, 6, remaining) # Подняли лимит до 6, чтобы влезало по 2-3 за сессию
         distribution[acc_id] = count
         remaining -= count
 
     # Остаток — раздаём случайным
     while remaining > 0:
-        candidates = [a for a, c in distribution.items() if c < 3]
+        candidates = [a for a, c in distribution.items() if c < 6]
         if not candidates:
             break
         acc_id = random.choice(candidates)
@@ -191,9 +192,9 @@ def generate_daily_plan(
     # Ещё раз рандом: ±1
     num_sessions = max(1, num_sessions + random.choice([-1, 0, 0, 0, 0, 1]))
 
-    # Гарантируем достаточно сессий для комментариев
+    # Гарантируем достаточно сессий для комментариев (с учетом что их может быть по 2-3 за раз)
     if comments_today > 0:
-        num_sessions = max(num_sessions, comments_today + random.randint(0, 2))
+        num_sessions = max(num_sessions, (comments_today // 2) + 1)
 
     # ── Времена сессий ───────────────────────────────────
     # Не фиксированные окна! Рандомно по всему дню
@@ -262,36 +263,63 @@ def generate_daily_plan(
             if next_h <= 23:
                 session_times = [(next_h, next_m)]
 
-    # ── Распределяем комментарии по сессиям ──────────────
-    comment_sessions = set()
-    if comments_today > 0:
-        available = list(range(num_sessions))
-        # Не ставим коммент в первую сессию (если >2 сессий)
-        if len(available) > 2:
-            available = available[1:]
-        random.shuffle(available)
-        for i in range(min(comments_today, len(available))):
-            comment_sessions.add(available[i])
+    # ── НОВАЯ ЛОГИКА: Распределяем ЦЕЛЕВЫЕ комментарии и реакции по сессиям ──────────────
+    MULTI_COMMENT_CHANCE = 0.25   # 25% шанс сделать 2-3 коммента за 1 сессию
+    MULTI_REACTION_CHANCE = 0.35  # 35% шанс сделать 2-3 реакции за 1 сессию
+    
+    session_comments = {i: [] for i in range(len(session_times))}
+    session_reactions = {i: [] for i in range(len(session_times))}
+    
+    available_channels = list(campaign_channels) if campaign_channels else []
 
-    # Каналы для комментариев
-    comment_channels = []
-    if comments_today > 0 and campaign_channels:
-        comment_channels = random.sample(
-            campaign_channels,
-            min(comments_today, len(campaign_channels))
-        )
+    # Распределяем КОММЕНТАРИИ
+    if comments_today > 0 and available_channels:
+        c_targets = random.sample(available_channels, min(comments_today, len(available_channels)))
+        available_sessions = list(range(len(session_times)))
+        if len(available_sessions) > 1:
+            available_sessions = available_sessions[1:] # Не ставим коммент в первую сессию
+
+        idx = 0
+        while idx < len(c_targets):
+            sess_idx = random.choice(available_sessions)
+            rem = len(c_targets) - idx # Скільки каналів залишилось
+            if rem >= 2 and random.random() < MULTI_COMMENT_CHANCE:
+                chunk_size = random.randint(2, min(3, rem))
+                session_comments[sess_idx].extend(c_targets[idx : idx+chunk_size])
+                idx += chunk_size
+            else:
+                session_comments[sess_idx].append(c_targets[idx])
+                idx += 1
+
+    # Распределяем РЕАКЦИИ
+    reactions_today = random.randint(1, 5) 
+    if available_channels:
+        r_targets = random.sample(available_channels, min(reactions_today, len(available_channels)))
+        idx = 0
+        while idx < len(r_targets):
+            sess_idx = random.choice(range(len(session_times)))
+            rem = len(r_targets) - idx # Скільки каналів залишилось
+            if rem >= 2 and random.random() < MULTI_REACTION_CHANCE:
+                chunk_size = random.randint(2, min(3, rem))
+                session_reactions[sess_idx].extend(r_targets[idx : idx+chunk_size])
+                idx += chunk_size
+            else:
+                session_reactions[sess_idx].append(r_targets[idx])
+                idx += 1
 
     # ── Генерируем действия ──────────────────────────────
     sessions = []
-    comment_idx = 0
 
     for sess_i, (hour, minute) in enumerate(session_times):
-        has_comment = sess_i in comment_sessions and comment_idx < len(comment_channels)
+        sess_c_targets = session_comments.get(sess_i, [])
+        sess_r_targets = session_reactions.get(sess_i, [])
+        has_targeted = len(sess_c_targets) > 0 or len(sess_r_targets) > 0
+        
         actions = []
 
         # Количество действий
-        if has_comment:
-            base_actions = random.randint(4, 12)
+        if has_targeted:
+            base_actions = random.randint(4, 12) + (len(sess_c_targets) + len(sess_r_targets)) * 2
         else:
             base_actions = random.randint(2, 8)
 
@@ -306,6 +334,9 @@ def generate_daily_plan(
 
         # Ещё ±1-2
         num_actions = max(3, num_actions + random.choice([-1, 0, 0, 0, 0, 1, 1, 2]))
+        
+        # Гарантируем, что хватит места для всех целевых действий
+        num_actions = max(num_actions, len(sess_c_targets) + len(sess_r_targets) + 2)
 
         # Доступные действия (зависят от дня)
         if day_number <= 2:
@@ -329,53 +360,59 @@ def generate_daily_plan(
                 ("join_channel", 3), ("typing", 4),
             ]
 
-        # Позиция комментария
-        if has_comment:
-            comment_pos = random.randint(
-                max(1, num_actions // 4),
-                max(2, num_actions * 3 // 4)
-            )
-        else:
-            comment_pos = -1
-
         action_i = 0
         while action_i < num_actions:
-            # ── Вставка комментария ──────────────────────
-            if action_i == comment_pos and has_comment and comment_idx < len(comment_channels):
-                target = comment_channels[comment_idx]
-                comment_idx += 1
+            
+            remaining_targets = len(sess_c_targets) + len(sess_r_targets)
+            remaining_slots = num_actions - action_i
+            
+            # ── Вставка целевого комментария или реакции ──────────────────────
+            if remaining_targets > 0 and (random.random() < 0.35 or remaining_targets >= remaining_slots):
+                is_comment = False
+                if len(sess_c_targets) > 0 and len(sess_r_targets) > 0:
+                    is_comment = random.random() < 0.5
+                elif len(sess_c_targets) > 0:
+                    is_comment = True
 
-                # Pre-read целевого канала
-                actions.append({
-                    "type": "read_feed",
-                    "channel": target,
-                    "count": random.randint(2, 10),
-                    "pause_after": random.randint(10, 180),  # Широкий диапазон!
-                })
-
-                # Реакция (рандомный шанс 10-55%)
-                if random.random() < random.uniform(0.10, 0.55):
+                if is_comment:
+                    target = sess_c_targets.pop(0)
+                    
+                    # Pre-read целевого канала
                     actions.append({
-                        "type": "set_reaction",
+                        "type": "read_feed",
                         "channel": target,
-                        "emoji": random.choice(REACTION_EMOJIS),
-                        "pause_after": random.randint(3, 40),
+                        "count": random.randint(2, 10),
+                        "pause_after": random.randint(10, 180),  # Широкий диапазон!
                     })
 
-                # Комментарий
-                actions.append({
-                    "type": "smart_comment",
-                    "channel": target,
-                    "pause_before": random.randint(2, 30),  # typing
-                })
+                    # Реакция перед комментом (рандомный шанс 10-55%)
+                    if random.random() < random.uniform(0.10, 0.55):
+                        actions.append({
+                            "type": "set_reaction",
+                            "channel": target,
+                            "emoji": random.choice(REACTION_EMOJIS),
+                            "pause_after": random.randint(3, 40),
+                        })
 
-                # Post-read (не уходить сразу)
-                actions.append({
-                    "type": "read_feed",
-                    "channel": None,
-                    "count": random.randint(1, 5),
-                    "pause_after": random.randint(3, 30),
-                })
+                    # Комментарий
+                    actions.append({
+                        "type": "smart_comment",
+                        "channel": target,
+                        "pause_before": random.randint(2, 30),  # typing
+                    })
+
+                    # Post-read (не уходить сразу)
+                    actions.append({
+                        "type": "read_feed",
+                        "channel": None,
+                        "count": random.randint(1, 5),
+                        "pause_after": random.randint(3, 30),
+                    })
+                else:
+                    target = sess_r_targets.pop(0)
+                    # Целевая реакция: зашел, почитал, поставил
+                    actions.append({"type": "read_feed", "channel": target, "count": random.randint(2, 6), "pause_after": random.randint(5, 30)})
+                    actions.append({"type": "set_reaction", "channel": target, "emoji": random.choice(REACTION_EMOJIS), "pause_after": random.randint(5, 20)})
 
                 action_i += 1
                 continue
@@ -425,8 +462,8 @@ def generate_daily_plan(
 
             action_i += 1
 
-        # 8% шанс ПРОПУСТИТЬ сессию целиком (как реальный человек)
-        if random.random() < 0.08 and not has_comment:
+        # 8% шанс ПРОПУСТИТЬ сессию целиком (как реальный человек) - только если нет целевых
+        if random.random() < 0.08 and not has_targeted:
             sessions.append({
                 "connect_at_hour": hour,
                 "connect_at_minute": minute,

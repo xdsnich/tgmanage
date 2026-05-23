@@ -276,17 +276,28 @@ async def list_folders(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    # Тепер дістаємо не тільки папку, але й статус коментарів
     result = await db.execute(
-        select(ParsedChannel.folder).where(
+        select(ParsedChannel.folder, ParsedChannel.has_comments).where(
             ParsedChannel.user_id == current_user.id,
             ParsedChannel.folder != "",
+            ParsedChannel.folder.isnot(None)
         )
     )
-    folders_raw = [r[0] for r in result.all()]
+    rows = result.all()
     folder_counts = {}
-    for f in folders_raw:
-        folder_counts[f] = folder_counts.get(f, 0) + 1
-    return [{"name": k, "count": v} for k, v in sorted(folder_counts.items())]
+    
+    for folder, has_comments in rows:
+        if folder not in folder_counts:
+            folder_counts[folder] = {"count": 0, "with_comments": 0}
+        folder_counts[folder]["count"] += 1
+        if has_comments:
+            folder_counts[folder]["with_comments"] += 1
+
+    return [
+        {"name": k, "count": v["count"], "with_comments": v["with_comments"]} 
+        for k, v in sorted(folder_counts.items())
+    ]
 
 
 @router.get("/folders/{folder_name}/channels")

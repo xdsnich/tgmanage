@@ -188,10 +188,18 @@ async def _run_subscribe_task(task_data: dict):
                                 import re
                                 wait = re.search(r"(\d+)", err)
                                 wait_sec = int(wait.group(1)) if wait else 60
+                                
+                                # ← НОВЕ: Перериваємо акаунт, якщо бан занадто довгий (> 10 хвилин)
+                                if wait_sec > 600:
+                                    logger.error(f"[subscribe] 🚨 КРИТИЧНИЙ БАН на {wait_sec} секунд для {acc.phone}. Згортаємо підписку для цього акаунта.")
+                                    results.append({"account_id": acc_id, "channel": channel, "phone": acc.phone, "ok": False, "detail": f"КРИТИЧНИЙ FLOOD_WAIT {wait_sec}с"})
+                                    failed += 1
+                                    break # Виходимо з циклу каналів для ЦЬОГО акаунта
+                                    
                                 logger.warning(f"[subscribe]   ⏳ {acc.phone} FLOOD_WAIT {wait_sec}с")
                                 results.append({"account_id": acc_id, "channel": channel, "phone": acc.phone, "ok": False, "detail": f"FLOOD_WAIT {wait_sec}с"})
                                 failed += 1
-                                await asyncio.sleep(wait_sec + random.randint(5, 15))
+                                await asyncio.sleep(wait_sec + random.randint(5, 15)) 
                             else:
                                 results.append({"account_id": acc_id, "channel": channel, "phone": acc.phone, "ok": False, "detail": err})
                                 failed += 1
