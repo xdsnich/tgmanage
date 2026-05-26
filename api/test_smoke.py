@@ -25,15 +25,67 @@ import os
 import asyncio
 import time
 
-# ── sys.path: api/ должен быть ПЕРВЫМ, а tg_manager1/ (parent) — убрать ──
-# В корне репо лежит легаси-config.py без DATABASE_URL. Если он попадёт
-# в sys.path раньше api/, импорты сломаются с непонятной ошибкой.
+# ── sys.path: api/ должен быть ПЕРВЫМ, parent — выкинуть ──
+# Если PYTHONPATH/.pth/legacy подкидывает tg_manager1/ в sys.path,
+# Python подтянет легаси-config.py (без DATABASE_URL) → ImportError.
 _API_DIR    = os.path.dirname(os.path.abspath(__file__))
 _PARENT_DIR = os.path.dirname(_API_DIR)
-sys.path = [p for p in sys.path
-            if os.path.normcase(os.path.abspath(p) if p else "") != os.path.normcase(_PARENT_DIR)]
-if _API_DIR not in sys.path:
-    sys.path.insert(0, _API_DIR)
+
+def _is_parent(p):
+    if not p:
+        return False
+    try:
+        return os.path.normcase(os.path.abspath(p)) == os.path.normcase(_PARENT_DIR)
+    except Exception:
+        return False
+
+# Удаляем parent (может быть в нескольких записях)
+sys.path[:] = [p for p in sys.path if not _is_parent(p)]
+# api/ — первым
+if _API_DIR in sys.path:
+    sys.path.remove(_API_DIR)
+sys.path.insert(0, _API_DIR)
+
+# Если config уже был импортирован из неправильного места — выбросим из кеша
+for _mod in list(sys.modules):
+    if _mod == "config" or _mod.startswith("config."):
+        del sys.modules[_mod]
+
+import importlib
+importlib.invalidate_caches()
+
+# Диагностика — проверяем что config грузится из api/
+try:
+    import config as _cfg_check
+    _cfg_dir = os.path.dirname(os.path.abspath(_cfg_check.__file__))
+    if os.path.normcase(_cfg_dir) != os.path.normcase(_API_DIR):
+        print("\033[31m\033[1m═" * 30 + "\033[0m")
+        print(f"\033[31m\033[1mFATAL: config.py грузится из НЕПРАВИЛЬНОГО места\033[0m")
+        print(f"  Ожидалось:  {os.path.join(_API_DIR, 'config.py')}")
+        print(f"  По факту:   {_cfg_check.__file__}")
+        print()
+        print(f"\033[33mПричина:\033[0m в корне репо лежит легаси {os.path.join(_PARENT_DIR, 'config.py')}")
+        print(f"        Python берёт его раньше api/config.py.")
+        print()
+        print(f"\033[36msys.path сейчас:\033[0m")
+        for i, p in enumerate(sys.path):
+            print(f"  [{i}] {p!r}")
+        print()
+        print(f"\033[36mPYTHONPATH env:\033[0m {os.environ.get('PYTHONPATH', '(не задана)')}")
+        print()
+        print(f"\033[32m\033[1mРЕШЕНИЯ (любое):\033[0m")
+        print(f"  1. Переименовать легаси в .legacy чтобы Python не нашёл:")
+        print(f"     ren \"{os.path.join(_PARENT_DIR, 'config.py')}\" config.py.legacy")
+        print()
+        print(f"  2. Если задана PYTHONPATH — очистить в PowerShell:")
+        print(f"     $env:PYTHONPATH = $null")
+        print()
+        print(f"  3. Проверить .venv/Lib/site-packages/*.pth файлы — нет ли там парента")
+        print("\033[31m\033[1m═" * 30 + "\033[0m")
+        sys.exit(1)
+except ImportError as _e:
+    print(f"\033[31mFATAL: не могу импортировать config из api/: {_e}\033[0m")
+    sys.exit(1)
 
 
 class C:
