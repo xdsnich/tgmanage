@@ -68,17 +68,17 @@ try:
         if now - last_warmup >= WARMUP_DISPATCH_INTERVAL:
             if done(warmup_tid):
                 try:
-                    r = celery_app.send_task("tasks.warmup_v2.dispatch_warmups", queue="ai_dialogs")
+                    r = celery_app.send_task("tasks.warmup_v2.dispatch_warmups", queue="warmup")
                     warmup_tid = r.id; print(f"[{ts}] → Warmup dispatch")
                 except Exception as e: print(f"[{ts}] ✗ Warmup: {e}")
             last_warmup = now
 
-       
+
         # Диспетчер планов кампаний → параллельные сессии
         if now - last_plans >= PLAN_DISPATCH_INTERVAL:
             if done(plans_tid):
                 try:
-                    r = celery_app.send_task("tasks.plan_executor.dispatch_plans", queue="ai_dialogs")
+                    r = celery_app.send_task("tasks.plan_executor.dispatch_plans", queue="plans")
                     plans_tid = r.id; print(f"[{ts}] → Plan dispatch")
                 except Exception as e: print(f"[{ts}] ✗ Plans: {e}")
             last_plans = now

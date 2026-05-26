@@ -118,26 +118,44 @@ async def root():
 # Терминал 1 — API:
 #   cd api && python -m uvicorn main:app --reload --port 8000
 #
-# Терминал 2 — Celery воркер на threads (-P threads):
-#   cd api && python -m celery -A celery_app worker -Q high_priority,bulk_actions,ai_dialogs -P threads -c 40 --loglevel=info
+# Терминал 2 — Celery воркер (ВСЕ очереди в одном процессе, простой сетап):
+#   cd api && python -m celery -A celery_app worker ^
+#     -Q plans,warmup,parsers,ai_dialogs,high_priority,bulk_actions,subscribe ^
+#     -P threads -c 40 --loglevel=info
 #
-#   -P threads — пул threads. Каждый таск в своём треде с собственным asyncio loop.
-#                Для I/O-bound кода (Telethon, asyncpg, httpx) GIL отпускается → реальный параллелизм.
-#   -c 40      — concurrency: до 40 параллельных задач одновременно.
-#                Memory ~5MB на тред. Для больше: -c 60, -c 100.
+#   -P threads — каждый таск в своём треде, у каждого треда свой asyncio loop.
+#                Для I/O-bound кода (Telethon, asyncpg, httpx) GIL отпускается → параллелизм.
+#   -c 40      — до 40 параллельных задач. ~5MB/тред. Для больше: -c 60, -c 100.
 #
-#   ПОЧЕМУ НЕ -P gevent: gevent держит все greenlet'ы в одном OS-треде, asyncio
-#   видит чужой running loop соседнего greenlet'а → "Cannot run the event loop while
-#   another loop is running". Несовместимо с asyncio-кодом.
+#   ПОЧЕМУ НЕ -P gevent: greenlet'ы делят OS-тред, asyncio видит чужой running loop →
+#   "Cannot run the event loop while another loop is running". Несовместимо.
 #
-# Терминал 3 — Планировщик:
+# Терминал 3 — Планировщик (раз в 60с шлёт dispatch_plans, dispatch_warmups):
 #   cd api && python run_periodic.py
 #
 # Терминал 4 — Фронт:
 #   cd gramgpt-web && npm run dev
 #
+# ═══════════════════════════════════════════════════════════
+# ПРОДВИНУТЫЙ СЕТАП (>100 юзеров) — разделение по процессам
+# ═══════════════════════════════════════════════════════════
+# Парсер-crawler может занять 10 минут — изолируем чтобы не блокировал планы.
+# Каждый процесс независим, можно перезапустить без остановки других.
+#
+# Воркер 1 — ПЛАНЫ (hot path, максимум throughput):
+#   celery -A celery_app worker -Q plans -P threads -c 40 -n plans@%h --loglevel=info
+#
+# Воркер 2 — ПРОГРЕВ:
+#   celery -A celery_app worker -Q warmup -P threads -c 20 -n warmup@%h --loglevel=info
+#
+# Воркер 3 — ПАРСЕРЫ (долгие задачи, низкая concurrency):
+#   celery -A celery_app worker -Q parsers -P threads -c 8 -n parsers@%h --loglevel=info
+#
+# Воркер 4 — Прочее (AI-диалоги, комменты, импорт, подписки, account/proxy ops):
+#   celery -A celery_app worker -Q ai_dialogs,high_priority,bulk_actions,subscribe -P threads -c 20 -n misc@%h --loglevel=info
+#
 # ───── Старая конфигурация (-P solo) — для отладки одного аккаунта ─────
-# python -m celery -A celery_app worker -Q high_priority,bulk_actions,ai_dialogs --loglevel=info -P solo
+# celery -A celery_app worker -Q plans,warmup,parsers,ai_dialogs,high_priority,bulk_actions,subscribe --loglevel=info -P solo
 #
 # ───── Закрытые каналы (event listener) ─────
-# cd api && python run_listener.py
+# python run_listener.py

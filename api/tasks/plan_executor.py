@@ -176,7 +176,7 @@ async def _dispatch_plans():
                 celery_app.send_task(
                     "tasks.plan_executor.execute_plan_session",
                     args=[plan.id],
-                    queue="ai_dialogs",
+                    queue="plans",
                 )
                 dispatched += 1
 
@@ -272,6 +272,7 @@ async def _execute_plan_session(plan_id: int):
     from models.warmup import WarmupTask
     from utils.telegram import make_telethon_client
     from utils.account_lock import acquire_account_lock, release_account_lock
+    from utils.user_lock import acquire_user_slot, release_user_slot
     from utils.db_pool import async_session as Session
     from services.llm import generate_comment, build_comment_prompt
     from tasks.behavior_engine import assign_style_profile
@@ -353,6 +354,7 @@ async def _execute_plan_session(plan_id: int):
                 logger.info(f"[plan] Аккаунт {plan.account_id} занят (lock) — пропуск")
                 return {"status": "locked"}
 
+            slot_user_id = None  # для release в finally
             try:
                 acc = (await db.execute(
                     select(TelegramAccount).options(joinedload(TelegramAccount.api_app))
@@ -363,6 +365,13 @@ async def _execute_plan_session(plan_id: int):
                     plan.executed_idx += 1
                     await db.commit()
                     return {"status": "inactive"}
+
+                # Per-user concurrency limit — защита от того что один юзер
+                # с 500 аккаунтами съест всю мощность воркера
+                if not acquire_user_slot(acc.user_id):
+                    logger.info(f"[plan] User {acc.user_id}: лимит одновременных сессий, пропуск")
+                    return {"status": "user_at_limit"}
+                slot_user_id = acc.user_id
 
                 proxy = None
                 if acc.proxy_id:
@@ -1049,6 +1058,8 @@ async def _execute_plan_session(plan_id: int):
 
             finally:
                 release_account_lock(plan.account_id)
+                if slot_user_id is not None:
+                    release_user_slot(slot_user_id)
 
         except Exception as e:
             logger.error(f"[plan_executor] #{plan_id}: {e}")

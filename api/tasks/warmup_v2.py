@@ -1048,7 +1048,7 @@ async def _dispatch_warmups():
                 celery_app.send_task(
                     "tasks.warmup_v2.run_single_warmup",
                     args=[t.id],
-                    queue="ai_dialogs",
+                    queue="warmup",
                 )
                 dispatched += 1
 

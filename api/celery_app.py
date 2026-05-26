@@ -16,7 +16,6 @@ import os
 from dotenv import load_dotenv
 
 load_dotenv()
-from config import DATABASE_URL
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 celery_app = Celery(
@@ -47,14 +46,33 @@ celery_app.conf.update(
     enable_utc=True,
 
     task_routes={
+        # Быстрые юзер-инициированные операции
         "tasks.account_tasks.*":         {"queue": "high_priority"},
         "tasks.proxy_tasks.*":           {"queue": "high_priority"},
+
+        # Bulk-операции (импорт TData, 2FA batch и т.п.)
         "tasks.bulk_tasks.*":            {"queue": "bulk_actions"},
+
+        # ПЛАНЫ КАМПАНИЙ — самые важные, отдельная очередь
+        # для предсказуемой latency. Дальше всё масштабируется по ней.
+        "tasks.plan_executor.*":         {"queue": "plans"},
+
+        # Прогрев аккаунтов — отдельная очередь
+        "tasks.warmup_v2.*":             {"queue": "warmup"},
+        "tasks.warmup_tasks.*":          {"queue": "warmup"},
+
+        # Парсеры — могут быть долгими (crawler до 10 мин), изолируем
+        # чтобы не блокировали planning/commenting
+        "tasks.parser_tasks.*":          {"queue": "parsers"},
+        "tasks.parser_similar_tasks.*":  {"queue": "parsers"},
+
+        # Подписки — отдельно, бывают long-running
+        "tasks.subscribe_tasks.*":       {"queue": "subscribe"},
+
+        # AI-диалоги и комментинг
         "tasks.ai_tasks.*":              {"queue": "ai_dialogs"},
         "tasks.commenting_tasks.*":      {"queue": "ai_dialogs"},
         "tasks.comment_executor.*":      {"queue": "ai_dialogs"},
-        "tasks.parser_tasks.*":          {"queue": "ai_dialogs"},
-        "tasks.parser_similar_tasks.*":  {"queue": "ai_dialogs"},   # ← маршрут для crawler
     },
 
     result_expires=3600,

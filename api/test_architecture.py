@@ -88,7 +88,8 @@ async def test_account(account_id: int, prefix: str = ""):
                 proxy = (await db.execute(select(Proxy).where(Proxy.id == acc.proxy_id))).scalar_one_or_none()
             phone = acc.phone
             status = acc.status
-        result["steps"].append({"step": "db", "ok": True, "detail": f"{phone} status={status}"})
+            user_id = acc.user_id
+        result["steps"].append({"step": "db", "ok": True, "detail": f"{phone} status={status} user_id={user_id}"})
     except Exception as e:
         result["steps"].append({"step": "db", "ok": False, "error": f"{type(e).__name__}: {str(e)[:150]}"})
         result["error"] = "DB failure"
@@ -101,6 +102,20 @@ async def test_account(account_id: int, prefix: str = ""):
         result["steps"].append({"step": "redis_limiter", "ok": True, "detail": f"connects={count}/6, limit_ok={limit_ok}"})
     except Exception as e:
         result["steps"].append({"step": "redis_limiter", "ok": False, "error": f"{type(e).__name__}: {str(e)[:150]}"})
+
+    # 2b. user_lock (Phase 4)
+    try:
+        from utils.user_lock import acquire_user_slot, release_user_slot, get_user_active
+        before = get_user_active(user_id)
+        if acquire_user_slot(user_id, max_concurrent=999):  # большой лимит чтобы точно взять
+            after = get_user_active(user_id)
+            release_user_slot(user_id)
+            final = get_user_active(user_id)
+            result["steps"].append({"step": "user_lock", "ok": True, "detail": f"user={user_id} slots {before}→{after}→{final}"})
+        else:
+            result["steps"].append({"step": "user_lock", "ok": False, "error": "не удалось взять слот"})
+    except Exception as e:
+        result["steps"].append({"step": "user_lock", "ok": False, "error": f"{type(e).__name__}: {str(e)[:150]}"})
 
     # 3. Redis lock (acquire)
     if not acquire_account_lock(account_id, ttl=60):
