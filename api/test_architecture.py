@@ -29,7 +29,13 @@ import argparse
 import time
 import logging
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# sys.path: api/ — первым, parent (tg_manager1/ с легаси config.py) — убрать
+_API_DIR    = os.path.dirname(os.path.abspath(__file__))
+_PARENT_DIR = os.path.dirname(_API_DIR)
+sys.path = [p for p in sys.path
+            if os.path.normcase(os.path.abspath(p) if p else "") != os.path.normcase(_PARENT_DIR)]
+if _API_DIR not in sys.path:
+    sys.path.insert(0, _API_DIR)
 
 # Тихий лог чтобы выхлоп был читаемым
 logging.basicConfig(level=logging.WARNING, format='[%(levelname)s] %(name)s: %(message)s')

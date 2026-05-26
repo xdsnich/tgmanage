@@ -25,7 +25,15 @@ import os
 import asyncio
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# ── sys.path: api/ должен быть ПЕРВЫМ, а tg_manager1/ (parent) — убрать ──
+# В корне репо лежит легаси-config.py без DATABASE_URL. Если он попадёт
+# в sys.path раньше api/, импорты сломаются с непонятной ошибкой.
+_API_DIR    = os.path.dirname(os.path.abspath(__file__))
+_PARENT_DIR = os.path.dirname(_API_DIR)
+sys.path = [p for p in sys.path
+            if os.path.normcase(os.path.abspath(p) if p else "") != os.path.normcase(_PARENT_DIR)]
+if _API_DIR not in sys.path:
+    sys.path.insert(0, _API_DIR)
 
 
 class C:

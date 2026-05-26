@@ -24,7 +24,13 @@ import subprocess
 
 def graceful_shutdown():
     """Отправляет broadcast 'shutdown' через broker всем воркерам."""
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    # sys.path: api/ — первым, parent (tg_manager1/ с легаси config.py) — убрать
+    api_dir    = os.path.dirname(os.path.abspath(__file__))
+    parent_dir = os.path.dirname(api_dir)
+    sys.path = [p for p in sys.path
+                if os.path.normcase(os.path.abspath(p) if p else "") != os.path.normcase(parent_dir)]
+    if api_dir not in sys.path:
+        sys.path.insert(0, api_dir)
     try:
         from celery_app import celery_app
     except ImportError as e:
