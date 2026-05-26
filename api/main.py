@@ -136,22 +136,29 @@ async def root():
 #   cd api && python -m uvicorn main:app --reload --port 8000
 #
 # Терминал 2 — Celery воркер (ВСЕ очереди в одном процессе, простой сетап):
-#   cd api && python -m celery -A celery_app worker ^
-#     -Q plans,warmup,parsers,ai_dialogs,high_priority,bulk_actions,subscribe ^
-#     -P threads -c 40 --loglevel=info
+#   cd api && celery -A celery_app worker `
+#     -Q plans,warmup,parsers,ai_dialogs,high_priority,bulk_actions,subscribe `
+#     -P threads -c 40 `
+#     --without-gossip --without-mingle --without-heartbeat `
+#     --loglevel=info
 #
 #   -P threads — каждый таск в своём треде, у каждого треда свой asyncio loop.
 #                Для I/O-bound кода (Telethon, asyncpg, httpx) GIL отпускается → параллелизм.
 #   -c 40      — до 40 параллельных задач. ~5MB/тред. Для больше: -c 60, -c 100.
 #
+#   --without-gossip   — не общаться с другими воркерами (нет multi-worker сетапа)
+#   --without-mingle   — не делать startup-sync с broker (быстрее старт + shutdown)
+#   --without-heartbeat — не пинговать broker (быстрее shutdown на Windows)
+#   Эти 3 флага суммарно экономят ~5 сек на каждом shutdown.
+#
 #   ПОЧЕМУ НЕ -P gevent: greenlet'ы делят OS-тред, asyncio видит чужой running loop →
 #   "Cannot run the event loop while another loop is running". Несовместимо.
 #
 #   ВЫКЛЮЧЕНИЕ:
-#   - Ctrl+C  → warm shutdown (ждёт max 15с, потом force-kill из celery_app.py)
-#   - Ctrl+C ещё раз → cold shutdown
-#   - python kill_workers.py        → graceful через Redis broker
-#   - python kill_workers.py --hard → taskkill (если воркер совсем застрял)
+#   - Ctrl+C один раз → warm shutdown (ждёт max 5с, потом force-kill)
+#   - Ctrl+C два раза  → cold shutdown (мгновенно)
+#   - python kill_workers.py        → graceful через Redis broker (с другого терминала)
+#   - python kill_workers.py --hard → taskkill /F (если совсем застрял)
 #
 # Терминал 3 — Celery Beat (планировщик, раз в 60с шлёт dispatch_plans/warmups/ai):
 #   cd api && python -m celery -A celery_app beat --loglevel=info

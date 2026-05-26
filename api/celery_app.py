@@ -118,12 +118,18 @@ celery_app.conf.update(
     task_soft_time_limit=480,
 
     # ── Быстрый shutdown ─────────────────────────────────────
-    # При Ctrl+C ждём максимум 15 секунд завершения тасков, потом force-kill.
-    # Без этого Telethon может висеть в socket.recv() пока сервер не разорвёт.
-    worker_shutdown_timeout=15,
+    # При Ctrl+C ждём максимум 5 секунд, потом force-kill всех тредов.
+    # Без этого Celery+threads на Windows может зависать на minutes пока
+    # redis.brpop в C-level вернётся (треды нельзя прервать сигналом).
+    worker_shutdown_timeout=5,
 
     # При потере коннекта к Redis — отменять долгие таски (а не висеть бесконечно)
     worker_cancel_long_running_tasks_on_connection_loss=True,
+
+    # Не слать события задач в broker — экономит Redis-трафик и ускоряет shutdown
+    # (на dev можно False, на prod = True если используешь Flower с full features)
+    worker_send_task_events=True,
+    task_send_sent_event=False,
 
     # Не держать результаты тасков в Redis дольше нужного
     task_ignore_result=False,
