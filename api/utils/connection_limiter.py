@@ -3,18 +3,12 @@
 Не больше 6 подключений — норма для реального пользователя.
 """
 
-import os
 import logging
 from datetime import date
+from utils.redis_pool import get_redis as _get_redis
 
 logger = logging.getLogger(__name__)
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 MAX_DAILY_CONNECTIONS = 6
-
-
-def _get_redis():
-    import redis
-    return redis.from_url(REDIS_URL)
 
 
 def check_connection_limit(account_id: int) -> bool:

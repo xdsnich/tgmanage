@@ -25,5 +25,8 @@ httpx==0.27.0
 # Celery + Redis
 celery==5.3.6
 redis==5.0.8
+# Gevent — async worker pool. Запуск: celery worker -P gevent -c 50
+# Без gevent celery -P solo обрабатывает по 1 задаче за раз.
+gevent==24.2.1
 
 aiohttp==3.9.5

@@ -111,58 +111,28 @@ async def root():
         }
     }
 
-# Запуск:
-# cd api && venv\Scripts\activate
-# uvicorn main:app --reload --port 8000
-# python -m celery -A celery_app worker -Q high_priority,bulk_actions --loglevel=info -P solo
-
-# Терминал 1 (API):      cd api → uvicorn main:app --reload --port 8000
-# Терминал 2 (Worker):   cd api → celery -A celery_app worker -Q high_priority,bulk_actions,ai_dialogs --loglevel=info -P solo
-# Терминал 3 (Beat):     cd api → python run_periodic.py
-# Терминал 4 (Frontend): cd gramgpt-web → npm run dev
-# Терминал 1: API
-# cd api && uvicorn main:app --reload --port 8000
-
-# # Терминал 2: Worker
-# cd api && celery -A celery_app worker -Q high_priority,bulk_actions,ai_dialogs --loglevel=info -P solo
-
-# # Терминал 3: Публичные каналы (веб-парсинг каждые 90с)
-# cd api && python run_periodic.py
-
-# # Терминал 4: Закрытые каналы (event listener)
-# cd api && python run_listener.py
-
-# # Терминал 5: Frontend
-# cd gramgpt-web && npm run dev
-#python -m uvicorn main:app --reload --port 8000
-#python -m celery -A celery_app worker -Q high_priority,bulk_actions,ai_dialogs --loglevel=info -P solo
-
-
-# # Терминал 1: API
-# cd api
-# python -m uvicorn main:app --reload --port 8000
-
-# # Терминал 2: Celery (комментинг + executor + проверки)
-# cd api
+# ═══════════════════════════════════════════════════════════
+# ЗАПУСК (масштабируемая конфигурация — gevent worker pool)
+# ═══════════════════════════════════════════════════════════
+#
+# Терминал 1 — API:
+#   cd api && python -m uvicorn main:app --reload --port 8000
+#
+# Терминал 2 — Celery воркер на gevent (вместо -P solo!):
+#   cd api && python -m celery -A celery_app worker -Q high_priority,bulk_actions,ai_dialogs -P gevent -c 50 --loglevel=info
+#
+#   -P gevent  — асинхронный пул (вместо solo = 1 задача за раз)
+#   -c 50      — concurrency: до 50 параллельных задач одновременно
+#   Для большего scale: -c 100, -c 200. Memory ~5MB на задачу.
+#
+# Терминал 3 — Планировщик:
+#   cd api && python run_periodic.py
+#
+# Терминал 4 — Фронт:
+#   cd gramgpt-web && npm run dev
+#
+# ───── Старая конфигурация (-P solo) — для отладки одного аккаунта ─────
 # python -m celery -A celery_app worker -Q high_priority,bulk_actions,ai_dialogs --loglevel=info -P solo
-
-# # Терминал 3: Celery (прогрев + подписки — отдельно, не блокирует комментинг)
-# cd api
-# python -m celery -A celery_app worker -Q warmup --loglevel=info -P solo
-
-# # Терминал 4: Планировщик
-# cd api
-# python run_periodic.py
-
-
-# # Терминал 1: API
-# cd api && python -m uvicorn main:app --reload --port 8000
-
-# # Терминал 2: Celery воркер
-# cd api && python -m celery -A celery_app worker -Q high_priority,bulk_actions,ai_dialogs -P solo --loglevel=info
-
-# # Терминал 3: Планировщик
-# cd api && python run_periodic.py
-
-# # Терминал 4: Фронт
-# cd gramgpt-web && npm run dev
+#
+# ───── Закрытые каналы (event listener) ─────
+# cd api && python run_listener.py

@@ -4,18 +4,12 @@ Redis-based lock to prevent parallel connections for the same account.
 Uses SETNX for atomic acquire.
 """
 
-import os
 import logging
+from utils.redis_pool import get_redis as _get_redis
 
 logger = logging.getLogger(__name__)
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 _LOCK_PREFIX = "gramgpt:account_lock:"
-
-
-def _get_redis():
-    import redis
-    return redis.from_url(REDIS_URL)
 
 
 def acquire_account_lock(account_id: int, ttl: int = 300) -> bool:
