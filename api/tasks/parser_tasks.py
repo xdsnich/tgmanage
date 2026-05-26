@@ -67,51 +67,44 @@ async def _save_channel(user_id, channel_data):
     if API_DIR not in sys.path:
         sys.path.insert(0, API_DIR)
 
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select
-    from config import DATABASE_URL
     from models.parsed_channel import ParsedChannel
+    from utils.db_pool import async_session as Session
 
-    engine = create_async_engine(DATABASE_URL, pool_size=1, max_overflow=0)
-    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
-
-    try:
-        async with Session() as db:
-            existing = await db.execute(
-                select(ParsedChannel).where(
-                    ParsedChannel.user_id == user_id,
-                    ParsedChannel.username == channel_data["username"],
-                )
+    async with Session() as db:
+        existing = await db.execute(
+            select(ParsedChannel).where(
+                ParsedChannel.user_id == user_id,
+                ParsedChannel.username == channel_data["username"],
             )
-            if existing.scalar_one_or_none():
-                return False
+        )
+        if existing.scalar_one_or_none():
+            return False
 
-            post_date = None
-            if channel_data.get("last_post_date"):
-                try:
-                    dt = datetime.fromisoformat(channel_data["last_post_date"].replace("Z", ""))
-                    post_date = dt.replace(tzinfo=None)
-                except Exception:
-                    pass
+        post_date = None
+        if channel_data.get("last_post_date"):
+            try:
+                dt = datetime.fromisoformat(channel_data["last_post_date"].replace("Z", ""))
+                post_date = dt.replace(tzinfo=None)
+            except Exception:
+                pass
 
-            ch_fields = {
-                "user_id": user_id,
-                "channel_id": channel_data.get("channel_id", 0),
-                "username": channel_data["username"],
-                "title": channel_data["title"],
-                "subscribers": channel_data["subscribers"],
-                "has_comments": channel_data["has_comments"],
-                "last_post_date": post_date,
-                "search_query": channel_data["search_query"],
-            }
-            if hasattr(ParsedChannel, 'source'):
-                ch_fields["source"] = "telegram"
+        ch_fields = {
+            "user_id": user_id,
+            "channel_id": channel_data.get("channel_id", 0),
+            "username": channel_data["username"],
+            "title": channel_data["title"],
+            "subscribers": channel_data["subscribers"],
+            "has_comments": channel_data["has_comments"],
+            "last_post_date": post_date,
+            "search_query": channel_data["search_query"],
+        }
+        if hasattr(ParsedChannel, 'source'):
+            ch_fields["source"] = "telegram"
 
-            db.add(ParsedChannel(**ch_fields))
-            await db.commit()
-            return True
-    finally:
-        await engine.dispose()
+        db.add(ParsedChannel(**ch_fields))
+        await db.commit()
+        return True
 
 
 # ═══════════════════════════════════════════════════════════
@@ -162,16 +155,12 @@ async def _run_parser(user_id: int, account_id: int, params: dict):
     if API_DIR not in sys.path:
         sys.path.insert(0, API_DIR)
 
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select
     from sqlalchemy.orm import joinedload
-    from config import DATABASE_URL
     from models.account import TelegramAccount
     from models.proxy import Proxy
     from utils.telegram import make_telethon_client
-
-    engine = create_async_engine(DATABASE_URL, pool_size=1, max_overflow=0)
-    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+    from utils.db_pool import async_session as Session
 
     # Загружаем аккаунт
     async with Session() as db:
@@ -191,8 +180,6 @@ async def _run_parser(user_id: int, account_id: int, params: dict):
         client = make_telethon_client(acc, proxy)
         if not client:
             return {"error": "Не удалось создать клиент"}
-
-    await engine.dispose()
 
     import redis as redis_lib
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")

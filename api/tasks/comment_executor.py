@@ -342,13 +342,9 @@ async def _process_comment_queue():
     """Обрабатывает очередь комментариев — запускается каждые 60с."""
     if API_DIR not in sys.path: sys.path.insert(0, API_DIR)
 
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select
-    from config import DATABASE_URL
     from models.comment_queue import CommentQueue
-
-    engine = create_async_engine(DATABASE_URL, pool_size=2, max_overflow=0)
-    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+    from utils.db_pool import async_session as Session
 
     async with Session() as db:
         try:
@@ -392,8 +388,6 @@ async def _process_comment_queue():
             logger.error(f"[executor] Ошибка: {e}")
             await db.rollback()
             return {"error": str(e)}
-        finally:
-            await engine.dispose()
 
 
 @celery_app.task(bind=True, name="tasks.comment_executor.process_comment_queue")
@@ -412,13 +406,9 @@ async def _dispatch_comments():
     if API_DIR not in sys.path:
         sys.path.insert(0, API_DIR)
 
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select
-    from config import DATABASE_URL
     from models.comment_queue import CommentQueue
-
-    engine = create_async_engine(DATABASE_URL, pool_size=2, max_overflow=0)
-    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+    from utils.db_pool import async_session as Session
 
     dispatched = 0
 
@@ -444,8 +434,6 @@ async def _dispatch_comments():
             logger.info(f"[dispatch] Comments: отправлено {dispatched}")
     except Exception as e:
         logger.error(f"[dispatch] Comments ошибка: {e}")
-    finally:
-        await engine.dispose()
 
     return {"dispatched": dispatched}
 
@@ -455,13 +443,9 @@ async def _execute_single_comment(queue_id: int):
     if API_DIR not in sys.path:
         sys.path.insert(0, API_DIR)
 
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select
-    from config import DATABASE_URL
     from models.comment_queue import CommentQueue
-
-    engine = create_async_engine(DATABASE_URL, pool_size=2, max_overflow=0)
-    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+    from utils.db_pool import async_session as Session
 
     async with Session() as db:
         try:
@@ -486,8 +470,6 @@ async def _execute_single_comment(queue_id: int):
             except:
                 pass
             return {"error": str(e)}
-        finally:
-            await engine.dispose()
 
 
 @celery_app.task(bind=True, name="tasks.comment_executor.dispatch_comments")

@@ -33,20 +33,15 @@ async def _check_account_with_proxy(account_dict: dict, check_spam: bool = False
     if API_DIR not in sys.path:
         sys.path.insert(0, API_DIR)
 
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select
-    from config import DATABASE_URL
     from models.account import TelegramAccount
     from models.proxy import Proxy
     from utils.telegram import make_telethon_client
+    from utils.db_pool import async_session as Session
 
     phone = account_dict.get("phone", "?")
 
-    engine = create_async_engine(DATABASE_URL, pool_size=1, max_overflow=0)
-    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
-
-    try:
-        async with Session() as db:
+    async with Session() as db:
             # Ищем аккаунт в БД по номеру
             from sqlalchemy.orm import joinedload
 
@@ -178,9 +173,6 @@ async def _check_account_with_proxy(account_dict: dict, check_spam: bool = False
 
                 return {**account_dict, "status": account.status,
                         "error": str(e)[:200], "last_checked": datetime.utcnow().isoformat()}
-
-    finally:
-        await engine.dispose()
 
 
 @celery_app.task(bind=True, name="tasks.account_tasks.check_account")

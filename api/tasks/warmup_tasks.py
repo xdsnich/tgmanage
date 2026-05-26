@@ -172,14 +172,10 @@ async def _process_all_warmups():
     if API_DIR not in sys.path:
         sys.path.insert(0, API_DIR)
 
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select
-    from config import DATABASE_URL
     from models.warmup import WarmupTask
     from models.account import TelegramAccount
-
-    engine = create_async_engine(DATABASE_URL, pool_size=2, max_overflow=0)
-    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+    from utils.db_pool import async_session as Session
 
     async with Session() as db:
         from sqlalchemy.orm import joinedload
@@ -221,8 +217,6 @@ async def _process_all_warmups():
             logger.error(f"Ошибка прогрева: {e}")
             await db.rollback()
             return {"error": str(e)}
-        finally:
-            await engine.dispose()
 
 
 @celery_app.task(bind=True, name="tasks.warmup_tasks.process_warmups")

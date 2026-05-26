@@ -127,27 +127,20 @@ MAX_DAILY_PER_ACTION = {
 
 async def _get_action_count_from_db(task_id: int, action_name: str, day_started_at) -> int:
     """Query warmup_logs table for today's action count (DB, not RAM)."""
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select, func
-    from config import DATABASE_URL
     from models.warmup_log import WarmupLog
+    from utils.db_pool import async_session as Session
 
-    engine = create_async_engine(DATABASE_URL, pool_size=1, max_overflow=0)
-    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
-
-    try:
-        async with Session() as db:
-            result = await db.execute(
-                select(func.count()).where(
-                    WarmupLog.task_id == task_id,
-                    WarmupLog.action == action_name,
-                    WarmupLog.success == True,
-                    WarmupLog.created_at >= day_started_at,
-                )
+    async with Session() as db:
+        result = await db.execute(
+            select(func.count()).where(
+                WarmupLog.task_id == task_id,
+                WarmupLog.action == action_name,
+                WarmupLog.success == True,
+                WarmupLog.created_at >= day_started_at,
             )
-            return result.scalar() or 0
-    finally:
-        await engine.dispose()
+        )
+        return result.scalar() or 0
 
 
 def _check_action_daily_limit_sync(task_id: int, action_name: str, day_started_at) -> bool:
@@ -830,17 +823,13 @@ async def _process_all_warmups_v2():
       - Если да — запускает сессию (несколько действий подряд)
       - Если нет — пропускает (waiting)
     """
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select
     from sqlalchemy.orm import joinedload
-    from config import DATABASE_URL
     from models.warmup import WarmupTask
     from models.account import TelegramAccount
     from models.proxy import Proxy
     from models.warmup_log import WarmupLog
-
-    engine = create_async_engine(DATABASE_URL, pool_size=2, max_overflow=0)
-    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+    from utils.db_pool import async_session as Session
 
     async with Session() as db:
         try:
@@ -850,7 +839,6 @@ async def _process_all_warmups_v2():
             tasks = result.scalars().all()
 
             if not tasks:
-                await engine.dispose()
                 return {"processed": 0}
 
             now = datetime.utcnow()
@@ -1005,13 +993,11 @@ async def _process_all_warmups_v2():
                 processed += 1
 
             await db.commit()
-            await engine.dispose()
             return {"processed": processed, "results": results}
 
         except Exception as e:
             logger.error(f"Ошибка прогрева v2: {e}")
             await db.rollback()
-            await engine.dispose()
             return {"error": str(e)}
 
 
@@ -1032,13 +1018,9 @@ async def _dispatch_warmups():
     if API_DIR not in sys.path:
         sys.path.insert(0, API_DIR)
 
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select
-    from config import DATABASE_URL
     from models.warmup import WarmupTask
-
-    engine = create_async_engine(DATABASE_URL, pool_size=2, max_overflow=0)
-    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+    from utils.db_pool import async_session as Session
 
     dispatched = 0
     skipped = 0
@@ -1073,8 +1055,6 @@ async def _dispatch_warmups():
             logger.info(f"[dispatch] Warmup: отправлено {dispatched}, пропущено {skipped}")
     except Exception as e:
         logger.error(f"[dispatch] Ошибка: {e}")
-    finally:
-        await engine.dispose()
 
     return {"dispatched": dispatched, "skipped": skipped}
 
@@ -1084,18 +1064,14 @@ async def _run_single_warmup(task_id: int):
     if API_DIR not in sys.path:
         sys.path.insert(0, API_DIR)
 
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select
     from sqlalchemy.orm import joinedload
-    from config import DATABASE_URL
     from models.warmup import WarmupTask
     from models.warmup_log import WarmupLog
     from models.account import TelegramAccount
     from models.proxy import Proxy
     from utils.account_lock import acquire_account_lock, release_account_lock
-
-    engine = create_async_engine(DATABASE_URL, pool_size=2, max_overflow=0)
-    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+    from utils.db_pool import async_session as Session
 
     async with Session() as db:
         try:
@@ -1222,8 +1198,6 @@ async def _run_single_warmup(task_id: int):
             except:
                 pass
             return {"error": str(e)}
-        finally:
-            await engine.dispose()
 
 
 @celery_app.task(bind=True, name="tasks.warmup_v2.dispatch_warmups")

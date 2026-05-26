@@ -59,17 +59,13 @@ async def _run_subscribe_task(task_data: dict):
     
     Общее время ≈ total_minutes
     """
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select
     from sqlalchemy.orm import joinedload
-    from config import DATABASE_URL
     from models.account import TelegramAccount
     from models.proxy import Proxy
     from models.subscribe_task import SubscribeTask
     from utils.telegram import make_telethon_client
-
-    engine = create_async_engine(DATABASE_URL, pool_size=2, max_overflow=0)
-    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+    from utils.db_pool import async_session as Session
 
     account_ids = task_data["account_ids"]
     channels = [_normalize_channel(c) for c in task_data["channels"]]
@@ -86,7 +82,6 @@ async def _run_subscribe_task(task_data: dict):
     # Время внутри аккаунта + время между аккаунтами
     num_accounts = len(account_ids)
     if num_accounts == 0 or len(channels) == 0:
-        await engine.dispose()
         return {"subscribed": 0, "failed": 0, "skipped": 0, "total": 0}
 
     # Время между аккаунтами (большие паузы)
@@ -283,8 +278,6 @@ async def _run_subscribe_task(task_data: dict):
                     task_row.status = "error"
                     task_row.error = str(e)[:300]
                     await db.commit()
-        finally:
-            await engine.dispose()
 
     logger.info(f"[subscribe] ═══ Готово: ✅ {subscribed} подписано, ❌ {failed} ошибок, ✓ {skipped} уже были")
 

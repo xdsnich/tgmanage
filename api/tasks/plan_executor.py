@@ -63,15 +63,11 @@ async def _dispatch_plans():
     if API_DIR not in sys.path:
         sys.path.insert(0, API_DIR)
 
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select, delete as sa_delete
-    from config import DATABASE_URL
     from models.campaign_plan import CampaignPlan
     from models.campaign import Campaign, CampaignStatus
     from models.warmup import WarmupTask
-
-    engine = create_async_engine(DATABASE_URL, pool_size=2, max_overflow=0)
-    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+    from utils.db_pool import async_session as Session
 
     dispatched = 0
     skipped = 0
@@ -253,8 +249,6 @@ async def _dispatch_plans():
 
     except Exception as e:
         logger.error(f"[plan_dispatch] Ошибка: {e}")
-    finally:
-        await engine.dispose()
 
     return {"dispatched": dispatched, "skipped": skipped, "cleaned": cleaned}
 
@@ -268,10 +262,8 @@ async def _execute_plan_session(plan_id: int):
     if API_DIR not in sys.path:
         sys.path.insert(0, API_DIR)
 
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select
     from sqlalchemy.orm import joinedload
-    from config import DATABASE_URL
     from models.campaign_plan import CampaignPlan
     from models.campaign import Campaign, CampaignStatus, CommentLog
     from models.account import TelegramAccount
@@ -280,11 +272,9 @@ async def _execute_plan_session(plan_id: int):
     from models.warmup import WarmupTask
     from utils.telegram import make_telethon_client
     from utils.account_lock import acquire_account_lock, release_account_lock
+    from utils.db_pool import async_session as Session
     from services.llm import generate_comment, build_comment_prompt
     from tasks.behavior_engine import assign_style_profile
-
-    engine = create_async_engine(DATABASE_URL, pool_size=2, max_overflow=0)
-    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 
     async with Session() as db:
         try:
@@ -1067,8 +1057,6 @@ async def _execute_plan_session(plan_id: int):
             except:
                 pass
             return {"error": str(e)}
-        finally:
-            await engine.dispose()
 
 
 # ═══════════════════════════════════════════════════════════

@@ -67,60 +67,49 @@ async def _save_channel(user_id: int, channel_data: dict) -> bool:
     if API_DIR not in sys.path:
         sys.path.insert(0, API_DIR)
 
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select
-    from config import DATABASE_URL
     from models.parsed_channel import ParsedChannel
+    from utils.db_pool import async_session as Session
 
-    engine = create_async_engine(DATABASE_URL, pool_size=1, max_overflow=0)
-    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
-
-    try:
-        async with Session() as db:
-            existing = await db.execute(
-                select(ParsedChannel).where(
-                    ParsedChannel.user_id == user_id,
-                    ParsedChannel.username == channel_data["username"],
-                )
+    async with Session() as db:
+        existing = await db.execute(
+            select(ParsedChannel).where(
+                ParsedChannel.user_id == user_id,
+                ParsedChannel.username == channel_data["username"],
             )
-            if existing.scalar_one_or_none():
-                return False
+        )
+        if existing.scalar_one_or_none():
+            return False
 
-            ch = ParsedChannel(
-                user_id=user_id,
-                channel_id=channel_data.get("channel_id", 0),
-                username=channel_data["username"],
-                title=channel_data["title"],
-                subscribers=channel_data["subscribers"],
-                has_comments=channel_data.get("has_comments", False),
-                search_query=channel_data.get("search_query", "similar"),
-                folder=channel_data.get("folder", ""),
-            )
-            for attr in ("country", "language", "category", "description", "source"):
-                if hasattr(ch, attr) and channel_data.get(attr) is not None:
-                    setattr(ch, attr, channel_data[attr])
+        ch = ParsedChannel(
+            user_id=user_id,
+            channel_id=channel_data.get("channel_id", 0),
+            username=channel_data["username"],
+            title=channel_data["title"],
+            subscribers=channel_data["subscribers"],
+            has_comments=channel_data.get("has_comments", False),
+            search_query=channel_data.get("search_query", "similar"),
+            folder=channel_data.get("folder", ""),
+        )
+        for attr in ("country", "language", "category", "description", "source"):
+            if hasattr(ch, attr) and channel_data.get(attr) is not None:
+                setattr(ch, attr, channel_data[attr])
 
-            db.add(ch)
-            await db.commit()
-            return True
-    finally:
-        await engine.dispose()
+        db.add(ch)
+        await db.commit()
+        return True
 
 
 async def _get_client_for(account_id: int):
     if API_DIR not in sys.path:
         sys.path.insert(0, API_DIR)
 
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select
     from sqlalchemy.orm import joinedload
-    from config import DATABASE_URL
     from models.account import TelegramAccount
     from models.proxy import Proxy
     from utils.telegram import make_telethon_client
-
-    engine = create_async_engine(DATABASE_URL, pool_size=1, max_overflow=0)
-    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+    from utils.db_pool import async_session as Session
 
     async with Session() as db:
         acc_r = await db.execute(
@@ -130,7 +119,6 @@ async def _get_client_for(account_id: int):
         )
         account = acc_r.scalar_one_or_none()
         if not account:
-            await engine.dispose()
             return None, None
 
         proxy = None
@@ -139,7 +127,6 @@ async def _get_client_for(account_id: int):
             proxy = pr.scalar_one_or_none()
 
     client = make_telethon_client(account, proxy)
-    await engine.dispose()
     return client, account
 
 
@@ -453,26 +440,19 @@ async def _update_channel_has_comments(channel_id: int, has_comments: bool, subs
     if API_DIR not in sys.path:
         sys.path.insert(0, API_DIR)
 
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select
-    from config import DATABASE_URL
     from models.parsed_channel import ParsedChannel
+    from utils.db_pool import async_session as Session
 
-    engine = create_async_engine(DATABASE_URL, pool_size=1, max_overflow=0)
-    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
-
-    try:
-        async with Session() as db:
-            r = await db.execute(select(ParsedChannel).where(ParsedChannel.id == channel_id))
-            ch = r.scalar_one_or_none()
-            if ch:
-                ch.has_comments = has_comments
-                ch.last_verification = datetime.utcnow() # <--- ДОБАВЛЕНО ТОЛЬКО ЭТО
-                if subscribers is not None and subscribers > 0:
-                    ch.subscribers = subscribers
-                await db.commit()
-    finally:
-        await engine.dispose()
+    async with Session() as db:
+        r = await db.execute(select(ParsedChannel).where(ParsedChannel.id == channel_id))
+        ch = r.scalar_one_or_none()
+        if ch:
+            ch.has_comments = has_comments
+            ch.last_verification = datetime.utcnow() # <--- ДОБАВЛЕНО ТОЛЬКО ЭТО
+            if subscribers is not None and subscribers > 0:
+                ch.subscribers = subscribers
+            await db.commit()
 
 
 async def _run_verify_comments(user_id: int, account_id: int, params: dict):
@@ -495,13 +475,9 @@ async def _run_verify_comments(user_id: int, account_id: int, params: dict):
 
     if API_DIR not in sys.path:
         sys.path.insert(0, API_DIR)
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select
-    from config import DATABASE_URL
     from models.parsed_channel import ParsedChannel
-
-    engine = create_async_engine(DATABASE_URL, pool_size=1, max_overflow=0)
-    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+    from utils.db_pool import async_session as Session
     from datetime import datetime, timedelta
 
     min_days = int(params.get("min_verify_interval_days", 0))
@@ -516,15 +492,13 @@ async def _run_verify_comments(user_id: int, account_id: int, params: dict):
             threshold = datetime.utcnow() - timedelta(days=min_days)
             # Выбираем каналы, которые никогда не проверялись ИЛИ проверялись давно
             q = q.where(
-                (ParsedChannel.last_verification == None) | 
+                (ParsedChannel.last_verification == None) |
                 (ParsedChannel.last_verification < threshold)
             )
         q = q.limit(limit)
         result = await db.execute(q)
         channels = result.scalars().all()
         channels_data = [(c.id, c.username) for c in channels if c.username]
-
-    await engine.dispose()
 
     total = len(channels_data)
     if total == 0:
@@ -731,13 +705,9 @@ async def _run_detect_language(user_id: int, params: dict):
     only_unknown = bool(params.get("only_unknown", True))
 
     if API_DIR not in sys.path: sys.path.insert(0, API_DIR)
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select
-    from config import DATABASE_URL
     from models.parsed_channel import ParsedChannel
-
-    engine = create_async_engine(DATABASE_URL, pool_size=5, max_overflow=10)
-    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+    from utils.db_pool import async_session as Session
 
     async with Session() as db:
         q = select(ParsedChannel).where(ParsedChannel.user_id == user_id)
@@ -795,7 +765,6 @@ async def _run_detect_language(user_id: int, params: dict):
         
         r.setex(progress_key, 3600, f"running|{checked}|{detected}|{total - checked}|{username}")
 
-    await engine.dispose()
     duration = int(time.time() - start_time)
     r.setex(progress_key, 300, f"done|{checked}|{detected}|0|готово за {duration}с")
     logger.info(f"[lang] Готово: {checked} перевірено, {detected} визначено")

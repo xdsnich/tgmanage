@@ -361,15 +361,10 @@ async def _process_all_dialogs():
     if api_dir not in sys.path:
         sys.path.insert(0, api_dir)
 
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select
-    from config import DATABASE_URL
     from models.account import TelegramAccount
     from models.ai_dialog import AIDialog
-
-    # Создаём ОТДЕЛЬНЫЙ engine для Celery (не переиспользуем API engine)
-    task_engine = create_async_engine(DATABASE_URL, pool_size=2, max_overflow=0)
-    TaskSession = async_sessionmaker(bind=task_engine, class_=AsyncSession, expire_on_commit=False)
+    from utils.db_pool import async_session as TaskSession
 
     async with TaskSession() as db:
         from sqlalchemy.orm import joinedload
@@ -451,8 +446,6 @@ async def _process_all_dialogs():
             logger.error(f"Ошибка обработки ИИ-диалогов: {e}")
             await db.rollback()
             return {"error": str(e)}
-        finally:
-            await task_engine.dispose()
 
 
 # ── Celery Tasks ─────────────────────────────────────────────
@@ -484,14 +477,11 @@ def process_single_account_dialogs(self, account_id: int):
         if api_dir not in sys.path:
             sys.path.insert(0, api_dir)
 
-        from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
         from sqlalchemy import select
-        from config import DATABASE_URL
+        from sqlalchemy.orm import joinedload
         from models.account import TelegramAccount
         from models.ai_dialog import AIDialog
-        from sqlalchemy.orm import joinedload
-        task_engine = create_async_engine(DATABASE_URL, pool_size=2, max_overflow=0)
-        TaskSession = async_sessionmaker(bind=task_engine, class_=AsyncSession, expire_on_commit=False)
+        from utils.db_pool import async_session as TaskSession
 
         async with TaskSession() as db:
             result = await db.execute(
@@ -508,7 +498,6 @@ def process_single_account_dialogs(self, account_id: int):
             account = acc_result.scalar_one_or_none()
 
             if not account:
-                await task_engine.dispose()
                 return {"error": "Аккаунт не найден"}
 
             # Загружаем прокси
@@ -524,7 +513,6 @@ def process_single_account_dialogs(self, account_id: int):
                 processed += 1
 
             await db.commit()
-            await task_engine.dispose()
             return {"processed": processed}
 
     return run_async(_process())

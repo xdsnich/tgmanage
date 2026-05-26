@@ -33,21 +33,16 @@ async def _get_client_for_phone(phone: str):
     if API_DIR not in sys.path:
         sys.path.insert(0, API_DIR)
 
-    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
     from sqlalchemy import select
-    from config import DATABASE_URL
     from models.account import TelegramAccount
     from models.proxy import Proxy
     from utils.telegram import make_telethon_client
-
-    engine = create_async_engine(DATABASE_URL, pool_size=1, max_overflow=0)
-    Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+    from utils.db_pool import async_session as Session
 
     async with Session() as db:
         acc_r = await db.execute(select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(TelegramAccount.phone == phone))
         account = acc_r.scalar_one_or_none()
         if not account:
-            await engine.dispose()
             return None, None
 
         proxy = None
@@ -56,7 +51,6 @@ async def _get_client_for_phone(phone: str):
             proxy = proxy_r.scalar_one_or_none()
 
         client = make_telethon_client(account, proxy)
-        await engine.dispose()
         return client, proxy
 
 
