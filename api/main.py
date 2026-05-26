@@ -112,18 +112,23 @@ async def root():
     }
 
 # ═══════════════════════════════════════════════════════════
-# ЗАПУСК (масштабируемая конфигурация — gevent worker pool)
+# ЗАПУСК (масштабируемая конфигурация)
 # ═══════════════════════════════════════════════════════════
 #
 # Терминал 1 — API:
 #   cd api && python -m uvicorn main:app --reload --port 8000
 #
-# Терминал 2 — Celery воркер на gevent (вместо -P solo!):
-#   cd api && python -m celery -A celery_app worker -Q high_priority,bulk_actions,ai_dialogs -P gevent -c 50 --loglevel=info
+# Терминал 2 — Celery воркер на threads (-P threads):
+#   cd api && python -m celery -A celery_app worker -Q high_priority,bulk_actions,ai_dialogs -P threads -c 40 --loglevel=info
 #
-#   -P gevent  — асинхронный пул (вместо solo = 1 задача за раз)
-#   -c 50      — concurrency: до 50 параллельных задач одновременно
-#   Для большего scale: -c 100, -c 200. Memory ~5MB на задачу.
+#   -P threads — пул threads. Каждый таск в своём треде с собственным asyncio loop.
+#                Для I/O-bound кода (Telethon, asyncpg, httpx) GIL отпускается → реальный параллелизм.
+#   -c 40      — concurrency: до 40 параллельных задач одновременно.
+#                Memory ~5MB на тред. Для больше: -c 60, -c 100.
+#
+#   ПОЧЕМУ НЕ -P gevent: gevent держит все greenlet'ы в одном OS-треде, asyncio
+#   видит чужой running loop соседнего greenlet'а → "Cannot run the event loop while
+#   another loop is running". Несовместимо с asyncio-кодом.
 #
 # Терминал 3 — Планировщик:
 #   cd api && python run_periodic.py

@@ -2,48 +2,37 @@
 GramGPT — utils/db_pool.py
 Shared async SQLAlchemy engine + session factory.
 
-Зачем: до этого каждый Celery-таск создавал свой engine (~50мс на старт +
-открытие 1-2 TCP-коннектов к PG). При 40 параллельных тасках = 40 engine'ов
-= 80+ TCP-коннектов одновременно.
+Зачем: до этого каждый Celery-таск создавал свой engine (~50мс на старт).
+Теперь — один engine на процесс. Каждая task-сессия открывает свежее соединение.
 
-Один engine на процесс с pool_size=20 + max_overflow=50 → до 70 параллельных
-сессий, реальных TCP-коннектов ~25 (мультиплексируются).
+ВАЖНО: используется NullPool (не пулинг соединений!) — причина:
+  С Celery -P threads каждый таск работает в своём треде со своим asyncio loop.
+  Если пулить соединения, они привязаны к loop'у того треда где открылись,
+  и asyncpg падает при попытке использовать соединение из другого loop'а:
+  "got Future <Future pending> attached to a different loop".
 
-Использование внутри Celery-тасков:
+  NullPool открывает свежее соединение для каждой сессии и закрывает после.
+  Overhead ~5-10мс на локальный PostgreSQL — копейки на фоне Telegram I/O.
+
+Использование:
   from utils.db_pool import async_session as Session
 
   async with Session() as db:
       # ... работа ...
-
-  # Engine.dispose() НЕ вызывать — он живёт всё время воркера.
 """
 
-import os
 import logging
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.pool import NullPool
 
 from config import DATABASE_URL
 
 logger = logging.getLogger(__name__)
 
-# ── Параметры пула ──────────────────────────────────────
-# pool_size:     постоянные соединения (всегда живые)
-# max_overflow:  дополнительные соединения которые открываются по запросу
-# pool_pre_ping: чекать TCP перед использованием (защита от мёртвых)
-# pool_recycle:  переоткрывать соединение раз в 30 мин (защита от idle timeout)
-# pool_timeout:  макс ожидание свободного соединения, потом ошибка
-DB_POOL_SIZE     = int(os.getenv("DB_POOL_SIZE", "20"))
-DB_MAX_OVERFLOW  = int(os.getenv("DB_MAX_OVERFLOW", "50"))
-DB_POOL_TIMEOUT  = int(os.getenv("DB_POOL_TIMEOUT", "30"))
-DB_POOL_RECYCLE  = int(os.getenv("DB_POOL_RECYCLE", "1800"))
-
 
 _engine = create_async_engine(
     DATABASE_URL,
-    pool_size=DB_POOL_SIZE,
-    max_overflow=DB_MAX_OVERFLOW,
-    pool_timeout=DB_POOL_TIMEOUT,
-    pool_recycle=DB_POOL_RECYCLE,
+    poolclass=NullPool,  # ← каждый таск открывает свежее соединение, безопасно для threads+asyncio
     pool_pre_ping=True,
 )
 
@@ -53,10 +42,7 @@ async_session = async_sessionmaker(
     expire_on_commit=False,
 )
 
-logger.info(
-    f"[db_pool] Engine создан: pool_size={DB_POOL_SIZE}, "
-    f"max_overflow={DB_MAX_OVERFLOW} (макс {DB_POOL_SIZE + DB_MAX_OVERFLOW} сессий)"
-)
+logger.info("[db_pool] Engine создан (NullPool — fresh connection per session)")
 
 
 def get_engine():
