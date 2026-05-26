@@ -16,8 +16,16 @@ import importlib
 import glob
 from datetime import datetime
 
-# Добавляем api/ в path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# sys.path-cleanup: api/ — первым, parent (легаси) — убрать
+_API_DIR    = os.path.dirname(os.path.abspath(__file__))
+_PARENT_DIR = os.path.dirname(_API_DIR)
+sys.path[:] = [p for p in sys.path
+               if os.path.normcase(os.path.abspath(p) if p else os.getcwd()) != os.path.normcase(_PARENT_DIR)]
+if _API_DIR not in sys.path:
+    sys.path.insert(0, _API_DIR)
+for _mod in list(sys.modules):
+    if _mod == "config" or _mod.startswith("config."):
+        del sys.modules[_mod]
 
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))

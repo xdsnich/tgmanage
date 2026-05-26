@@ -2,6 +2,22 @@
 GramGPT API — celery_app.py
 """
 import sys
+import os
+
+# ── ВАЖНО: sys.path-cleanup ДОЛЖЕН быть до любого 'from config import ...' ──
+# В корне репо лежит легаси tg_manager1/config.py без DATABASE_URL.
+# Если PYTHONPATH/IDE/.pth кладёт parent dir в sys.path раньше api/,
+# Python берёт легаси и таски падают на импорте database.py.
+_API_DIR    = os.path.dirname(os.path.abspath(__file__))
+_PARENT_DIR = os.path.dirname(_API_DIR)
+sys.path[:] = [p for p in sys.path
+               if os.path.normcase(os.path.abspath(p) if p else os.getcwd()) != os.path.normcase(_PARENT_DIR)]
+if _API_DIR not in sys.path:
+    sys.path.insert(0, _API_DIR)
+# Сбрасываем кеш модулей если config уже был импортирован из неправильного места
+for _mod in list(sys.modules):
+    if _mod == "config" or _mod.startswith("config."):
+        del sys.modules[_mod]
 
 # Windows console может иметь не-UTF-8 кодировку — принудительно переключаем
 if sys.stdout and hasattr(sys.stdout, 'reconfigure'):

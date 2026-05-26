@@ -14,7 +14,17 @@ GramGPT — run_periodic.py  ⚠ DEPRECATED — используй Celery Beat
 import time, sys, os
 import redis as redis_lib
 
-sys.path.insert(0, os.path.dirname(__file__))
+# sys.path-cleanup: api/ — первым, parent (легаси config.py) — убрать
+_API_DIR    = os.path.dirname(os.path.abspath(__file__))
+_PARENT_DIR = os.path.dirname(_API_DIR)
+sys.path[:] = [p for p in sys.path
+               if os.path.normcase(os.path.abspath(p) if p else os.getcwd()) != os.path.normcase(_PARENT_DIR)]
+if _API_DIR not in sys.path:
+    sys.path.insert(0, _API_DIR)
+for _mod in list(sys.modules):
+    if _mod == "config" or _mod.startswith("config."):
+        del sys.modules[_mod]
+
 from celery_app import celery_app
 
 print("🧹 Очищаю Redis...")

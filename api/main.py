@@ -7,6 +7,19 @@ GramGPT API — main.py
 """
 
 import sys
+import os
+
+# ── sys.path-cleanup ДОЛЖЕН быть до любого 'from config import ...' ──
+# Защита от легаси tg_manager1/config.py — см. celery_app.py для деталей.
+_API_DIR    = os.path.dirname(os.path.abspath(__file__))
+_PARENT_DIR = os.path.dirname(_API_DIR)
+sys.path[:] = [p for p in sys.path
+               if os.path.normcase(os.path.abspath(p) if p else os.getcwd()) != os.path.normcase(_PARENT_DIR)]
+if _API_DIR not in sys.path:
+    sys.path.insert(0, _API_DIR)
+for _mod in list(sys.modules):
+    if _mod == "config" or _mod.startswith("config."):
+        del sys.modules[_mod]
 
 # Windows console может иметь не-UTF-8 кодировку — принудительно переключаем
 if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
