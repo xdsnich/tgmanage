@@ -26,6 +26,7 @@ from routers import auth, accounts, proxies, tasks
 from routers import tg_auth, analytics, security, channels, actions, inbox, tdata, commenting, warmup, parser, api_apps, reactions, subscribe, service_credentials
 from routers import health
 from routers import web_session
+from routers import diagnostics
 # ── Lifespan (старт / стоп) ──────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -81,6 +82,7 @@ app.include_router(subscribe.router, prefix=PREFIX)
 app.include_router(health.router, prefix=f"{PREFIX}")
 app.include_router(service_credentials.router, prefix=PREFIX)
 app.include_router(web_session.router, prefix="/api/v1")
+app.include_router(diagnostics.router, prefix=PREFIX)  # Диагностика подписок и аккаунтов
 # ── Healthcheck ──────────────────────────────────────────────
 @app.get("/health")
 async def health():

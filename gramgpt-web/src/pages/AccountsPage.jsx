@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { accountsAPI, importAPI, proxiesAPI } from '../services/api'
+import { accountsAPI, importAPI, proxiesAPI, channelsAPI, diagnosticsAPI } from '../services/api'
 import { Card, Button, Input, Modal, TrustBar, StatusBadge, Empty, Spinner, Badge } from '../components/ui'
 
 const ROLES = ['default', 'продавец', 'прогреватель', 'читатель', 'консультант']
@@ -44,6 +44,25 @@ export default function AccountsPage() {
   const [tdataSessionId, setTdataSessionId] = useState(null)
   const [tdataStep, setTdataStep] = useState('upload')  // upload | assign | importing
   const fileInputRef = useRef(null)
+  const avatarInputRef = useRef(null)
+  const postPhotoInputRef = useRef(null)
+
+  // Channel creation
+  const [channelModal, setChannelModal] = useState(false)
+  const [channelAccount, setChannelAccount] = useState(null)
+  const [channelForm, setChannelForm] = useState({ title: '', username: '', description: '', first_post: '', pin_to_profile: true })
+  const [channelAvatar, setChannelAvatar] = useState(null)
+  const [channelPostPhoto, setChannelPostPhoto] = useState(null)
+  const [creating, setCreating] = useState(false)
+  const [channelResult, setChannelResult] = useState(null)
+
+  // Diagnostics: test join
+  const [diagModal, setDiagModal] = useState(false)
+  const [diagAccountId, setDiagAccountId] = useState(null)
+  const [diagChannel, setDiagChannel] = useState('')
+  const [diagLeaveAfter, setDiagLeaveAfter] = useState(false)
+  const [diagRunning, setDiagRunning] = useState(false)
+  const [diagResult, setDiagResult] = useState(null)
 
   const load = async () => {
     setLoading(true)
@@ -97,6 +116,38 @@ export default function AccountsPage() {
     setEditModal(true)
   }
 
+  const openChannelModal = (acc, e) => {
+    e.stopPropagation()
+    setChannelAccount(acc)
+    setChannelForm({ title: '', username: '', description: '', first_post: '', pin_to_profile: true })
+    setChannelAvatar(null)
+    setChannelPostPhoto(null)
+    setChannelResult(null)
+    setChannelModal(true)
+  }
+
+  const handleCreateChannel = async (e) => {
+    e.preventDefault()
+    setCreating(true)
+    try {
+      const fd = new FormData()
+      fd.append('account_id', channelAccount.id)
+      fd.append('title', channelForm.title)
+      fd.append('description', channelForm.description)
+      fd.append('username', channelForm.username.replace(/^@/, ''))
+      fd.append('first_post', channelForm.first_post)
+      fd.append('pin_to_profile', channelForm.pin_to_profile)
+      if (channelAvatar) fd.append('avatar', channelAvatar)
+      if (channelPostPhoto) fd.append('post_photo', channelPostPhoto)
+      const { data } = await channelsAPI.createFull(fd)
+      setChannelResult({ success: data.success, channel: data.channel, pinned: data.pinned_to_profile, hasPost: data.first_post_published, avatarSet: data.avatar_set })
+      await load()
+    } catch (err) {
+      setChannelResult({ success: false, error: err.response?.data?.detail || 'Ошибка создания канала' })
+    }
+    setCreating(false)
+  }
+
   return (
     <div style={{ padding: '28px 32px', animation: 'fadeUp 0.4s cubic-bezier(0.16,1,0.3,1)' }}>
       {/* Header */}
@@ -107,6 +158,9 @@ export default function AccountsPage() {
           <p style={{ fontSize: 13, color: 'var(--text-3)', marginTop: 4 }}>{accounts.length} аккаунтов в базе</p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
+          <Button variant="ghost" onClick={() => {
+            setDiagAccountId(accounts[0]?.id || null); setDiagChannel(''); setDiagResult(null); setDiagLeaveAfter(false); setDiagModal(true)
+          }}>🔍 Тест подписки</Button>
           <Button variant="ghost" onClick={() => { setImportType(null); setImportResult(null); setImportFiles([]); setImportPhone(''); setImportModal(true) }}>📦 Импорт</Button>
           <Button variant="primary" onClick={() => setAddModal(true)}>+ Добавить</Button>
         </div>
@@ -213,7 +267,7 @@ export default function AccountsPage() {
         <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', overflow: 'hidden' }}>
           {/* Header row */}
           <div style={{
-            display: 'grid', gridTemplateColumns: '2fr 1.2fr 0.8fr 0.8fr 1fr 80px 100px',
+            display: 'grid', gridTemplateColumns: '2fr 1.2fr 0.8fr 0.8fr 1fr 80px 130px',
             padding: '10px 20px', borderBottom: '1px solid var(--border)',
             fontSize: 10, color: 'var(--text-3)', letterSpacing: '0.1em', fontWeight: 700, textTransform: 'uppercase',
           }}>
@@ -222,7 +276,7 @@ export default function AccountsPage() {
 
           {filtered.map((acc, i) => (
             <div key={acc.id} onClick={() => navigate(`/accounts/${acc.id}`)} style={{
-              display: 'grid', gridTemplateColumns: '2fr 1.2fr 0.8fr 0.8fr 1fr 80px 100px',
+              display: 'grid', gridTemplateColumns: '2fr 1.2fr 0.8fr 0.8fr 1fr 80px 130px',
               padding: '14px 20px', alignItems: 'center',
               borderBottom: i < filtered.length - 1 ? '1px solid var(--border)' : 'none',
               transition: 'background 0.1s', cursor: 'pointer',
@@ -251,6 +305,16 @@ export default function AccountsPage() {
               <StatusBadge status={acc.status} />
               <TrustBar score={acc.trust_score} />
               <div style={{ display: 'flex', gap: 4, justifyContent: 'flex-end' }}>
+                <button onClick={(e) => openChannelModal(acc, e)} title="Создать канал" style={{
+                  width: 28, height: 28, borderRadius: 6, border: '1px solid var(--border)',
+                  background: 'transparent', color: 'var(--text-3)', cursor: 'pointer',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 13,
+                  transition: 'all 0.15s',
+                }}
+                  onMouseEnter={e => { e.currentTarget.style.borderColor = 'rgba(0,194,178,0.5)'; e.currentTarget.style.color = 'var(--teal)' }}
+                  onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)'; e.currentTarget.style.color = 'var(--text-3)' }}>
+                  📺
+                </button>
                 <button onClick={(e) => openEdit(acc, e)} title="Редактировать" style={{
                   width: 28, height: 28, borderRadius: 6, border: '1px solid var(--border)',
                   background: 'transparent', color: 'var(--text-3)', cursor: 'pointer',
@@ -321,6 +385,257 @@ export default function AccountsPage() {
             <Button variant="primary" type="submit" loading={saving}>Сохранить</Button>
           </div>
         </form>
+      </Modal>
+
+      {/* Diagnostics: test join modal */}
+      <Modal open={diagModal} onClose={() => setDiagModal(false)} title="🔍 Тест подписки на канал" width={620}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <div style={{ padding: '10px 14px', background: 'rgba(61,139,255,0.06)', border: '1px solid rgba(61,139,255,0.15)', borderRadius: 10, fontSize: 12, color: 'var(--text-2)', lineHeight: 1.6 }}>
+            Симулирует тот же процесс что делает <b>plan_executor</b> при подписке на канал в кампании.
+            Покажет каждый шаг и точную ошибку Telegram — резолв, pre-check, JoinRequest, верификация.
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+            <div>
+              <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Аккаунт</label>
+              <select value={diagAccountId || ''} onChange={e => setDiagAccountId(e.target.value ? parseInt(e.target.value) : null)}
+                style={{ width: '100%', padding: '10px 12px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 13, outline: 'none' }}>
+                <option value="">— Выбери аккаунт —</option>
+                {accounts.map(a => (
+                  <option key={a.id} value={a.id}>
+                    {a.first_name || a.phone} {a.username ? `(@${a.username})` : ''} · {a.status}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <Input label="Канал (@username)" value={diagChannel}
+              onChange={e => setDiagChannel(e.target.value)}
+              placeholder="@DC_Draino или DC_Draino" />
+          </div>
+
+          <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', fontSize: 13, color: 'var(--text-2)' }}>
+            <input type="checkbox" checked={diagLeaveAfter} onChange={e => setDiagLeaveAfter(e.target.checked)}
+              style={{ width: 16, height: 16, accentColor: 'var(--violet)', cursor: 'pointer' }} />
+            <span>Выйти из канала после теста (только если только что вступили)</span>
+          </label>
+
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+            <Button variant="ghost" onClick={() => setDiagModal(false)}>Закрыть</Button>
+            <Button variant="primary" loading={diagRunning}
+              disabled={!diagAccountId || !diagChannel.trim()}
+              onClick={async () => {
+                setDiagRunning(true); setDiagResult(null)
+                try {
+                  const { data } = await diagnosticsAPI.testJoin(diagAccountId, diagChannel.trim(), diagLeaveAfter)
+                  setDiagResult(data)
+                } catch (err) {
+                  setDiagResult({
+                    success: false,
+                    error: err.response?.data?.detail || err.message || 'Ошибка',
+                    error_type: 'NetworkError',
+                    steps: [],
+                  })
+                }
+                setDiagRunning(false)
+              }}>
+              ▶️ Запустить тест
+            </Button>
+          </div>
+
+          {diagResult && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 4 }}>
+              {/* Summary */}
+              <div style={{
+                padding: '14px 16px', borderRadius: 10,
+                background: diagResult.success ? 'var(--green-dim)' : 'var(--red-dim)',
+                border: `1px solid ${diagResult.success ? 'rgba(61,214,140,0.25)' : 'rgba(248,81,73,0.25)'}`,
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <div style={{ fontSize: 15, fontWeight: 700, color: diagResult.success ? 'var(--green)' : 'var(--red)' }}>
+                    {diagResult.success
+                      ? (diagResult.already_in ? '✓ Уже подписан' : '✓ Подписка работает')
+                      : '✕ Подписка не прошла'}
+                  </div>
+                  {diagResult.elapsed_seconds != null && (
+                    <div style={{ fontSize: 11, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{diagResult.elapsed_seconds}с</div>
+                  )}
+                </div>
+                {diagResult.error && (
+                  <div style={{ marginTop: 6, fontSize: 12, color: 'var(--text-2)' }}>
+                    <b>{diagResult.error_type || 'Error'}:</b> {diagResult.error}
+                  </div>
+                )}
+              </div>
+
+              {/* Steps */}
+              {diagResult.steps && diagResult.steps.length > 0 && (
+                <div style={{ background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, overflow: 'hidden' }}>
+                  {diagResult.steps.map((s, i) => (
+                    <div key={i} style={{
+                      display: 'flex', gap: 12, padding: '12px 14px',
+                      borderBottom: i < diagResult.steps.length - 1 ? '1px solid var(--border)' : 'none',
+                      alignItems: 'flex-start',
+                    }}>
+                      <div style={{
+                        width: 24, height: 24, borderRadius: 12, flexShrink: 0,
+                        display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        background: s.ok ? 'var(--green-dim)' : 'var(--red-dim)',
+                        color: s.ok ? 'var(--green)' : 'var(--red)',
+                        fontSize: 12, fontWeight: 700,
+                      }}>{s.ok ? '✓' : '✕'}</div>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                          <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>{s.label}</span>
+                          <span style={{ fontSize: 10, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{s.step}</span>
+                        </div>
+                        {s.detail && <div style={{ fontSize: 12, color: 'var(--text-2)', marginTop: 3, lineHeight: 1.5 }}>{s.detail}</div>}
+                        {s.error && (
+                          <div style={{
+                            marginTop: 6, padding: '6px 10px', borderRadius: 6,
+                            background: 'rgba(248,81,73,0.08)', border: '1px solid rgba(248,81,73,0.2)',
+                            fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--red)',
+                            wordBreak: 'break-word',
+                          }}>
+                            {s.error_type && <b>{s.error_type}: </b>}{s.error}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </Modal>
+
+      {/* Channel creation modal */}
+      <Modal open={channelModal} onClose={() => { setChannelModal(false); setChannelResult(null) }}
+        title={`Создать канал · ${channelAccount?.first_name || channelAccount?.phone || ''}`} width={540}>
+        {channelResult ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16, alignItems: 'center', padding: '24px 0', textAlign: 'center' }}>
+            {channelResult.success ? (
+              <>
+                <div style={{ fontSize: 48 }}>📺</div>
+                <div style={{ fontSize: 17, fontWeight: 700, color: 'var(--green)' }}>Канал создан!</div>
+                {channelResult.channel && (
+                  <div style={{ padding: '12px 16px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, width: '100%', textAlign: 'left' }}>
+                    <div style={{ fontWeight: 600, fontSize: 14 }}>{channelResult.channel.title}</div>
+                    {channelResult.channel.link && <div style={{ fontSize: 12, color: 'var(--teal)', marginTop: 4 }}>{channelResult.channel.link}</div>}
+                  </div>
+                )}
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, justifyContent: 'center' }}>
+                  {channelResult.avatarSet && <span style={{ fontSize: 11, padding: '3px 10px', borderRadius: 6, background: 'var(--green-dim)', color: 'var(--green)', border: '1px solid rgba(61,214,140,0.25)' }}>✓ Аватар загружен</span>}
+                  {channelResult.hasPost && <span style={{ fontSize: 11, padding: '3px 10px', borderRadius: 6, background: 'var(--blue-dim)', color: 'var(--blue)', border: '1px solid rgba(61,139,255,0.25)' }}>✓ Первый пост опубликован</span>}
+                  {channelResult.pinned && <span style={{ fontSize: 11, padding: '3px 10px', borderRadius: 6, background: 'var(--violet-dim)', color: 'var(--violet)', border: '1px solid rgba(124,77,255,0.25)' }}>✓ Закреплён в профиле</span>}
+                </div>
+                <Button variant="primary" onClick={() => { setChannelModal(false); setChannelResult(null) }}>Готово</Button>
+              </>
+            ) : (
+              <>
+                <div style={{ fontSize: 48 }}>❌</div>
+                <div style={{ fontSize: 14, color: 'var(--red)' }}>{channelResult.error}</div>
+                <Button variant="ghost" onClick={() => setChannelResult(null)}>← Попробовать снова</Button>
+              </>
+            )}
+          </div>
+        ) : (
+          <form onSubmit={handleCreateChannel} style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <Input label="Название канала *" value={channelForm.title} required
+              onChange={e => setChannelForm(f => ({ ...f, title: e.target.value }))}
+              placeholder="Мой крутой канал" autoFocus />
+
+            <Input label="@username (необязательно)" value={channelForm.username}
+              onChange={e => setChannelForm(f => ({ ...f, username: e.target.value }))}
+              placeholder="@mychannel" />
+
+            <div>
+              <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Описание</label>
+              <textarea value={channelForm.description} rows={2}
+                onChange={e => setChannelForm(f => ({ ...f, description: e.target.value }))}
+                placeholder="Краткое описание канала"
+                style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 14, outline: 'none', resize: 'vertical', fontFamily: 'var(--font-sans)' }} />
+            </div>
+
+            <div>
+              <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Первый пост</label>
+              <textarea value={channelForm.first_post} rows={3}
+                onChange={e => setChannelForm(f => ({ ...f, first_post: e.target.value }))}
+                placeholder="Текст первого сообщения (необязательно)"
+                style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 14, outline: 'none', resize: 'vertical', fontFamily: 'var(--font-sans)' }} />
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+              {/* Avatar upload */}
+              <div>
+                <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Аватар канала</label>
+                <div onClick={() => avatarInputRef.current?.click()} style={{
+                  height: 80, border: '2px dashed var(--border)', borderRadius: 10,
+                  display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+                  cursor: 'pointer', transition: 'border-color 0.15s', gap: 4,
+                }}
+                  onMouseEnter={e => e.currentTarget.style.borderColor = 'var(--violet)'}
+                  onMouseLeave={e => e.currentTarget.style.borderColor = 'var(--border)'}>
+                  {channelAvatar ? (
+                    <>
+                      <span style={{ fontSize: 11, color: 'var(--green)', fontWeight: 600 }}>✓ {channelAvatar.name.length > 16 ? channelAvatar.name.slice(0, 14) + '…' : channelAvatar.name}</span>
+                      <span style={{ fontSize: 10, color: 'var(--text-3)' }}>нажми чтобы сменить</span>
+                    </>
+                  ) : (
+                    <>
+                      <span style={{ fontSize: 22 }}>🖼</span>
+                      <span style={{ fontSize: 11, color: 'var(--text-3)' }}>выбрать фото</span>
+                    </>
+                  )}
+                </div>
+                <input ref={avatarInputRef} type="file" accept="image/*" style={{ display: 'none' }}
+                  onChange={e => setChannelAvatar(e.target.files[0] || null)} />
+              </div>
+
+              {/* Post photo upload */}
+              <div>
+                <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Фото к посту</label>
+                <div onClick={() => postPhotoInputRef.current?.click()} style={{
+                  height: 80, border: '2px dashed var(--border)', borderRadius: 10,
+                  display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+                  cursor: 'pointer', transition: 'border-color 0.15s', gap: 4,
+                }}
+                  onMouseEnter={e => e.currentTarget.style.borderColor = 'var(--violet)'}
+                  onMouseLeave={e => e.currentTarget.style.borderColor = 'var(--border)'}>
+                  {channelPostPhoto ? (
+                    <>
+                      <span style={{ fontSize: 11, color: 'var(--green)', fontWeight: 600 }}>✓ {channelPostPhoto.name.length > 16 ? channelPostPhoto.name.slice(0, 14) + '…' : channelPostPhoto.name}</span>
+                      <span style={{ fontSize: 10, color: 'var(--text-3)' }}>нажми чтобы сменить</span>
+                    </>
+                  ) : (
+                    <>
+                      <span style={{ fontSize: 22 }}>📸</span>
+                      <span style={{ fontSize: 11, color: 'var(--text-3)' }}>фото к посту</span>
+                    </>
+                  )}
+                </div>
+                <input ref={postPhotoInputRef} type="file" accept="image/*" style={{ display: 'none' }}
+                  onChange={e => setChannelPostPhoto(e.target.files[0] || null)} />
+              </div>
+            </div>
+
+            {/* Pin toggle */}
+            <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', padding: '10px 12px', background: 'var(--bg-3)', borderRadius: 8, border: '1px solid var(--border)' }}>
+              <input type="checkbox" checked={channelForm.pin_to_profile}
+                onChange={e => setChannelForm(f => ({ ...f, pin_to_profile: e.target.checked }))}
+                style={{ width: 16, height: 16, accentColor: 'var(--violet)', cursor: 'pointer' }} />
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 600 }}>Закрепить канал в профиле</div>
+                <div style={{ fontSize: 11, color: 'var(--text-3)' }}>Канал появится как личный канал аккаунта</div>
+              </div>
+            </label>
+
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <Button variant="ghost" type="button" onClick={() => setChannelModal(false)}>Отмена</Button>
+              <Button variant="primary" type="submit" loading={creating}>📺 Создать канал</Button>
+            </div>
+          </form>
+        )}
       </Modal>
 
       {/* Import modal */}

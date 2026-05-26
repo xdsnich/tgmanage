@@ -604,6 +604,40 @@ async def _execute_plan_session(plan_id: int):
                                 if not target_channel or not campaign:
                                     continue
 
+                                # Guard: комментируем только в joined каналах.
+                                # Применяется только для кампаний с assignment-записями
+                                # (т.е. запущенных после migrate 024).
+                                # Если таблица не создана — guard не мешает (обратная совместимость).
+                                _allow_comment = True
+                                if plan.campaign_id:
+                                    try:
+                                        from models.campaign_channel_assignment import CampaignChannelAssignment
+                                        # begin_nested() = SAVEPOINT: если запрос упадёт (таблица не создана),
+                                        # откатится только savepoint, внешняя транзакция не ломается.
+                                        async with db.begin_nested():
+                                            has_asgn = (await db.execute(
+                                                select(CampaignChannelAssignment.id).where(
+                                                    CampaignChannelAssignment.campaign_id == plan.campaign_id
+                                                ).limit(1)
+                                            )).scalar_one_or_none()
+                                            if has_asgn is not None:
+                                                # Кампания с organic funnel — применяем guard
+                                                sub = (await db.execute(
+                                                    select(CampaignChannelAssignment.id).where(
+                                                        CampaignChannelAssignment.campaign_id      == plan.campaign_id,
+                                                        CampaignChannelAssignment.account_id       == acc.id,
+                                                        CampaignChannelAssignment.channel_username == target_channel,
+                                                        CampaignChannelAssignment.status           == "joined",
+                                                    )
+                                                )).scalar_one_or_none()
+                                                _allow_comment = (sub is not None)
+                                    except Exception:
+                                        pass  # Таблица не создана → старое поведение (разрешаем)
+
+                                if not _allow_comment:
+                                    logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] ⏭ @{target_channel}: ещё не подписан — пропуск")
+                                    continue
+
                                 try:
                                     entity = await client.get_entity(target_channel)
                                     posts = await client.get_messages(entity, limit=random.randint(3, 8))
@@ -710,9 +744,10 @@ async def _execute_plan_session(plan_id: int):
                                     ban_errors = [
                                         "YOU_BLOCKED", "USER_BANNED", "CHAT_WRITE_FORBIDDEN",
                                         "USER_RESTRICTED", "BANNED_RIGHTS", "USER_BLOCKED",
-                                        "CHANNEL_PRIVATE", "ChatWriteForbidden", "UserBannedInChannel"
+                                        "CHANNEL_PRIVATE", "ChatWriteForbidden", "UserBannedInChannel",
+                                        "banned from sending", "banned in this", "You're banned",
                                     ]
-                                    is_ban = any(b in err for b in ban_errors)
+                                    is_ban = any(b.lower() in err.lower() for b in ban_errors)
 
                                     if is_ban and campaign:
                                         try:
@@ -754,7 +789,186 @@ async def _execute_plan_session(plan_id: int):
                                         acc.status = "frozen"
                                         break
 
+                            elif action_type == "react_to_comment":
+                                target_channel = action.get("channel", "")
+                                react_count = action.get("count", 1)
+                                if not target_channel:
+                                    continue
+                                try:
+                                    from telethon.tl.functions.messages import SendReactionRequest
+                                    from telethon.tl.functions.channels import GetFullChannelRequest
+                                    from telethon.tl.types import ReactionEmoji
+
+                                    entity = await client.get_entity(target_channel)
+
+                                    # Берём последний пост канала
+                                    posts = await client.get_messages(entity, limit=1)
+                                    if not posts:
+                                        continue
+                                    post = posts[0]
+
+                                    # Ищем linked discussion group
+                                    full = await client(GetFullChannelRequest(entity))
+                                    linked_chat_id = getattr(full.full_chat, 'linked_chat_id', None)
+                                    discussion = await client.get_entity(linked_chat_id) if linked_chat_id else entity
+
+                                    # Получаем комменты под постом
+                                    comments = []
+                                    async for cmsg in client.iter_messages(discussion, reply_to=post.id, limit=10):
+                                        if cmsg.text:
+                                            comments.append(cmsg)
+
+                                    if not comments:
+                                        continue
+
+                                    emojis_pool = ["👍", "❤️", "🔥", "👏", "🤔", "😮", "🥰", "💯", "⚡", "🎉"]
+                                    targets = random.sample(comments, min(react_count, len(comments)))
+
+                                    for ci, cmsg in enumerate(targets):
+                                        emoji = random.choice(emojis_pool)
+                                        await client(SendReactionRequest(
+                                            peer=discussion,
+                                            msg_id=cmsg.id,
+                                            reaction=[ReactionEmoji(emoticon=emoji)],
+                                        ))
+                                        logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 😍 Реакция {emoji} на коммент в @{target_channel}")
+                                        await _safe_log(db, task_id=None, account_id=acc.id, action="react_to_comment",
+                                                         detail=f"Реакция {emoji} на коммент в @{target_channel}",
+                                                         channel=target_channel, emoji=emoji, success=True,
+                                                         source=plan_source, campaign_id=plan_campaign_id)
+                                        done_actions += 1
+                                        if ci < len(targets) - 1:
+                                            await asyncio.sleep(random.randint(3, 10))
+
+                                except Exception as e:
+                                    logger.warning(f"[plan][{phone}]   [{action_num}/{len(actions)}] react_to_comment ошибка: {str(e)[:100]}")
+
+                            elif action_type == "join_target_channel":
+                                # Вступление в конкретный канал кампании
+                                ch = action.get("channel", "")
+                                if not ch:
+                                    continue
+                                try:
+                                    from telethon.tl.functions.channels import JoinChannelRequest, GetParticipantRequest
+                                    from telethon.tl.functions.contacts import ResolveUsernameRequest
+                                    from telethon.errors import (
+                                        UserAlreadyParticipantError, InviteRequestSentError,
+                                        ChannelsTooMuchError, ChannelPrivateError,
+                                        UsernameNotOccupiedError, UsernameInvalidError,
+                                    )
+                                    from models.campaign_channel_assignment import CampaignChannelAssignment
+
+                                    clean_ch = ch.lstrip('@').strip()
+                                    me = await client.get_me()
+
+                                    # 1) Резолвим канал свежим запросом (минуем кэш Telethon)
+                                    try:
+                                        resolved = await client(ResolveUsernameRequest(clean_ch))
+                                        if not resolved.chats:
+                                            raise Exception(f"@{clean_ch}: канал не существует")
+                                        entity = resolved.chats[0]
+                                    except (UsernameNotOccupiedError, UsernameInvalidError) as e:
+                                        raise Exception(f"@{clean_ch}: невалидный username")
+
+                                    # 2) Уже подписаны?
+                                    already_in = False
+                                    try:
+                                        await client(GetParticipantRequest(channel=entity, participant=me))
+                                        already_in = True
+                                        logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 📢 @{clean_ch}: уже подписан (проверено)")
+                                    except Exception:
+                                        already_in = False
+
+                                    # 3) Не подписаны → JoinChannelRequest + верификация
+                                    if not already_in:
+                                        join_request_sent = False
+                                        try:
+                                            await client(JoinChannelRequest(entity))
+                                            join_request_sent = True
+                                        except UserAlreadyParticipantError:
+                                            already_in = True
+                                        except InviteRequestSentError:
+                                            raise Exception(f"@{clean_ch}: канал требует подтверждения (отправлена заявка)")
+                                        except ChannelsTooMuchError:
+                                            raise Exception(f"@{clean_ch}: лимит каналов на аккаунте")
+                                        except ChannelPrivateError:
+                                            raise Exception(f"@{clean_ch}: приватный канал")
+
+                                        # 4) Проверяем что мы реально стали участником (один раз)
+                                        if join_request_sent and not already_in:
+                                            await asyncio.sleep(random.uniform(2, 4))
+                                            try:
+                                                await client(GetParticipantRequest(channel=entity, participant=me))
+                                                logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 📢 Вступил @{clean_ch} (подтверждено)")
+                                            except Exception as verr:
+                                                # Не в участниках после join → теневой бан / заморозка / флудвейт
+                                                raise Exception(f"@{clean_ch}: join не прошёл (теневой бан/заморозка): {type(verr).__name__}")
+
+                                    # 5) Обновляем dialogs cache чтобы next read_feed не словил MsgidDecreaseRetry
+                                    try:
+                                        await client.get_dialogs(limit=1, archived=False)
+                                    except Exception:
+                                        pass
+
+                                    # 6) Сохраняем assignment как joined
+                                    if plan.campaign_id:
+                                        assignment = (await db.execute(
+                                            select(CampaignChannelAssignment).where(
+                                                CampaignChannelAssignment.campaign_id == plan.campaign_id,
+                                                CampaignChannelAssignment.account_id  == acc.id,
+                                                CampaignChannelAssignment.channel_username == ch,
+                                            )
+                                        )).scalar_one_or_none()
+                                        if assignment:
+                                            assignment.status    = "joined"
+                                            assignment.joined_at = datetime.utcnow()
+                                        else:
+                                            db.add(CampaignChannelAssignment(
+                                                campaign_id=plan.campaign_id,
+                                                account_id=acc.id,
+                                                channel_username=ch,
+                                                status="joined",
+                                                joined_at=datetime.utcnow(),
+                                            ))
+                                        await db.flush()
+
+                                    detail = f"Уже был в @{clean_ch}" if already_in else f"Вступил в @{clean_ch} (подтверждено)"
+                                    await _safe_log(db, task_id=None, account_id=acc.id, action="join_channel",
+                                                     detail=detail, channel=clean_ch, success=True,
+                                                     source=plan_source, campaign_id=plan_campaign_id)
+                                    done_actions += 1
+                                except Exception as e:
+                                    err = str(e)
+                                    logger.warning(f"[plan][{phone}]   [{action_num}/{len(actions)}] 📢 join_target_channel ошибка ({type(e).__name__}) @{ch}: {err[:120]}")
+                                    # Фиксируем ошибку в матрице
+                                    if plan.campaign_id:
+                                        try:
+                                            from models.campaign_channel_assignment import CampaignChannelAssignment
+                                            assignment = (await db.execute(
+                                                select(CampaignChannelAssignment).where(
+                                                    CampaignChannelAssignment.campaign_id == plan.campaign_id,
+                                                    CampaignChannelAssignment.account_id  == acc.id,
+                                                    CampaignChannelAssignment.channel_username == ch,
+                                                )
+                                            )).scalar_one_or_none()
+                                            if assignment:
+                                                assignment.status = "failed"
+                                                await db.flush()
+                                        except Exception:
+                                            pass
+                                    # Логируем ошибку в warmup_logs чтобы было видно в UI
+                                    await _safe_log(db, task_id=None, account_id=acc.id, action="join_channel",
+                                                     detail=f"❌ @{ch}: {err[:120]}",
+                                                     channel=ch, success=False, error=err[:200],
+                                                     source=plan_source, campaign_id=plan_campaign_id)
+                                    import re as _re
+                                    if "FLOOD_WAIT" in err:
+                                        wait = int(_re.search(r"(\d+)", err).group(1)) if _re.search(r"(\d+)", err) else 60
+                                        await asyncio.sleep(wait + random.randint(5, 15))
+                                        break
+
                             elif action_type == "join_channel":
+                                # Устаревший тип: вступление в случайный популярный канал (прогрев)
                                 try:
                                     from telethon.tl.functions.channels import JoinChannelRequest
                                     popular = ["telegram", "durov", "techcrunch", "bbcnews", "reddit",

@@ -24,6 +24,24 @@ from models.campaign import (
 router = APIRouter(prefix="/commenting", tags=["commenting"])
 
 
+# ── Channel distribution ──────────────────────────────────────
+
+def _distribute_channels(channels: list, account_ids: list) -> dict:
+    """
+    Round-robin: каждый канал достаётся ровно одному аккаунту.
+    30 каналов / 5 аккаунтов → 6 уникальных каналов на аккаунт.
+    Перемешиваем каналы перед раздачей для случайности.
+    """
+    if not channels or not account_ids:
+        return {acc_id: [] for acc_id in account_ids}
+    shuffled = list(channels)
+    random.shuffle(shuffled)
+    assignments: dict = {acc_id: [] for acc_id in account_ids}
+    for i, ch in enumerate(shuffled):
+        assignments[account_ids[i % len(account_ids)]].append(ch)
+    return assignments
+
+
 # ── Schemas ──────────────────────────────────────────────────
 
 class CampaignCreate(BaseModel):
@@ -286,26 +304,51 @@ async def start_campaign(
     if not accounts_data:
         raise HTTPException(status_code=400, detail="Нет активных аккаунтов")
 
-    # Распределяем комменты по дням
+    # ── Распределяем каналы между аккаунтами (матрица уникальности) ──────
+    # 30 каналов / 5 аккаунтов → 6 уникальных каналов на аккаунт
+    account_id_list = [a[0] for a in accounts_data]
+    channel_dist = _distribute_channels(channel_usernames, account_id_list)
+
+    # ── Сохраняем матрицу в БД (удаляем старую) ──────────────────────────
+    from models.campaign_channel_assignment import CampaignChannelAssignment
+    from sqlalchemy import delete as sa_delete
+
+    await db.execute(
+        sa_delete(CampaignChannelAssignment).where(CampaignChannelAssignment.campaign_id == c.id)
+    )
+    await db.flush()
+
+    # Считаем planned_join_day для каждого канала аккаунта
+    # joins_per_day: не более 2 вступлений в сутки
+    import math
+    for acc_id, assigned_chs in channel_dist.items():
+        jpd = min(2, max(1, math.ceil(len(assigned_chs) / max(1, total_days))))
+        for i, ch in enumerate(assigned_chs):
+            planned_day = (i // jpd) + 1  # день 1,1,2,2,3,3,...
+            db.add(CampaignChannelAssignment(
+                campaign_id=c.id,
+                account_id=acc_id,
+                channel_username=ch,
+                status="pending",
+                planned_join_day=planned_day,
+            ))
+    await db.flush()
+
+    # ── Распределяем комменты по дням ────────────────────────────────────
     daily_comments = distribute_comments_by_days(c.max_comments, total_days)
 
-    # Генерируем планы
-    plans_created = 0
-    total_planned_comments = 0
-    # Удаляем старые планы этой кампании
+    # ── Удаляем старые планы этой кампании ───────────────────────────────
     from models.campaign_plan import CampaignPlan
-    await db.execute(
-        select(CampaignPlan).where(CampaignPlan.campaign_id == c.id)
-    )
-    from sqlalchemy import delete as sa_delete
     await db.execute(sa_delete(CampaignPlan).where(CampaignPlan.campaign_id == c.id))
     await db.flush()
+
+    plans_created = 0
+    total_planned_comments = 0
 
     for day_num in range(1, total_days + 1):
         from datetime import date, timedelta
         plan_date = date.today() + timedelta(days=day_num - 1)
 
-        # Распределяем комменты дня по аккаунтам
         accs_with_p = [(a_id, p) for a_id, _, p in accounts_data]
         day_distribution = distribute_day_comments(daily_comments[day_num - 1], accs_with_p)
 
@@ -313,6 +356,14 @@ async def start_campaign(
             comments_for_acc = day_distribution.get(acc_id, 0)
             timing = assign_timing_profile(phone)
             style = assign_style_profile(phone)
+
+            # ── Вычисляем органический план подписок для этого дня ───────
+            assigned = channel_dist.get(acc_id, [])
+            jpd = min(2, max(1, math.ceil(len(assigned) / max(1, total_days))))
+            join_start = min(len(assigned), (day_num - 1) * jpd)
+            join_end   = min(len(assigned),  day_num      * jpd)
+            channels_to_join_today   = assigned[join_start:join_end]
+            commentable_before_today = assigned[:join_start]
 
             plan = generate_daily_plan(
                 account_id=acc_id,
@@ -324,9 +375,9 @@ async def start_campaign(
                 personality=personality,
                 timing=timing,
                 style=style,
+                channels_to_join=channels_to_join_today,
+                commentable_from_prev_days=commentable_before_today,
             )
-
-            
 
             db.add(CampaignPlan(
                 campaign_id=c.id,

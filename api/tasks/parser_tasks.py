@@ -33,6 +33,16 @@ def run_async(coro):
         loop.close()
 
 
+async def _interruptible_sleep(seconds: float, r, stop_key: str) -> bool:
+    """Sleep in 0.5s chunks. Returns True if stop signal was received."""
+    end = time.time() + seconds
+    while time.time() < end:
+        if r.get(stop_key):
+            return True
+        await asyncio.sleep(min(0.5, max(0.0, end - time.time())))
+    return False
+
+
 # ═══════════════════════════════════════════════════════════
 # Event logging для метрик
 # ═══════════════════════════════════════════════════════════
@@ -190,6 +200,8 @@ async def _run_parser(user_id: int, account_id: int, params: dict):
     progress_key = f"parser:progress:{user_id}"
     stop_key = f"parser:stop:{user_id}"
     r.delete(stop_key)
+    # Store progress key so the Celery task can be revoked if needed
+    # (task_id is stored by the outer Celery wrapper)
 
     keywords = [k.strip() for k in params["keywords"].split(",") if k.strip()]
     found = []
@@ -286,7 +298,10 @@ async def _run_parser(user_id: int, account_id: int, params: dict):
                                 raise FloodWaitError(request=None, seconds=fw)
                             logger.info(f"🔍 [parser] FLOOD_WAIT {fw}s — жду")
                             flood_total_wait += fw
-                            await asyncio.sleep(fw + 2)
+                            stopped = await _interruptible_sleep(fw + 2, r, stop_key)
+                            if stopped:
+                                logger.info("🔍 [parser] Stop during flood wait")
+                                raise StopIteration
                             # Повторяем проверку
                             has_comments, fw2 = await _check_has_comments(client, chat)
 
@@ -341,11 +356,17 @@ async def _run_parser(user_id: int, account_id: int, params: dict):
                         logger.warning(f"Save @{chat.username}: {e}")
 
                     # Пауза между каналами
-                    await asyncio.sleep(random.uniform(
-                        params.get("pause_between_channels_min", 0.8),
-                        params.get("pause_between_channels_max", 1.5)
-                    ))
+                    stopped = await _interruptible_sleep(
+                        random.uniform(
+                            params.get("pause_between_channels_min", 0.8),
+                            params.get("pause_between_channels_max", 1.5)
+                        ), r, stop_key
+                    )
+                    if stopped:
+                        break
 
+            except StopIteration:
+                break
             except FloodWaitError as e:
                 flood_events += 1
                 flood_total_wait += e.seconds
@@ -356,15 +377,21 @@ async def _run_parser(user_id: int, account_id: int, params: dict):
                     logger.warning(f"🔍 FLOOD_WAIT_{e.seconds} — прерываю")
                     break
                 logger.warning(f"🔍 FLOOD_WAIT {e.seconds}s — жду")
-                await asyncio.sleep(e.seconds + 2)
+                stopped = await _interruptible_sleep(e.seconds + 2, r, stop_key)
+                if stopped:
+                    break
             except Exception as e:
                 logger.warning(f"🔍 Ошибка '{kw}': {e}")
 
             # Пауза между keywords
-            await asyncio.sleep(random.uniform(
-                params.get("pause_between_keywords_min", 3),
-                params.get("pause_between_keywords_max", 6)
-            ))
+            stopped = await _interruptible_sleep(
+                random.uniform(
+                    params.get("pause_between_keywords_min", 3),
+                    params.get("pause_between_keywords_max", 6)
+                ), r, stop_key
+            )
+            if stopped:
+                break
 
         await client.disconnect()
 
@@ -399,4 +426,7 @@ async def _run_parser(user_id: int, account_id: int, params: dict):
 )
 def run_parser_search(self, user_id: int, account_id: int, params: dict):
     """Фоновый парсинг каналов."""
+    import redis as redis_lib
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    r.setex(f"parser:task_id:{user_id}", 7200, self.request.id)
     return run_async(_run_parser(user_id, account_id, params))

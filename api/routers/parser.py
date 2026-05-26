@@ -409,9 +409,16 @@ async def stop_search(
 ):
     """Прерывает текущий парсинг"""
     import redis as redis_lib
-    import os
     r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
-    r.setex(f"parser:stop:{current_user.id}", 300, "1")
+    r.setex(f"parser:stop:{current_user.id}", 3600, "1")
+    task_id = r.get(f"parser:task_id:{current_user.id}")
+    if task_id:
+        try:
+            from celery_app import celery_app
+            celery_app.control.revoke(task_id.decode(), terminate=True, signal="SIGTERM")
+        except Exception:
+            pass
+        r.delete(f"parser:task_id:{current_user.id}")
     return {"status": "stop requested"}
 @router.get("/whitelist")
 async def get_whitelist(
@@ -557,10 +564,20 @@ async def stop_similar_crawl(
     current_user: User = Depends(get_current_user),
 ):
     import redis as redis_lib
-    import os
     r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
-    r.setex(f"parser:similar:stop:{current_user.id}", 300, "1")
-    return {"status": "stopping"}# ══════════════════════════════════════════════════════════
+    r.setex(f"parser:similar:stop:{current_user.id}", 3600, "1")
+    task_id = r.get(f"parser:similar:task_id:{current_user.id}")
+    if task_id:
+        try:
+            from celery_app import celery_app
+            celery_app.control.revoke(task_id.decode(), terminate=True, signal="SIGTERM")
+        except Exception:
+            pass
+        r.delete(f"parser:similar:task_id:{current_user.id}")
+    return {"status": "stopping"}
+
+
+# ══════════════════════════════════════════════════════════
 # Similar channels crawler (обход графа похожих каналов)
 # ══════════════════════════════════════════════════════════
 
@@ -636,15 +653,6 @@ async def get_similar_progress(
         return {"status": "idle"}
 
 
-@router.post("/similar/stop")
-async def stop_similar_crawl(
-    current_user: User = Depends(get_current_user),
-):
-    import redis as redis_lib
-    import os
-    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
-    r.setex(f"parser:similar:stop:{current_user.id}", 300, "1")
-    return {"status": "stopping"}
 # ══════════════════════════════════════════════════════════
 # Comments Verifier — проверка has_comments пачками
 # ══════════════════════════════════════════════════════════

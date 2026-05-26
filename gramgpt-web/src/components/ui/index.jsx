@@ -172,10 +172,12 @@ export function Modal({ open = true, onClose, title, children, width = 480 }) {
       <div onClick={e => e.stopPropagation()} style={{
         background: 'var(--bg-2)', border: '1px solid var(--border)',
         borderRadius: 'var(--radius)', width: '100%', maxWidth: width,
+        maxHeight: 'calc(100vh - 48px)',
+        display: 'flex', flexDirection: 'column',
         animation: 'fadeUp 0.25s cubic-bezier(0.16,1,0.3,1)',
         boxShadow: '0 24px 80px rgba(0,0,0,0.7)',
       }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '18px 24px', borderBottom: '1px solid var(--border)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '18px 24px', borderBottom: '1px solid var(--border)', flexShrink: 0 }}>
           <h3 style={{ fontSize: 15, fontWeight: 700, letterSpacing: '-0.02em' }}>{title}</h3>
           <button onClick={onClose} style={{
             background: 'rgba(255,255,255,0.06)', border: 'none', color: 'var(--text-3)',
@@ -183,7 +185,7 @@ export function Modal({ open = true, onClose, title, children, width = 480 }) {
             display: 'flex', alignItems: 'center', justifyContent: 'center',
           }}>✕</button>
         </div>
-        <div style={{ padding: 24 }}>{children}</div>
+        <div style={{ padding: 24, overflowY: 'auto', flex: 1 }}>{children}</div>
       </div>
     </div>
   )

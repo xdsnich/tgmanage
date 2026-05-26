@@ -34,6 +34,16 @@ def run_async(coro):
         loop.close()
 
 
+async def _interruptible_sleep(seconds: float, r, stop_key: str) -> bool:
+    """Sleep in 0.5s chunks. Returns True if stop signal was received."""
+    end = time.time() + seconds
+    while time.time() < end:
+        if r.get(stop_key):
+            return True
+        await asyncio.sleep(min(0.5, max(0.0, end - time.time())))
+    return False
+
+
 # ═══════════════════════════════════════════════════════════
 # Event logging (метрики парсера)
 # ═══════════════════════════════════════════════════════════
@@ -254,11 +264,15 @@ async def _run_similar_crawler(user_id: int, account_id: int, params: dict):
                     r.setex(progress_key, 300, f"error|{found_count}|{saved_count}|{len(queue)}|FLOOD_WAIT {wait}s")
                     break
                 flood_total_wait += wait
-                await asyncio.sleep(wait + 2)
+                stopped = await _interruptible_sleep(wait + 2, r, stop_key)
+                if stopped:
+                    break
                 queue.appendleft((username, depth))
                 continue
 
-            await asyncio.sleep(random.uniform(pause_min, pause_max))
+            stopped = await _interruptible_sleep(random.uniform(pause_min, pause_max), r, stop_key)
+            if stopped:
+                break
 
             result = await _get_recommendations(client, entity)
             if isinstance(result, tuple) and result[0] == 'flood':
@@ -271,7 +285,9 @@ async def _run_similar_crawler(user_id: int, account_id: int, params: dict):
                     r.setex(progress_key, 300, f"error|{found_count}|{saved_count}|{len(queue)}|FLOOD_WAIT {wait}s")
                     break
                 flood_total_wait += wait
-                await asyncio.sleep(wait + 2)
+                stopped = await _interruptible_sleep(wait + 2, r, stop_key)
+                if stopped:
+                    break
                 queue.appendleft((username, depth))
                 continue
 
@@ -575,7 +591,9 @@ async def _run_verify_comments(user_id: int, account_id: int, params: dict):
                         break 
                     logger.info(f"💬 Коментарі @{username}: has_comments={has_comments}, flood_wait={flood_wait}")
                     flood_total_wait += flood_wait
-                    await asyncio.sleep(flood_wait + 2)
+                    stopped = await _interruptible_sleep(flood_wait + 2, r, stop_key)
+                    if stopped:
+                        break
                     has_comments, flood_wait2 = await _check_channel_has_comments(client, username)
 
                 if has_comments:
@@ -595,7 +613,9 @@ async def _run_verify_comments(user_id: int, account_id: int, params: dict):
             r.setex(progress_key, 3600,
                     f"running|{checked}|{with_comments}|{total - checked}|{username}")
 
-            await asyncio.sleep(random.uniform(pause_min, pause_max))
+            stopped = await _interruptible_sleep(random.uniform(pause_min, pause_max), r, stop_key)
+            if stopped:
+                break
 
         await client.disconnect()
 
@@ -637,6 +657,9 @@ async def _run_verify_comments(user_id: int, account_id: int, params: dict):
     reject_on_worker_lost=False,
 )
 def run_similar_crawler(self, user_id: int, account_id: int, params: dict):
+    import redis as redis_lib
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    r.setex(f"parser:similar:task_id:{user_id}", 7200, self.request.id)
     return run_async(_run_similar_crawler(user_id, account_id, params))
 
 

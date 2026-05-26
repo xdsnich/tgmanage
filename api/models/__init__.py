@@ -5,6 +5,7 @@ from .api_app import ApiApp
 from .ai_dialog import AIDialog
 from .actions_log import ActionLog
 from .campaign import Campaign, TargetChannel, CampaignStatus, TriggerMode, LLMProvider, CommentTone, CommentLog
+from .campaign_channel_assignment import CampaignChannelAssignment
 from .warmup import WarmupTask
 from .parsed_channel import ParsedChannel
 from .reaction import ReactionTask
@@ -20,6 +21,7 @@ __all__ = [
     "Proxy", "ProxyProtocol","ApiApp",
     "AIDialog", "ActionLog",
     "Campaign", "TargetChannel", "CampaignStatus", "TriggerMode", "LLMProvider", "CommentTone",
+    "CampaignChannelAssignment",
     "WarmupTask", "ParsedChannel","ReactionTask","WarmupLog","SubscribeTask",
     "CommentQueue", "AccountBehavior",
     "ServiceCredential","AccountConnection",

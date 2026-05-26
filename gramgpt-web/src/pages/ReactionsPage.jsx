@@ -25,18 +25,18 @@ export default function ReactionsPage() {
     mode: 'random', target: 'post', comments_limit: 5, count: 0, delay_min: 3, delay_max: 15,
   })
 
-  const load = async () => {
-    setLoading(true)
+  const load = async (silent = false) => {
+    if (!silent) setLoading(true)
     try {
       const [tasksRes, accsRes] = await Promise.all([reactionsAPI.list(), accountsAPI.list()])
       setTasks(tasksRes.data)
       setAccounts(accsRes.data.filter(a => a.status === 'active'))
     } catch (err) { console.error(err) }
-    setLoading(false)
+    if (!silent) setLoading(false)
   }
 
   useEffect(() => { load() }, [])
-  useAutoRefresh(() => load(), 15000)
+  useAutoRefresh(() => load(true), 15000)
 
   const handleCreate = async () => {
     if (!form.channel_link || !form.account_ids.length || !form.reactions.length) {

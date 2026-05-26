@@ -24,8 +24,8 @@ export default function WarmupPage() {
   const [form, setForm] = useState({ account_ids: [], total_days: 7, mode: 'normal' })
   const logsRef = useRef(null)
 
-  const load = async () => {
-    setLoading(true)
+  const load = async (silent = false) => {
+    if (!silent) setLoading(true)
     try {
       const [tasksRes, accsRes, logsRes] = await Promise.all([
         warmupAPI.list(),
@@ -36,11 +36,11 @@ export default function WarmupPage() {
       setAccounts(accsRes.data)
       setLogs(logsRes.data || [])
     } catch (err) { console.error(err) }
-    setLoading(false)
+    if (!silent) setLoading(false)
   }
 
   useEffect(() => { load() }, [])
-  useAutoRefresh(() => load(), 15000)
+  useAutoRefresh(() => load(true), 15000)
 
   // Авто-обновление логов каждые 15с
   useEffect(() => {

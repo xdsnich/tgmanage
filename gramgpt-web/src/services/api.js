@@ -124,8 +124,8 @@ export const proxiesAPI = {
   create: (data) =>
     api.post('/proxies/', data),
 
-  bulkCreate: (text) =>
-    api.post('/proxies/bulk', { proxies_text: text }),
+  bulkCreate: (text, days = 0) =>
+    api.post('/proxies/bulk', { proxies_text: text, duration_days: days }),
 
   delete: (id) =>
     api.delete(`/proxies/${id}`),
@@ -201,6 +201,12 @@ export const channelsAPI = {
 
   create: (accountId, title, description = '', username = '') =>
     api.post('/channels/create', { account_id: accountId, title, description, username }),
+
+  createFull: (formData) =>
+    api.post('/channels/create-full', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 60000,
+    }),
 
   pin: (accountId, channelLink) =>
     api.post('/channels/pin', { account_id: accountId, channel_link: channelLink }),
@@ -278,6 +284,8 @@ export const importAPI = {
 export const parserAPI = {
   list: () => api.get('/parser/channels'),
   search: (data) => api.post('/parser/search', data, { timeout: 120000 }),
+  searchProgress: () => api.get('/parser/search/progress'),
+  searchStop: () => api.post('/parser/search/stop'),
   delete: (id) => api.delete(`/parser/channels/${id}`),
   clearAll: () => api.delete('/parser/channels'),
   exportCSV: () => api.get('/parser/export', { responseType: 'blob' }),
@@ -286,6 +294,20 @@ export const parserAPI = {
   folderChannels: (name) => api.get(`/parser/folders/${encodeURIComponent(name)}/channels`),
   setFolder: (channelIds, folder) => api.post('/parser/set-folder', { channel_ids: channelIds, folder }),
   updateChannelFolder: (id, folder) => api.patch(`/parser/channels/${id}/folder`, { folder }),
+  similarStart: (data) => api.post('/parser/similar/start', data, { timeout: 30000 }),
+  similarProgress: () => api.get('/parser/similar/progress'),
+  similarStop: () => api.post('/parser/similar/stop'),
+  whitelist: (minRate = 0, sortBy = 'pass_rate') =>
+    api.get('/parser/whitelist', { params: { min_rate: minRate, sort_by: sortBy } }),
+  whitelistDelete: (id) => api.delete(`/parser/whitelist/${id}`),
+  statsOverview: () => api.get('/parser/stats/overview'),
+  keywordGeos: () => api.get('/parser/keywords/geos'),
+  keywordExpand: (data) => api.post('/parser/keywords/expand', data),
+  statsActivity: (days = 7) => api.get('/parser/stats/activity', { params: { days } }),
+  statsFloodEvents: (limit = 20) => api.get('/parser/stats/flood-events', { params: { limit } }),
+  statsTopSeeds: (limit = 10) => api.get('/parser/stats/top-seeds', { params: { limit } }),
+  statsByAccount: () => api.get('/parser/stats/by-account'),
+  statsSessions: (limit = 15) => api.get('/parser/stats/sessions', { params: { limit } }),
 }
 
 // ── COMMENTING (нейрокомментинг) ─────────────────────────────
@@ -335,6 +357,9 @@ export const commentingAPI = {
 
   activity: (id, limit = 50) =>
     api.get(`/commenting/campaigns/${id}/activity`, { params: { limit } }),
+
+  plans: (id, day = null) =>
+    api.get(`/commenting/campaigns/${id}/plans`, { params: day ? { day } : {} }),
 }
 
 // ── API APPS (мульти-API ключи) ──────────────────────────────
@@ -375,4 +400,17 @@ export const subscribeAPI = {
   run: (id) => api.post(`/subscribe/tasks/${id}/run`),
   delete: (id) => api.delete(`/subscribe/tasks/${id}`),
 }
+// ── DIAGNOSTICS (тест подписки, проверка аккаунта) ───────────
+export const diagnosticsAPI = {
+  testJoin: (accountId, channelUsername, leaveAfter = false) =>
+    api.post('/diagnostics/test-join', {
+      account_id: accountId,
+      channel_username: channelUsername,
+      leave_after: leaveAfter,
+    }, { timeout: 60000 }),
+
+  accountChannels: (accountId) =>
+    api.get(`/diagnostics/account-channels/${accountId}`, { timeout: 60000 }),
+}
+
 export default api
