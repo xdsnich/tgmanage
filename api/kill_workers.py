@@ -55,33 +55,53 @@ def graceful_shutdown():
 def hard_kill():
     """Force-kill всех Python-процессов где в командной строке есть 'celery'."""
     if os.name == 'nt':
-        # Windows
-        # Берём список процессов через wmic, фильтруем по celery в commandline
+        # Windows — wmic удалён в Win11, используем PowerShell Get-CimInstance
         try:
-            r = subprocess.run(
-                ['wmic', 'process', 'where',
-                 'name="python.exe" and CommandLine like "%celery%"',
-                 'get', 'ProcessId'],
-                capture_output=True, text=True, timeout=10,
+            ps_cmd = (
+                "Get-CimInstance Win32_Process "
+                "-Filter \"Name='python.exe' OR Name='pythonw.exe'\" | "
+                "Where-Object { $_.CommandLine -like '*celery*' } | "
+                "Select-Object -ExpandProperty ProcessId"
             )
+            r = subprocess.run(
+                ['powershell', '-NoProfile', '-NonInteractive', '-Command', ps_cmd],
+                capture_output=True, text=True, timeout=15,
+            )
+
+            if r.returncode != 0:
+                print(f"  PowerShell вернул код {r.returncode}: {r.stderr.strip()[:200]}")
+                return False
+
             pids = []
             for line in r.stdout.splitlines():
                 line = line.strip()
                 if line.isdigit():
                     pids.append(int(line))
 
+            # Защита: не убиваем себя
+            self_pid = os.getpid()
+            pids = [p for p in pids if p != self_pid]
+
             if not pids:
                 print("  Celery-процессов не найдено")
                 return False
 
+            killed = 0
             for pid in pids:
-                print(f"  Убиваю PID {pid}...")
-                subprocess.run(['taskkill', '/F', '/PID', str(pid)],
-                               capture_output=True)
-            print(f"  Убито {len(pids)} процессов")
-            return True
+                kr = subprocess.run(['taskkill', '/F', '/PID', str(pid)],
+                                    capture_output=True, text=True)
+                if kr.returncode == 0:
+                    print(f"  ✓ Убит PID {pid}")
+                    killed += 1
+                else:
+                    print(f"  ✗ Не получилось убить PID {pid}: {kr.stderr.strip()[:120]}")
+            print(f"  Убито {killed}/{len(pids)} процессов")
+            return killed > 0
+        except FileNotFoundError:
+            print("  Ошибка: powershell.exe не найден в PATH")
+            return False
         except Exception as e:
-            print(f"  Ошибка hard kill: {e}")
+            print(f"  Ошибка hard kill: {type(e).__name__}: {e}")
             return False
     else:
         # Linux/Mac
