@@ -79,4 +79,21 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     task_acks_late=True,
     task_track_started=True,
+
+    # ── Тайм-ауты тасков ─────────────────────────────────────
+    # Hard kill: таск убивается после 10 мин (защита от вечно висящих)
+    task_time_limit=600,
+    # Soft warning: SoftTimeLimitExceeded поднимается на 8-й минуте — можно почистить ресурсы
+    task_soft_time_limit=480,
+
+    # ── Быстрый shutdown ─────────────────────────────────────
+    # При Ctrl+C ждём максимум 15 секунд завершения тасков, потом force-kill.
+    # Без этого Telethon может висеть в socket.recv() пока сервер не разорвёт.
+    worker_shutdown_timeout=15,
+
+    # При потере коннекта к Redis — отменять долгие таски (а не висеть бесконечно)
+    worker_cancel_long_running_tasks_on_connection_loss=True,
+
+    # Не держать результаты тасков в Redis дольше нужного
+    task_ignore_result=False,
 )

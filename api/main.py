@@ -130,6 +130,12 @@ async def root():
 #   ПОЧЕМУ НЕ -P gevent: greenlet'ы делят OS-тред, asyncio видит чужой running loop →
 #   "Cannot run the event loop while another loop is running". Несовместимо.
 #
+#   ВЫКЛЮЧЕНИЕ:
+#   - Ctrl+C  → warm shutdown (ждёт max 15с, потом force-kill из celery_app.py)
+#   - Ctrl+C ещё раз → cold shutdown
+#   - python kill_workers.py        → graceful через Redis broker
+#   - python kill_workers.py --hard → taskkill (если воркер совсем застрял)
+#
 # Терминал 3 — Планировщик (раз в 60с шлёт dispatch_plans, dispatch_warmups):
 #   cd api && python run_periodic.py
 #
