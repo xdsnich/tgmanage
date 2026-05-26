@@ -208,34 +208,68 @@ async def run_mini_plan(account_id: int, channel_username: str,
                 from telethon.tl.functions.messages import SendReactionRequest
                 from telethon.tl.functions.channels import GetFullChannelRequest
                 from telethon.tl.types import ReactionEmoji
+                from telethon.errors import ReactionInvalidError
 
                 msgs = await client.get_messages(entity, limit=3)
                 if not msgs:
                     result["steps"].append({"step": "set_reaction", "ok": False, "error": "нет постов в канале"})
                 else:
-                    # Берём available_reactions канала
+                    # Разбираем available_reactions канала. Тип может быть:
+                    #   ChatReactionsNone  — реакции запрещены
+                    #   ChatReactionsAll   — любые стандартные эмодзи
+                    #   ChatReactionsSome  — только из whitelist (reactions=[ReactionEmoji, ...])
+                    #   None               — старый канал без явных настроек (обычно работает all)
                     allowed = []
+                    reaction_mode = "unknown"
                     try:
                         full = await client(GetFullChannelRequest(entity))
                         available = getattr(full.full_chat, 'available_reactions', None)
-                        if available:
+                        cls_name = type(available).__name__ if available is not None else "None"
+                        reaction_mode = cls_name
+                        if cls_name == "ChatReactionsSome":
                             for r in getattr(available, 'reactions', []):
                                 if hasattr(r, 'emoticon'):
                                     allowed.append(r.emoticon)
-                    except Exception:
-                        pass
-                    if not allowed:
-                        allowed = ["👍", "❤️", "🔥", "👏"]
+                        elif cls_name in ("ChatReactionsAll", "NoneType") or available is None:
+                            # All / legacy → разрешён весь стандартный набор
+                            allowed = ["👍", "👎", "❤️", "🔥", "🥰", "👏", "😁", "🤔",
+                                       "🤯", "😱", "🤬", "😢", "🎉", "🤩", "🙏", "💯"]
+                        # ChatReactionsNone → allowed остаётся []
+                    except Exception as e:
+                        result["steps"].append({"step": "set_reaction", "ok": False,
+                                                "error": f"GetFullChannel: {type(e).__name__}"})
+                        raise
 
-                    emoji = random.choice(allowed)
-                    target_post = msgs[0]
-                    await client(SendReactionRequest(
-                        peer=entity, msg_id=target_post.id,
-                        reaction=[ReactionEmoji(emoticon=emoji)],
-                    ))
-                    result["steps"].append({"step": "set_reaction", "ok": True, "detail": f"{emoji} на пост #{target_post.id}"})
+                    if not allowed:
+                        result["steps"].append({"step": "set_reaction", "ok": False,
+                                                "error": f"канал не разрешает реакции (mode={reaction_mode})"})
+                    else:
+                        target_post = msgs[0]
+                        # Пытаемся до 3-х разных эмодзи. Если канал отверг 🔥 — попробуем 👍 и т.д.
+                        candidates = random.sample(allowed, min(3, len(allowed)))
+                        last_err = None
+                        success = False
+                        for emoji in candidates:
+                            try:
+                                await client(SendReactionRequest(
+                                    peer=entity, msg_id=target_post.id,
+                                    reaction=[ReactionEmoji(emoticon=emoji)],
+                                ))
+                                result["steps"].append({"step": "set_reaction", "ok": True,
+                                                        "detail": f"{emoji} на пост #{target_post.id} (mode={reaction_mode})"})
+                                success = True
+                                break
+                            except ReactionInvalidError as e:
+                                last_err = e
+                                continue
+                        if not success:
+                            result["steps"].append({"step": "set_reaction", "ok": False,
+                                                    "error": f"все {len(candidates)} эмодзи отвергнуты (mode={reaction_mode}): {str(last_err)[:80]}"})
             except Exception as e:
-                result["steps"].append({"step": "set_reaction", "ok": False, "error": f"{type(e).__name__}: {str(e)[:150]}"})
+                # Уже залогировано в внутреннем except (GetFullChannel) — здесь не дублируем
+                if not any(s["step"] == "set_reaction" for s in result["steps"]):
+                    result["steps"].append({"step": "set_reaction", "ok": False,
+                                            "error": f"{type(e).__name__}: {str(e)[:150]}"})
 
             # ── Шаг 8: Leave (опционально, только если только что вступили) ──
             if leave_after and not already_in:

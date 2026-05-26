@@ -476,6 +476,7 @@ async def _execute_plan_session(plan_id: int):
                                     from telethon.tl.functions.messages import SendReactionRequest
                                     from telethon.tl.types import ReactionEmoji
                                     from telethon.tl.functions.channels import GetFullChannelRequest
+                                    from telethon.errors import ReactionInvalidError
                                     channel_name = action.get("channel")
 
                                     if channel_name:
@@ -487,34 +488,57 @@ async def _execute_plan_session(plan_id: int):
                                             continue
                                         entity = random.choice(channels)
 
+                                    # Разбираем available_reactions канала.
+                                    # ChatReactionsSome → только из whitelist
+                                    # ChatReactionsAll / None → весь стандартный набор
+                                    # ChatReactionsNone → реакции запрещены, скип
                                     allowed_emojis = []
+                                    skip = False
                                     try:
                                         full = await client(GetFullChannelRequest(entity))
                                         available = getattr(full.full_chat, 'available_reactions', None)
-                                        if available:
+                                        cls = type(available).__name__ if available is not None else "None"
+                                        if cls == "ChatReactionsSome":
                                             for r in getattr(available, 'reactions', []):
                                                 if hasattr(r, 'emoticon'):
                                                     allowed_emojis.append(r.emoticon)
+                                        elif cls == "ChatReactionsNone":
+                                            skip = True  # явно запрещены
+                                        else:
+                                            # ChatReactionsAll или None (legacy) → стандартные
+                                            allowed_emojis = ["👍", "👎", "❤️", "🔥", "🥰", "👏", "😁",
+                                                              "🤔", "🤯", "😱", "🤬", "😢", "🎉", "🤩", "🙏", "💯"]
                                     except Exception:
-                                        pass
+                                        allowed_emojis = ["👍", "❤️", "🔥", "👏"]
 
-                                    if not allowed_emojis:
-                                        allowed_emojis = ["👍", "❤️", "🔥", "👏", "😢", "🎉", "🤔", "💯"]
-
-                                    emoji = random.choice(allowed_emojis)
+                                    if skip or not allowed_emojis:
+                                        continue
 
                                     msgs = await client.get_messages(entity, limit=5)
-                                    if msgs:
-                                        target_msg = random.choice(msgs)
-                                        await client(SendReactionRequest(
-                                            peer=entity, msg_id=target_msg.id,
-                                            reaction=[ReactionEmoji(emoticon=emoji)]
-                                        ))
+                                    if not msgs:
+                                        continue
+                                    target_msg = random.choice(msgs)
+
+                                    # Пробуем до 3 разных эмодзи — если канал отверг один, берём другой
+                                    candidates = random.sample(allowed_emojis, min(3, len(allowed_emojis)))
+                                    reacted_emoji = None
+                                    for emoji in candidates:
+                                        try:
+                                            await client(SendReactionRequest(
+                                                peer=entity, msg_id=target_msg.id,
+                                                reaction=[ReactionEmoji(emoticon=emoji)]
+                                            ))
+                                            reacted_emoji = emoji
+                                            break
+                                        except ReactionInvalidError:
+                                            continue
+
+                                    if reacted_emoji:
                                         name = channel_name or getattr(entity, 'name', '?') or getattr(entity, 'title', '?')
-                                        logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 😍 Реакция {emoji} в «{name}»")
+                                        logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 😍 Реакция {reacted_emoji} в «{name}»")
                                         await _safe_log(db, task_id=None, account_id=acc.id, action="set_reaction",
-                                                         detail=f"Реакция {emoji} в «{name}»",
-                                                         channel=str(name), emoji=emoji, success=True,
+                                                         detail=f"Реакция {reacted_emoji} в «{name}»",
+                                                         channel=str(name), emoji=reacted_emoji, success=True,
                                                          source=plan_source, campaign_id=plan_campaign_id)
                                         done_actions += 1
                                 except Exception as e:
@@ -797,6 +821,7 @@ async def _execute_plan_session(plan_id: int):
                                     from telethon.tl.functions.messages import SendReactionRequest
                                     from telethon.tl.functions.channels import GetFullChannelRequest
                                     from telethon.tl.types import ReactionEmoji
+                                    from telethon.errors import ReactionInvalidError
 
                                     entity = await client.get_entity(target_channel)
 
@@ -806,10 +831,36 @@ async def _execute_plan_session(plan_id: int):
                                         continue
                                     post = posts[0]
 
-                                    # Ищем linked discussion group
+                                    # Ищем linked discussion group + available_reactions
                                     full = await client(GetFullChannelRequest(entity))
                                     linked_chat_id = getattr(full.full_chat, 'linked_chat_id', None)
                                     discussion = await client.get_entity(linked_chat_id) if linked_chat_id else entity
+
+                                    # У discussion group свои available_reactions
+                                    disc_full = full
+                                    if linked_chat_id:
+                                        try:
+                                            disc_full = await client(GetFullChannelRequest(discussion))
+                                        except Exception:
+                                            pass
+
+                                    allowed_emojis = []
+                                    try:
+                                        available = getattr(disc_full.full_chat, 'available_reactions', None)
+                                        cls = type(available).__name__ if available is not None else "None"
+                                        if cls == "ChatReactionsSome":
+                                            for r in getattr(available, 'reactions', []):
+                                                if hasattr(r, 'emoticon'):
+                                                    allowed_emojis.append(r.emoticon)
+                                        elif cls == "ChatReactionsNone":
+                                            continue  # реакции в чате запрещены
+                                        else:
+                                            allowed_emojis = ["👍", "❤️", "🔥", "👏", "🤔", "😮", "🥰", "💯", "🎉"]
+                                    except Exception:
+                                        allowed_emojis = ["👍", "❤️", "🔥", "👏"]
+
+                                    if not allowed_emojis:
+                                        continue
 
                                     # Получаем комменты под постом
                                     comments = []
@@ -820,22 +871,31 @@ async def _execute_plan_session(plan_id: int):
                                     if not comments:
                                         continue
 
-                                    emojis_pool = ["👍", "❤️", "🔥", "👏", "🤔", "😮", "🥰", "💯", "⚡", "🎉"]
                                     targets = random.sample(comments, min(react_count, len(comments)))
 
                                     for ci, cmsg in enumerate(targets):
-                                        emoji = random.choice(emojis_pool)
-                                        await client(SendReactionRequest(
-                                            peer=discussion,
-                                            msg_id=cmsg.id,
-                                            reaction=[ReactionEmoji(emoticon=emoji)],
-                                        ))
-                                        logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 😍 Реакция {emoji} на коммент в @{target_channel}")
-                                        await _safe_log(db, task_id=None, account_id=acc.id, action="react_to_comment",
-                                                         detail=f"Реакция {emoji} на коммент в @{target_channel}",
-                                                         channel=target_channel, emoji=emoji, success=True,
-                                                         source=plan_source, campaign_id=plan_campaign_id)
-                                        done_actions += 1
+                                        # До 3 разных эмодзи на случай если первый отвергнут
+                                        candidates = random.sample(allowed_emojis, min(3, len(allowed_emojis)))
+                                        reacted_emoji = None
+                                        for emoji in candidates:
+                                            try:
+                                                await client(SendReactionRequest(
+                                                    peer=discussion,
+                                                    msg_id=cmsg.id,
+                                                    reaction=[ReactionEmoji(emoticon=emoji)],
+                                                ))
+                                                reacted_emoji = emoji
+                                                break
+                                            except ReactionInvalidError:
+                                                continue
+
+                                        if reacted_emoji:
+                                            logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 😍 Реакция {reacted_emoji} на коммент в @{target_channel}")
+                                            await _safe_log(db, task_id=None, account_id=acc.id, action="react_to_comment",
+                                                             detail=f"Реакция {reacted_emoji} на коммент в @{target_channel}",
+                                                             channel=target_channel, emoji=reacted_emoji, success=True,
+                                                             source=plan_source, campaign_id=plan_campaign_id)
+                                            done_actions += 1
                                         if ci < len(targets) - 1:
                                             await asyncio.sleep(random.randint(3, 10))
 
