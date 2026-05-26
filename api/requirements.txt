@@ -30,4 +30,9 @@ redis==5.0.8
 # threads встроены в Python, дополнительные зависимости не нужны.
 # Запуск: celery worker -P threads -c 40
 
+# Flower — web-UI для Celery (порт 5555 по умолчанию).
+# Запуск: celery -A celery_app flower --port=5555
+# Видно: очереди, активные таски, fail rate, история выполнения.
+flower==2.0.1
+
 aiohttp==3.9.5

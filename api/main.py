@@ -22,6 +22,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config import APP_NAME, APP_VERSION, DEBUG, CORS_ORIGINS
 from database import create_tables
+from utils.logging_setup import setup_logging
+
+# Логи API → logs/api.log с ротацией 100MB × 10
+setup_logging("api")
 from routers import auth, accounts, proxies, tasks
 from routers import tg_auth, analytics, security, channels, actions, inbox, tdata, commenting, warmup, parser, api_apps, reactions, subscribe, service_credentials
 from routers import health
@@ -136,11 +140,19 @@ async def root():
 #   - python kill_workers.py        → graceful через Redis broker
 #   - python kill_workers.py --hard → taskkill (если воркер совсем застрял)
 #
-# Терминал 3 — Планировщик (раз в 60с шлёт dispatch_plans, dispatch_warmups):
-#   cd api && python run_periodic.py
+# Терминал 3 — Celery Beat (планировщик, раз в 60с шлёт dispatch_plans/warmups/ai):
+#   cd api && python -m celery -A celery_app beat --loglevel=info
+#
+#   Beat НЕ выполняет таски сам — только отправляет в очередь воркеру по расписанию.
+#   Расписание задано в celery_app.py → beat_schedule.
+#   ⚠ НЕ запускай run_periodic.py одновременно с beat — будут дубли тасков!
 #
 # Терминал 4 — Фронт:
 #   cd gramgpt-web && npm run dev
+#
+# Терминал 5 (опционально) — Flower UI для мониторинга очередей:
+#   cd api && python -m celery -A celery_app flower --port=5555
+#   Открывает http://localhost:5555 — видно активные таски, очереди, fail rate.
 #
 # ═══════════════════════════════════════════════════════════
 # ПРОДВИНУТЫЙ СЕТАП (>100 юзеров) — разделение по процессам

@@ -254,6 +254,37 @@ async def check_celery_config():
     return f"time_limit={cfg.task_time_limit}s, shutdown={cfg.worker_shutdown_timeout}s, queues={len(set(v.get('queue') for v in cfg.task_routes.values()))}"
 
 
+@check("Beat schedule настроен")
+async def check_beat_schedule():
+    from celery_app import celery_app
+    schedule = celery_app.conf.beat_schedule
+    expected = {"dispatch-plans", "dispatch-warmups", "process-ai-dialogs"}
+    missing = expected - set(schedule.keys())
+    if missing:
+        raise RuntimeError(f"в beat_schedule нет: {missing}")
+    # Проверяем что таски существуют
+    for name, cfg in schedule.items():
+        task = cfg.get("task")
+        if not task:
+            raise RuntimeError(f"{name}: нет 'task'")
+    return f"{len(schedule)} расписанных задач: {', '.join(sorted(schedule.keys()))}"
+
+
+@check("Logging setup (ротация файлов)")
+async def check_logging():
+    import logging
+    from utils.logging_setup import setup_logging, LOG_DIR, LOG_MAX_BYTES, LOG_BACKUP_COUNT
+    # Идемпотентный вызов — повторно не должен дублировать handlers
+    before = len(logging.getLogger().handlers)
+    setup_logging("smoke_test")
+    after = len(logging.getLogger().handlers)
+    # logs/smoke_test.log должен появиться
+    log_path = os.path.join(LOG_DIR, "smoke_test.log")
+    if not os.path.exists(log_path):
+        raise RuntimeError(f"файл лога не создан: {log_path}")
+    return f"{LOG_DIR}/ → rotation {LOG_MAX_BYTES // (1024 * 1024)}MB × {LOG_BACKUP_COUNT}"
+
+
 # Когда Seq Scan допустим: маленькие таблицы (Postgres так быстрее, это нормально)
 SEQ_SCAN_OK_BELOW_ROWS = 500
 
@@ -338,6 +369,8 @@ async def main():
     await check_indexes()
     await check_celery()
     await check_celery_config()
+    await check_beat_schedule()
+    await check_logging()
     await check_dispatcher_query()
     await check_guard_query()
     await check_user_lock()

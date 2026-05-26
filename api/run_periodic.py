@@ -1,18 +1,14 @@
 """
-GramGPT — run_periodic.py
-Планировщик задач. Защита от дублей.
-cd api && python run_periodic.py
+GramGPT — run_periodic.py  ⚠ DEPRECATED — используй Celery Beat
 
-Параллельная архитектура:
-  dispatch_warmups (<1с) → run_single_warmup × N (параллельно)
-  dispatch_comments (<1с) → execute_single_comment × N (параллельно)
-  process_campaigns — парсит каналы → очередь
-  process_ai_dialogs — AI-диалоги
+Старый планировщик на while + sleep. Без supervisor, упадёт ночью —
+никто не узнает. Заменён Celery Beat (см. celery_app.py beat_schedule).
 
-Больше воркеров = больше параллельности:
-  1 воркер  → последовательно (2-5 аккаунтов ОК)
-  3 воркера → 3 аккаунта одновременно (20-50 ОК)
-  5 воркеров → 5 одновременно (100+ ОК)
+Новый запуск планировщика:
+  cd api && celery -A celery_app beat --loglevel=info
+
+НЕ запускай run_periodic.py И beat одновременно — таски будут дублироваться.
+Этот файл оставлен как fallback на случай проблем с Beat.
 """
 
 import time, sys, os

@@ -12,11 +12,26 @@ if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
         pass
 
 from celery import Celery
+from celery.signals import worker_process_init, beat_init
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+# ── Logging с ротацией ──────────────────────────────────────
+# Подключаем при старте процесса (worker или beat).
+# logs/celery.log + logs/beat.log с ротацией 100MB × 10 файлов.
+@worker_process_init.connect
+def _setup_worker_logging(**_):
+    from utils.logging_setup import setup_logging
+    setup_logging("celery")
+
+
+@beat_init.connect
+def _setup_beat_logging(**_):
+    from utils.logging_setup import setup_logging
+    setup_logging("beat")
 
 celery_app = Celery(
     "gramgpt",
@@ -96,4 +111,27 @@ celery_app.conf.update(
 
     # Не держать результаты тасков в Redis дольше нужного
     task_ignore_result=False,
+
+    # ── Beat schedule — заменяет run_periodic.py ─────────────
+    # Beat = встроенный планировщик Celery с supervisor-friendly архитектурой.
+    # Запуск: celery -A celery_app beat --loglevel=info
+    # Beat НЕ выполняет таски сам — он только посылает их в очередь воркеру
+    # по расписанию. Так что Beat и Worker — это два РАЗНЫХ процесса.
+    beat_schedule={
+        "dispatch-plans": {
+            "task": "tasks.plan_executor.dispatch_plans",
+            "schedule": 60.0,                  # каждые 60 секунд
+            "options": {"queue": "plans"},
+        },
+        "dispatch-warmups": {
+            "task": "tasks.warmup_v2.dispatch_warmups",
+            "schedule": 60.0,
+            "options": {"queue": "warmup"},
+        },
+        "process-ai-dialogs": {
+            "task": "tasks.ai_tasks.process_ai_dialogs",
+            "schedule": 60.0,
+            "options": {"queue": "ai_dialogs"},
+        },
+    },
 )
