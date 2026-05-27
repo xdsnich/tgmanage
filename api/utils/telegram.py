@@ -21,22 +21,23 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════
-# КОНФИГ CLI — для fallback на глобальные api_id/hash
+# FALLBACK API CREDENTIALS — из env-переменных
 # ═══════════════════════════════════════════════════════════
+#
+# Раньше тут была get_cli_config() которая импортила tg_manager1/config.py
+# (легаси). Это ломало sys.path и приводило к ImportError по всей системе.
+# Заменено на прямое чтение env через os.getenv — .env уже загружен
+# модулем api/config.py при импорте database.py / db_pool.py.
 
-_cli_config = None
-
-def get_cli_config():
-    """Лениво загружает глобальный config.py из корня проекта."""
-    global _cli_config
-    if _cli_config is None:
-        import os, sys
-        root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-        if root not in sys.path:
-            sys.path.insert(0, root)
-        import config as cfg
-        _cli_config = cfg
-    return _cli_config
+def _get_fallback_api_credentials():
+    """Возвращает (api_id, api_hash) из env-переменных как последний fallback."""
+    import os
+    try:
+        api_id = int(os.getenv("TG_API_ID", "0"))
+    except (ValueError, TypeError):
+        api_id = 0
+    api_hash = (os.getenv("TG_API_HASH", "") or "").strip()
+    return api_id, api_hash
 
 
 # ═══════════════════════════════════════════════════════════
@@ -360,10 +361,12 @@ def make_telethon_client(
             logger.info(f"📱 API app: {account.api_app.title} (id={used_api_id}, platform={used_platform})")
 
     if not used_api_id:
-        cli_config = get_cli_config()
-        used_api_id = cli_config.API_ID
-        used_api_hash = cli_config.API_HASH
-        logger.info(f"📱 Global API: id={used_api_id}")
+        used_api_id, used_api_hash = _get_fallback_api_credentials()
+        if used_api_id:
+            logger.info(f"📱 Fallback API из env: id={used_api_id}")
+        else:
+            logger.warning("⛔ Нет API credentials: ни в account.api_app, ни в TG_API_ID env. Подключение невозможно.")
+            return None
 
     if not used_platform:
         used_platform = "android"  # самое безопасное по умолчанию
