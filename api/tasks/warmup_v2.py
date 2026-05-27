@@ -558,6 +558,152 @@ ACTION_FNS = {
 # ВЫПОЛНЕНИЕ СЕССИИ
 # ═══════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════
+# DRIP-SUBSCRIBE: рандомная подписка на target_channels за время прогрева
+#
+# Идея: пользователь даёт список 30 каналов на 7-дневный прогрев.
+# Каждый день аккаунт подписывается на 0-3 случайных канала из списка.
+# В конце прогрева каналы переносятся в кампанию комментинга — но
+# первый коммент в канал делается не сразу после подписки, а
+# через дни (= органично, как у живого человека).
+# ═══════════════════════════════════════════════════════════
+
+async def _drip_subscribe_target_channels(task_row, client, db) -> int:
+    """
+    Если у task есть target_channels — пытается подписать аккаунт на
+    рандомное количество новых каналов (в рамках daily_join_max - joined_today).
+
+    Возвращает кол-во новых успешных подписок за этот вызов.
+    Сохраняет в task_row.subscribed_channels: {channel: ISO timestamp}.
+
+    Использует robust-join (resolve → join → verify GetParticipant)
+    как в plan_executor — чтобы не пометить как "joined" то что
+    реально не прошло.
+    """
+    from models.warmup_log import WarmupLog
+    from datetime import datetime as _dt
+
+    targets = task_row.target_channels or []
+    if not targets:
+        return 0
+
+    # Сколько уже подписан + лимит на сегодня
+    subscribed = dict(task_row.subscribed_channels or {})
+    remaining_quota = max(0, (task_row.daily_join_max or 3) - (task_row.joined_today or 0))
+    if remaining_quota == 0:
+        return 0
+
+    # Минимум — 0, максимум — remaining_quota.
+    # Распределение: чаще 0-1, реже max. Эмулирует "иногда забыл подписаться".
+    weights = [3, 4, 2, 1, 1][:remaining_quota + 1]  # для quota=3 → [3,4,2,1]
+    pool = list(range(remaining_quota + 1))
+    n_to_join = random.choices(pool, weights=weights, k=1)[0]
+    if n_to_join == 0:
+        return 0
+
+    # Каналы которые ещё НЕ подписаны
+    candidates = [c for c in targets if c.lstrip('@').strip() not in subscribed]
+    if not candidates:
+        return 0
+
+    # Выбираем рандомно n штук
+    n_to_join = min(n_to_join, len(candidates))
+    picks = random.sample(candidates, n_to_join)
+
+    from telethon.tl.functions.contacts import ResolveUsernameRequest
+    from telethon.tl.functions.channels import JoinChannelRequest, GetParticipantRequest
+    from telethon.errors import (
+        UserAlreadyParticipantError, FloodWaitError,
+        ChannelPrivateError, UserBannedInChannelError,
+        ChannelsTooMuchError, InviteRequestSentError,
+        UsernameNotOccupiedError, UsernameInvalidError,
+    )
+
+    me = await client.get_me()
+    new_joins = 0
+
+    for ch in picks:
+        clean_ch = ch.lstrip('@').strip()
+        try:
+            # 1. Resolve
+            resolved = await client(ResolveUsernameRequest(clean_ch))
+            if not resolved.chats:
+                db.add(WarmupLog(
+                    task_id=task_row.id, account_id=task_row.account_id,
+                    action="drip_subscribe", success=False,
+                    channel=clean_ch, detail=f"@{clean_ch}: канал не найден"))
+                continue
+            entity = resolved.chats[0]
+
+            # 2. Уже подписаны?
+            already_in = False
+            try:
+                await client(GetParticipantRequest(channel=entity, participant=me))
+                already_in = True
+            except Exception:
+                pass
+
+            # 3. Join + verify
+            if not already_in:
+                try:
+                    await client(JoinChannelRequest(entity))
+                    await asyncio.sleep(random.uniform(2, 4))
+                    await client(GetParticipantRequest(channel=entity, participant=me))
+                except UserAlreadyParticipantError:
+                    already_in = True
+                except (ChannelPrivateError, UserBannedInChannelError) as e:
+                    db.add(WarmupLog(
+                        task_id=task_row.id, account_id=task_row.account_id,
+                        action="drip_subscribe", success=False,
+                        channel=clean_ch, detail=f"@{clean_ch}: {type(e).__name__}"))
+                    continue
+                except InviteRequestSentError:
+                    db.add(WarmupLog(
+                        task_id=task_row.id, account_id=task_row.account_id,
+                        action="drip_subscribe", success=False,
+                        channel=clean_ch, detail=f"@{clean_ch}: требует одобрения"))
+                    continue
+                except ChannelsTooMuchError:
+                    db.add(WarmupLog(
+                        task_id=task_row.id, account_id=task_row.account_id,
+                        action="drip_subscribe", success=False,
+                        channel=clean_ch, detail="лимит 500 каналов на аккаунте"))
+                    break  # дальше нет смысла пытаться
+                except FloodWaitError as fe:
+                    db.add(WarmupLog(
+                        task_id=task_row.id, account_id=task_row.account_id,
+                        action="drip_subscribe", success=False,
+                        channel=clean_ch, detail=f"FloodWait {fe.seconds}с"))
+                    break
+
+            # 4. Записываем в subscribed_channels
+            subscribed[clean_ch] = _dt.utcnow().isoformat()
+            task_row.subscribed_channels = dict(subscribed)
+            task_row.joined_today = (task_row.joined_today or 0) + 1
+            task_row.channels_joined = (task_row.channels_joined or 0) + 1
+            new_joins += 1
+
+            db.add(WarmupLog(
+                task_id=task_row.id, account_id=task_row.account_id,
+                action="drip_subscribe", success=True,
+                channel=clean_ch,
+                detail=f"Подписался на @{clean_ch}" + (" (был уже)" if already_in else " (новый)")))
+
+            # Пауза между подписками — органично
+            await asyncio.sleep(random.uniform(30, 120))
+
+        except Exception as e:
+            db.add(WarmupLog(
+                task_id=task_row.id, account_id=task_row.account_id,
+                action="drip_subscribe", success=False,
+                channel=clean_ch, detail=f"@{clean_ch}: {type(e).__name__}: {str(e)[:120]}"))
+
+    if new_joins:
+        await db.flush()
+
+    return new_joins
+
+
 async def _run_session(task_row, account, proxy, session_cfg, db):
     """
     Выполняет целую сессию — несколько действий подряд с короткими паузами.
@@ -608,6 +754,16 @@ async def _run_session(task_row, account, proxy, session_cfg, db):
                             action="error", detail="Не авторизован", success=False)
             db.add(log)
             return 0
+
+        # ── Drip-подписка на target_channels (если заданы) ──
+        # Бежит ОДИН раз в начале сессии. Внутри сама решит сколько подписать
+        # (0..daily_join_max - joined_today). Лимит обновляется при новом дне.
+        try:
+            new_joins = await _drip_subscribe_target_channels(task_row, client, db)
+            if new_joins:
+                logger.info(f"[warmup][{phone}] 📢 Drip: подписался на {new_joins} канал(а) из target_channels")
+        except Exception as drip_err:
+            logger.warning(f"[warmup][{phone}] drip-subscribe ошибка: {drip_err}")
 
         # ── Проверяем есть ли pending комментарии для этого аккаунта ──
         pending_comment = None
@@ -1099,6 +1255,7 @@ async def _run_single_warmup(task_id: int):
                         t.day += 1
                         t.day_started_at = now
                         t.today_actions = 0
+                        t.joined_today = 0  # сброс счётчика drip-подписок
                         day_type = pick_day_type()
                         day_mult = DAY_MULTIPLIER.get(min(t.day, 7), 1.0)
                         mode_mult = MODE_MULTIPLIER.get(t.mode, 1.0)

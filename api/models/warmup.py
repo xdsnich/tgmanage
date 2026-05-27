@@ -55,5 +55,17 @@ class WarmupTask(Base):
     batch_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     # v2 — связь с кампанией комментинга
     campaign_id:     Mapped[Optional[int]]    = mapped_column(ForeignKey("campaigns.id", ondelete="SET NULL"), nullable=True)
+
+    # ── Drip-подписка на целевые каналы (миграция 026) ──
+    # target_channels — список username'ов (без @) на которые надо подписаться за время прогрева
+    # subscribed_channels — словарь {username: ISO timestamp} уже подписанных за этот прогрев
+    # daily_join_*  — диапазон подписок в день (рандом)
+    # joined_today  — счётчик подписок за сегодня (сбрасывается одновременно с today_actions)
+    target_channels:     Mapped[list]   = mapped_column(JSON, default=list)
+    subscribed_channels: Mapped[dict]   = mapped_column(JSON, default=dict)
+    daily_join_min:      Mapped[int]    = mapped_column(Integer, default=0)
+    daily_join_max:      Mapped[int]    = mapped_column(Integer, default=3)
+    joined_today:        Mapped[int]    = mapped_column(Integer, default=0)
+
     def __repr__(self):
         return f"<WarmupTask account={self.account_id} mode={self.mode} status={self.status}>"

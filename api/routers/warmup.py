@@ -28,6 +28,10 @@ class WarmupCreate(BaseModel):
     account_ids: list[int]               # Несколько аккаунтов сразу
     total_days: int = 7                  # Сколько дней прогревать
     mode: str = "normal"                 # careful | normal | aggressive
+    # Drip-подписка на целевые каналы за время прогрева
+    target_channels: list[str] = []      # 30+ каналов на 7 дней — рандомная подписка по дням
+    daily_join_min: int = 0              # Минимум подписок в день
+    daily_join_max: int = 3              # Максимум подписок в день
 
 
 class WarmupUpdate(BaseModel):
@@ -169,6 +173,15 @@ async def create_warmup_tasks(
         offset = random.randint(0, 90) * i  # Каждый следующий — ещё позже
         offset = min(offset, 180)  # Максимум 3 часа
 
+        # Чистим target_channels (убираем @, пустые, повторы)
+        clean_targets = []
+        seen = set()
+        for ch in (body.target_channels or []):
+            c = (ch or "").lstrip('@').strip()
+            if c and c.lower() not in seen:
+                clean_targets.append(c)
+                seen.add(c.lower())
+
         t = WarmupTask(
             user_id=current_user.id,
             account_id=acc_id,
@@ -181,6 +194,9 @@ async def create_warmup_tasks(
             join_channels=True,
             batch_id=batch_id,
             batch_name=batch_name,
+            target_channels=clean_targets,
+            daily_join_min=max(0, body.daily_join_min),
+            daily_join_max=max(body.daily_join_min, body.daily_join_max),
         )
         db.add(t)
         await db.flush()
@@ -197,6 +213,76 @@ async def create_warmup_tasks(
         "tasks": created,
         "skipped_details": skipped,
         "message": f"Создано {len(created)} задач. Пропущено: {len(skipped)}",
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# Drip-подписки: видеть прогресс + экспортировать каналы в кампанию
+# ═══════════════════════════════════════════════════════════
+
+@router.get("/tasks/{task_id}/subscribed-channels")
+async def get_task_subscribed_channels(
+    task_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Возвращает каналы которыми аккаунт обзавёлся за прогрев.
+    Используется чтобы потом импортнуть их в кампанию комментинга со статусом 'joined'."""
+    t = (await db.execute(
+        select(WarmupTask).where(WarmupTask.id == task_id, WarmupTask.user_id == current_user.id)
+    )).scalar_one_or_none()
+    if not t:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+
+    return {
+        "task_id":           t.id,
+        "account_id":        t.account_id,
+        "target_channels":   t.target_channels or [],
+        "subscribed":        t.subscribed_channels or {},
+        "subscribed_count":  len(t.subscribed_channels or {}),
+        "remaining_target":  len([c for c in (t.target_channels or [])
+                                   if c.lstrip('@').strip() not in (t.subscribed_channels or {})]),
+        "joined_today":      t.joined_today or 0,
+        "daily_join_max":    t.daily_join_max or 0,
+        "day":               t.day,
+        "total_days":        t.total_days,
+        "status":            t.status,
+    }
+
+
+@router.get("/batches/{batch_id}/subscribed-channels")
+async def get_batch_subscribed_channels(
+    batch_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Возвращает агрегат по batch'у (группа прогрева): какой аккаунт на какие каналы подписан.
+    Это форма для импорта в кампанию: {account_id: [ch1, ch2, ...]}."""
+    tasks = (await db.execute(
+        select(WarmupTask).where(
+            WarmupTask.batch_id == batch_id,
+            WarmupTask.user_id == current_user.id,
+        )
+    )).scalars().all()
+
+    if not tasks:
+        raise HTTPException(status_code=404, detail="Batch не найден")
+
+    mapping = {}
+    all_subscribed = set()
+    for t in tasks:
+        chs = list((t.subscribed_channels or {}).keys())
+        mapping[t.account_id] = chs
+        all_subscribed.update(chs)
+
+    return {
+        "batch_id":            batch_id,
+        "batch_name":          tasks[0].batch_name,
+        "total_tasks":         len(tasks),
+        "accounts":            mapping,                          # {acc_id: [channels]}
+        "unique_channels":     sorted(all_subscribed),           # все уникальные каналы
+        "unique_count":        len(all_subscribed),
+        "ready_for_campaign":  all(t.status in ("finished", "running") for t in tasks),
     }
 
 
