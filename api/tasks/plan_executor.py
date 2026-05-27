@@ -762,17 +762,42 @@ async def _execute_plan_session(plan_id: int):
 
                                 except Exception as e:
                                     err = str(e)
-                                    logger.warning(f"[plan][{phone}]   [{action_num}/{len(actions)}] ❌ comment error: {err[:100]}")
+                                    err_type = type(e).__name__
+                                    logger.warning(f"[plan][{phone}]   [{action_num}/{len(actions)}] ❌ comment error ({err_type}): {err[:100]}")
 
-                                    ban_errors = [
-                                        "YOU_BLOCKED", "USER_BANNED", "CHAT_WRITE_FORBIDDEN",
-                                        "USER_RESTRICTED", "BANNED_RIGHTS", "USER_BLOCKED",
-                                        "CHANNEL_PRIVATE", "ChatWriteForbidden", "UserBannedInChannel",
-                                        "banned from sending", "banned in this", "You're banned",
+                                    # ── Детектим бан двумя способами ─────
+                                    # 1. По имени класса исключения (самый надёжный)
+                                    ban_exception_classes = {
+                                        "ChatWriteForbiddenError",
+                                        "UserBannedInChannelError",
+                                        "ChatRestrictedError",
+                                        "ChannelPrivateError",
+                                        "UserDeactivatedError",
+                                        "UserDeactivatedBanError",
+                                        "PeerIdInvalidError",  # часто означает "забанены/кикнуты"
+                                    }
+                                    # 2. По тексту сообщения (для случаев когда Telethon не задрафтил спецкласс)
+                                    ban_message_patterns = [
+                                        "can't write", "cannot write", "write in this chat",
+                                        "banned from sending", "banned in this", "you're banned",
+                                        "chat_write_forbidden", "user_banned", "user_restricted",
+                                        "banned_rights", "channel_private", "you_blocked",
                                     ]
-                                    is_ban = any(b.lower() in err.lower() for b in ban_errors)
+                                    is_ban = (
+                                        err_type in ban_exception_classes or
+                                        any(p.lower() in err.lower() for p in ban_message_patterns)
+                                    )
 
-                                    if is_ban and campaign:
+                                    # ── Запись в channel_ban_stats ──
+                                    # ВСЕГДА инкрементим total_attempts (даже на не-бан ошибках),
+                                    # чтобы канал был виден в UI проходимости.
+                                    # banned_count инкрементим только если is_ban.
+                                    # transient-ошибки типа FLOOD_WAIT не считаем — это не вина канала.
+                                    is_transient = any(p in err for p in ("FLOOD_WAIT", "AUTH_KEY_UNREGISTERED",
+                                                                          "PEER_FLOOD", "ServerError",
+                                                                          "TimeoutError", "ConnectionError"))
+
+                                    if campaign and not is_transient:
                                         try:
                                             from models.channel_ban_stats import ChannelBanStats
                                             st = (await db.execute(
@@ -789,12 +814,15 @@ async def _execute_plan_session(plan_id: int):
                                                 )
                                                 db.add(st)
                                             st.total_attempts += 1
-                                            st.banned_count += 1
-                                            st.last_ban_reason = err[:200]
+                                            if is_ban:
+                                                st.banned_count += 1
+                                                st.last_ban_reason = f"[{err_type}] {err[:180]}"
+                                                logger.warning(f"[stats] 🚫 @{target_channel} БАН ({err_type}): {st.banned_count}/{st.total_attempts}")
+                                            else:
+                                                logger.info(f"[stats] ⚠ @{target_channel} ошибка-не-бан ({err_type}): {st.banned_count}/{st.total_attempts}")
                                             st.last_updated = datetime.utcnow()
-                                            logger.warning(f"[stats] 🚫 @{target_channel} банит: {st.banned_count}/{st.total_attempts}")
                                         except Exception as se:
-                                            logger.warning(f"[stats] Ошибка записи бана: {se}")
+                                            logger.warning(f"[stats] Ошибка записи: {se}")
 
                                     await _safe_log(db, task_id=None, account_id=acc.id, action="smart_comment",
                                                      detail=f"❌ Ошибка @{target_channel}: {err[:100]}",
