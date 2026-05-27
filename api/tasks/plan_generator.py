@@ -121,11 +121,14 @@ REACTION_EMOJIS = ["👍", "🔥", "❤️", "🤔", "👏", "😂", "🎉", "�
 
 def _pick_day_mood():
     moods = [
-        {"name": "lazy",    "session_mult": 0.7, "action_mult": 0.6, "weight": 15},
-        {"name": "tired",   "session_mult": 0.8, "action_mult": 0.7, "weight": 15},
-        {"name": "normal",  "session_mult": 1.0, "action_mult": 1.0, "weight": 35},
-        {"name": "active",  "session_mult": 1.2, "action_mult": 1.3, "weight": 20},
-        {"name": "hyper",   "session_mult": 1.5, "action_mult": 1.6, "weight": 10},
+        # rest = реальный пользователь иногда вообще не открывает Telegram день-два.
+        # ~5% дней (≈1 раз в 3 недели) — выглядит органично, маскирует "идеально-постоянного" бота.
+        {"name": "rest",    "session_mult": 0.0, "action_mult": 0.0, "weight": 5},
+        {"name": "lazy",    "session_mult": 0.7, "action_mult": 0.6, "weight": 17},
+        {"name": "tired",   "session_mult": 0.8, "action_mult": 0.7, "weight": 17},
+        {"name": "normal",  "session_mult": 1.0, "action_mult": 1.0, "weight": 30},
+        {"name": "active",  "session_mult": 1.2, "action_mult": 1.3, "weight": 17},
+        {"name": "hyper",   "session_mult": 1.5, "action_mult": 1.6, "weight": 9},
         {"name": "focused", "session_mult": 0.8, "action_mult": 1.4, "weight": 5},
     ]
     weights = [m["weight"] for m in moods]
@@ -162,6 +165,38 @@ def generate_daily_plan(
 
     p_name = personality.get("name", "active_reader")
     mood = _pick_day_mood()
+
+    # ── REST DAY: целый день без активности (~5% дней) ─────
+    # Только если на день нет критичных задач (комменты, вступления).
+    # Если есть — конвертируем в lazy, потому что rest сломает кампанию.
+    if mood["name"] == "rest":
+        has_critical = bool(channels_to_join) or comments_today > 0
+        if has_critical:
+            mood = {"name": "lazy", "session_mult": 0.7, "action_mult": 0.6, "weight": 0}
+        else:
+            now = datetime.utcnow()
+            return {
+                "account_id":     account_id,
+                "campaign_id":    campaign_id,
+                "personality":    p_name,
+                "timing":         timing.get("name", "unknown"),
+                "style":          style.get("name", "unknown"),
+                "mood":           "rest",
+                "day_number":     day_number,
+                "total_comments": 0,
+                "total_sessions": 1,
+                "sessions": [{
+                    "connect_at_hour":   (now.hour + 3) % 24,
+                    "connect_at_minute": now.minute,
+                    "actions":           [],
+                    "skipped":           True,
+                    "skip_reason":       random.choice([
+                        "выходной", "не до телефона",
+                        "поездка", "семейный день",
+                        "проспал весь день", "забыл про телегу",
+                    ]),
+                }],
+            }
 
     # ── Количество сессий ────────────────────────────────
     base_sessions = random.randint(

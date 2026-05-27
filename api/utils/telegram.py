@@ -206,6 +206,91 @@ def _get_device_for_platform(phone: str, platform: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════
+# PHONE → LANG / SYSTEM-LANG (по country-prefix)
+#
+# Telegram сравнивает: номер +380 (Украина) + lang_code='en' = красный флаг.
+# Реальный пользователь почти всегда имеет lang_code = язык своей страны.
+# ═══════════════════════════════════════════════════════════
+
+# Префиксы (от длинных к коротким — порядок важен для матчинга)
+PHONE_COUNTRY_LANG = [
+    # CIS
+    ("380",  "uk", "uk-UA"),   # Украина
+    ("375",  "be", "be-BY"),   # Беларусь
+    ("373",  "ro", "ro-MD"),   # Молдова
+    ("374",  "hy", "hy-AM"),   # Армения
+    ("995",  "ka", "ka-GE"),   # Грузия
+    ("994",  "az", "az-AZ"),   # Азербайджан
+    ("992",  "tg", "tg-TJ"),   # Таджикистан
+    ("993",  "tk", "tk-TM"),   # Туркменистан
+    ("996",  "ky", "ky-KG"),   # Кыргызстан
+    ("998",  "uz", "uz-UZ"),   # Узбекистан
+    # Россия + Казахстан (общий префикс +7)
+    ("77",   "kk", "kk-KZ"),   # Казахстан (+77...)
+    ("76",   "kk", "kk-KZ"),   # Казахстан (+76...)
+    ("7",    "ru", "ru-RU"),   # Россия
+    # Europe
+    ("420",  "cs", "cs-CZ"),   # Чехия
+    ("421",  "sk", "sk-SK"),   # Словакия
+    ("48",   "pl", "pl-PL"),   # Польша
+    ("49",   "de", "de-DE"),   # Германия
+    ("43",   "de", "de-AT"),   # Австрия
+    ("41",   "de", "de-CH"),   # Швейцария
+    ("33",   "fr", "fr-FR"),   # Франция
+    ("39",   "it", "it-IT"),   # Италия
+    ("34",   "es", "es-ES"),   # Испания
+    ("351",  "pt", "pt-PT"),   # Португалия
+    ("31",   "nl", "nl-NL"),   # Нидерланды
+    ("32",   "nl", "nl-BE"),   # Бельгия
+    ("46",   "sv", "sv-SE"),   # Швеция
+    ("47",   "no", "no-NO"),   # Норвегия
+    ("45",   "da", "da-DK"),   # Дания
+    ("358",  "fi", "fi-FI"),   # Финляндия
+    ("36",   "hu", "hu-HU"),   # Венгрия
+    ("40",   "ro", "ro-RO"),   # Румыния
+    ("359",  "bg", "bg-BG"),   # Болгария
+    ("30",   "el", "el-GR"),   # Греция
+    ("385",  "hr", "hr-HR"),   # Хорватия
+    ("381",  "sr", "sr-RS"),   # Сербия
+    ("90",   "tr", "tr-TR"),   # Турция
+    ("44",   "en", "en-GB"),   # UK
+    ("353",  "en", "en-IE"),   # Ирландия
+    # Middle East / Africa
+    ("971",  "ar", "ar-AE"),   # ОАЭ
+    ("966",  "ar", "ar-SA"),   # Саудовская Аравия
+    ("972",  "he", "he-IL"),   # Израиль
+    ("20",   "ar", "ar-EG"),   # Египет
+    # Asia
+    ("86",   "zh", "zh-CN"),   # Китай
+    ("81",   "ja", "ja-JP"),   # Япония
+    ("82",   "ko", "ko-KR"),   # Корея
+    ("91",   "hi", "hi-IN"),   # Индия
+    ("62",   "id", "id-ID"),   # Индонезия
+    ("66",   "th", "th-TH"),   # Тайланд
+    ("84",   "vi", "vi-VN"),   # Вьетнам
+    # Americas
+    ("55",   "pt", "pt-BR"),   # Бразилия
+    ("52",   "es", "es-MX"),   # Мексика
+    ("54",   "es", "es-AR"),   # Аргентина
+    ("1",    "en", "en-US"),   # США / Канада
+]
+
+
+def _phone_to_lang(phone: str) -> tuple:
+    """
+    Возвращает (lang_code, system_lang_code) по country-prefix номера.
+    Не нашли → fallback на ('en', 'en-US').
+    """
+    if not phone:
+        return ("en", "en-US")
+    p = phone.replace("+", "").replace(" ", "").replace("-", "").strip()
+    for prefix, lang, sys_lang in PHONE_COUNTRY_LANG:
+        if p.startswith(prefix):
+            return (lang, sys_lang)
+    return ("en", "en-US")
+
+
+# ═══════════════════════════════════════════════════════════
 # BACKWARD COMPATIBILITY
 # Старая функция _get_device_fingerprint для мест где ещё нет platform
 # (например в tdata.py до момента загрузки ApiApp)
@@ -305,18 +390,34 @@ def make_telethon_client(
         device = parts[0]
         system = parts[1]
         app_ver = parts[2]
-        logger.info(f"📱 Fingerprint из БД: {device} / {system}")
+        # Формат 5-частей (новый, с lang): "device|system|app|lang|sys_lang"
+        # Формат 3-частей (старый, без lang): legacy, lang='en' (как было)
+        if len(parts) >= 5 and parts[3] and parts[4]:
+            lang_code = parts[3]
+            system_lang_code = parts[4]
+            logger.info(f"📱 Fingerprint из БД: {device} / {system} / lang={lang_code}")
+        else:
+            # Legacy fingerprint — сохраняем поведение "en" чтобы не менять
+            # device profile уже авторизованного аккаунта (Telegram заметит).
+            lang_code = "en"
+            system_lang_code = "en"
+            logger.info(f"📱 Fingerprint из БД (legacy 3-части, lang=en): {device} / {system}")
     else:
         fp = _get_device_for_platform(phone, used_platform)
         device = fp["device"]
         system = fp["system"]
         app_ver = fp["app_version"]
 
-        # Сохраняем в объект — запишется в БД при следующем commit
-        fp_string = f"{device}|{system}|{app_ver}"
+        # Lang определяем по country-prefix номера. Реальный пользователь
+        # из Украины с lang_code='en' выглядит подозрительно.
+        lang_code, system_lang_code = _phone_to_lang(phone)
+
+        # Сохраняем в объект — новый формат с 5 полями.
+        # Запишется в БД при следующем commit.
+        fp_string = f"{device}|{system}|{app_ver}|{lang_code}|{system_lang_code}"
         if hasattr(account, 'device_fingerprint'):
             account.device_fingerprint = fp_string
-            logger.info(f"📱 Fingerprint сохранён: {device} / {system} (platform={used_platform})")
+            logger.info(f"📱 Fingerprint сохранён: {device} / {system} / lang={lang_code} (platform={used_platform})")
 
     return TelegramClient(
         session_path, used_api_id, used_api_hash,
@@ -324,8 +425,8 @@ def make_telethon_client(
         device_model=device,
         system_version=system,
         app_version=app_ver,
-        lang_code="en",
-        system_lang_code="en",
+        lang_code=lang_code,
+        system_lang_code=system_lang_code,
         timeout=30,
     )
 
