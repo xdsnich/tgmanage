@@ -362,7 +362,21 @@ async def main():
     print(f"\n{C.M}{C.BOLD}═══ GramGPT — SMOKE TEST ═══{C.OFF}\n")
 
     started = time.time()
-    await check_imports()
+    ok = await check_imports()
+    # Если первый импорт упал с config-ошибкой — даём чёткую инструкцию
+    if not ok:
+        print()
+        print(f"  {C.Y}{C.BOLD}── ВОЗМОЖНОЕ РЕШЕНИЕ ──{C.OFF}")
+        print(f"  Скорее всего у тебя в корне репо валяется легаси {C.BOLD}tg_manager1/config.py{C.OFF}")
+        print(f"  который Python подхватывает раньше api/config.py.")
+        print()
+        print(f"  Запусти однократно:")
+        print(f"  {C.G}python _fix_legacy_config.py{C.OFF}")
+        print()
+        print(f"  Это переименует легаси в config.py.legacy (файл останется на диске,")
+        print(f"  Python больше его не подхватит). Потом запусти smoke снова.\n")
+        return 1
+    await check_db()
     await check_db()
     await check_redis()
     await check_migrations()
