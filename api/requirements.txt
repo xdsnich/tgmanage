@@ -36,3 +36,9 @@ redis==5.0.8
 flower==2.0.1
 
 aiohttp==3.9.5
+
+# Telethon — клиент Telegram MTProto.
+# ВАЖНО: фиксированная версия. Если получаешь ошибки
+# "Could not find a matching Constructor ID" — Telegram добавил новые типы
+# и нужно обновить эту версию. Команда: pip install -U telethon
+telethon>=1.36.0

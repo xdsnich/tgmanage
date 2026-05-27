@@ -793,9 +793,28 @@ async def _execute_plan_session(plan_id: int):
                                     # чтобы канал был виден в UI проходимости.
                                     # banned_count инкрементим только если is_ban.
                                     # transient-ошибки типа FLOOD_WAIT не считаем — это не вина канала.
-                                    is_transient = any(p in err for p in ("FLOOD_WAIT", "AUTH_KEY_UNREGISTERED",
-                                                                          "PEER_FLOOD", "ServerError",
-                                                                          "TimeoutError", "ConnectionError"))
+                                    is_transient = (
+                                        any(p in err for p in (
+                                            "FLOOD_WAIT", "AUTH_KEY_UNREGISTERED",
+                                            "PEER_FLOOD", "ServerError",
+                                            "TimeoutError", "ConnectionError",
+                                            # Telethon не знает новый Constructor ID от Telegram
+                                            # (новая фича Telegram, нужен upgrade библиотеки).
+                                            # Не вина канала, не вина аккаунта.
+                                            "Could not find a matching Constructor",
+                                            "TypeNotFoundError",
+                                            # Подобные MTProto/parse ошибки которые сами по себе
+                                            # не означают что нас банят
+                                            "MTProtoError", "InvalidBufferError",
+                                            "SecurityError",  # обычно битый пакет от сервера/прокси
+                                        )) or
+                                        err_type in (
+                                            "TypeNotFoundError",
+                                            "InvalidBufferError",
+                                            "SecurityCheckMismatch",
+                                            "AuthKeyDuplicatedError",  # отдельный кейс, аккаунт лезет с 2 мест
+                                        )
+                                    )
 
                                     if campaign and not is_transient:
                                         try:
