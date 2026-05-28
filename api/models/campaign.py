@@ -92,6 +92,12 @@ class Campaign(Base):
     created_at:      Mapped[datetime]           = mapped_column(DateTime, default=datetime.utcnow)
     updated_at:      Mapped[datetime]           = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    # ── Связь с прогревом (миграция 027) ──────────────────
+    # Если кампания создана из прогрева — каналы на которые аккаунты уже
+    # подписались за прогрев становятся commentable с 1-го дня (не нужно
+    # повторно вступать и не пишем сразу после подписки).
+    warmup_batch_id: Mapped[Optional[str]]      = mapped_column(String(64), nullable=True, index=True)
+
     # ── Relationships ────────────────────────────────────
     target_channels: Mapped[list[TargetChannel]] = relationship("TargetChannel", back_populates="campaign", cascade="all, delete-orphan")
 

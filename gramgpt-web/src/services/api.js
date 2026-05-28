@@ -346,6 +346,9 @@ export const commentingAPI = {
     return api.post(`/commenting/campaigns/${campaignId}/channels`, { channels: usernames })
   },
 
+  importFromWarmup: (campaignId, batchId) =>
+    api.post(`/commenting/campaigns/${campaignId}/import-from-warmup`, { batch_id: batchId }),
+
   removeChannel: (campaignId, channelId) =>
     api.delete(`/commenting/campaigns/${campaignId}/channels/${channelId}`),
 
@@ -392,6 +395,8 @@ export const warmupAPI = {
   liveLogs: (limit = 30) => api.get('/warmup/logs/live', { params: { limit } }),
   modes: () => api.get('/warmup/modes'),
   pause: (id) => api.post(`/warmup/tasks/${id}/pause`),
+  subscribedChannels: (id) => api.get(`/warmup/tasks/${id}/subscribed-channels`),
+  batchSubscribedChannels: (batchId) => api.get(`/warmup/batches/${batchId}/subscribed-channels`),
 }
 
 export const subscribeAPI = {

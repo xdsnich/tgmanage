@@ -137,10 +137,9 @@ async def root():
 #
 # Терминал 2 — Celery воркер (ВСЕ очереди в одном процессе, простой сетап):
 #   cd api && celery -A celery_app worker `
-#     -Q plans,warmup,parsers,ai_dialogs,high_priority,bulk_actions,subscribe `
-#     -P threads -c 40 `
-#     --without-gossip --without-mingle --without-heartbeat `
-#     --loglevel=info
+#   -Q plans,warmup,parsers,ai_dialogs,high_priority,bulk_actions,subscribe `
+#   -P threads -c 40 --without-gossip --without-mingle --without-heartbeat `
+#   --loglevel=info
 #
 #   -P threads — каждый таск в своём треде, у каждого треда свой asyncio loop.
 #                Для I/O-bound кода (Telethon, asyncpg, httpx) GIL отпускается → параллелизм.

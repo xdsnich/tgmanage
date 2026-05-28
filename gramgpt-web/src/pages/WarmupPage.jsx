@@ -21,7 +21,7 @@ export default function WarmupPage() {
   const [logsLoading, setLogsLoading] = useState(false)
   const [saving, setSaving] = useState(false)
 
-  const [form, setForm] = useState({ account_ids: [], total_days: 7, mode: 'normal' })
+  const [form, setForm] = useState({ account_ids: [], total_days: 7, mode: 'normal', target_channels: '', daily_join_max: 3 })
   const logsRef = useRef(null)
 
   const load = async (silent = false) => {
@@ -61,14 +61,23 @@ export default function WarmupPage() {
     if (!form.account_ids.length) { alert('Выбери аккаунты'); return }
     setSaving(true)
     try {
+      // Парсим каналы: по строкам/запятым/пробелам, убираем @ и пустые
+      const channels = (form.target_channels || '')
+        .split(/[\s,\n]+/)
+        .map(c => c.replace(/^@/, '').replace(/^https?:\/\/t\.me\//i, '').trim())
+        .filter(Boolean)
+      const dailyMax = Math.max(0, parseInt(form.daily_join_max) || 0)
       const { data } = await warmupAPI.create({
         account_ids: form.account_ids,
         total_days: parseInt(form.total_days) || 7,
         mode: form.mode,
+        target_channels: channels,
+        daily_join_min: 0,
+        daily_join_max: dailyMax,
       })
-      alert(data.message)
+      alert(data.message + (channels.length ? `\nDrip-подписка: ${channels.length} каналов, до ${dailyMax}/день` : ''))
       setCreateModal(false)
-      setForm({ account_ids: [], total_days: 7, mode: 'normal' })
+      setForm({ account_ids: [], total_days: 7, mode: 'normal', target_channels: '', daily_join_max: 3 })
       await load()
     } catch (err) { alert(err.response?.data?.detail || 'Ошибка') }
     setSaving(false)
@@ -216,6 +225,22 @@ export default function WarmupPage() {
                       <span>📋 {t.logs_count} логов</span>
                     </div>
 
+                    {/* Drip-подписка прогресс */}
+                    {t.target_count > 0 && (
+                      <div style={{ marginBottom: 10, padding: '8px 12px', background: 'rgba(124,77,255,0.06)', border: '1px solid rgba(124,77,255,0.15)', borderRadius: 8 }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 4 }}>
+                          <span style={{ color: 'var(--violet)', fontWeight: 600 }}>📢 Drip-подписка</span>
+                          <span style={{ color: 'var(--text-3)' }}>
+                            {t.subscribed_count}/{t.target_count} каналов
+                            {t.status === 'running' && ` · сегодня ${t.joined_today}/${t.daily_join_max}`}
+                          </span>
+                        </div>
+                        <div style={{ height: 4, borderRadius: 2, background: 'rgba(255,255,255,0.06)', overflow: 'hidden' }}>
+                          <div style={{ height: '100%', width: `${t.target_count ? Math.round((t.subscribed_count / t.target_count) * 100) : 0}%`, background: 'var(--violet)', borderRadius: 2, transition: 'width 0.5s' }} />
+                        </div>
+                      </div>
+                    )}
+
                     {/* Actions */}
                     <div style={{ display: 'flex', gap: 6 }}>
                       {t.status === 'idle' && <Button variant="primary" size="sm" onClick={() => handleStart(t.id)}>▶ Старт</Button>}
@@ -323,6 +348,55 @@ export default function WarmupPage() {
             {/* Days */}
             <Input label="Количество дней прогрева" type="number" value={form.total_days}
               onChange={e => setForm(f => ({ ...f, total_days: e.target.value }))} />
+
+            {/* Drip-подписка на каналы */}
+            <div style={{ padding: '14px 16px', background: 'rgba(124,77,255,0.06)', border: '1px solid rgba(124,77,255,0.2)', borderRadius: 10 }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--violet)', marginBottom: 4 }}>
+                📢 Drip-подписка на каналы (опционально)
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 10, lineHeight: 1.6 }}>
+                За время прогрева аккаунты <strong>рандомно подпишутся</strong> на эти каналы (0–{form.daily_join_max || 0} в день).
+                Потом можно экспортировать их в кампанию комментинга — и аккаунты будут писать
+                <strong> не сразу после подписки</strong>, а через дни. Это снижает баны.
+              </div>
+              <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>
+                Каналы (по одному на строку или через запятую)
+              </label>
+              <textarea
+                value={form.target_channels}
+                onChange={e => setForm(f => ({ ...f, target_channels: e.target.value }))}
+                rows={5}
+                placeholder={"@durov\n@telegram\nDC_Draino\nhttps://t.me/example"}
+                style={{
+                  width: '100%', padding: '10px 12px', background: 'var(--bg-3)',
+                  border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)',
+                  fontSize: 13, outline: 'none', resize: 'vertical', fontFamily: 'var(--font-mono)',
+                }}
+              />
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 10 }}>
+                <label style={{ fontSize: 12, color: 'var(--text-2)' }}>Макс. подписок в день:</label>
+                <input
+                  type="range" min="0" max="5" step="1"
+                  value={form.daily_join_max}
+                  onChange={e => setForm(f => ({ ...f, daily_join_max: e.target.value }))}
+                  style={{ flex: 1, accentColor: 'var(--violet)' }}
+                />
+                <span style={{ fontSize: 14, fontWeight: 700, color: 'var(--violet)', minWidth: 20, textAlign: 'center' }}>
+                  {form.daily_join_max}
+                </span>
+              </div>
+              {(() => {
+                const cnt = (form.target_channels || '').split(/[\s,\n]+/).map(c => c.trim()).filter(Boolean).length
+                return cnt > 0 ? (
+                  <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 8 }}>
+                    Указано <strong style={{ color: 'var(--violet)' }}>{cnt}</strong> каналов.
+                    {form.daily_join_max > 0
+                      ? ` За ${form.total_days} дней аккаунт подпишется на ~${Math.min(cnt, Math.round(form.total_days * form.daily_join_max * 0.4))}–${Math.min(cnt, form.total_days * form.daily_join_max)} из них.`
+                      : ' (подписки выключены — daily_join_max = 0)'}
+                  </div>
+                ) : null
+              })()}
+            </div>
 
             {/* Info */}
             <div style={{ padding: '14px 16px', background: 'rgba(61,214,140,0.06)', border: '1px solid rgba(61,214,140,0.15)', borderRadius: 10, fontSize: 12, color: 'var(--text-2)', lineHeight: 1.7 }}>

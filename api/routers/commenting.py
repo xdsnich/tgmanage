@@ -304,10 +304,30 @@ async def start_campaign(
     if not accounts_data:
         raise HTTPException(status_code=400, detail="Нет активных аккаунтов")
 
-    # ── Распределяем каналы между аккаунтами (матрица уникальности) ──────
-    # 30 каналов / 5 аккаунтов → 6 уникальных каналов на аккаунт
+    # ── Если кампания из прогрева — грузим что аккаунты уже подписали ────
+    from datetime import datetime as _dt
+    prejoined_map = {}     # {account_id: [channels]} — подписки из прогрева
+    if c.warmup_batch_id:
+        from models.warmup import WarmupTask
+        wts = (await db.execute(
+            select(WarmupTask).where(WarmupTask.batch_id == c.warmup_batch_id)
+        )).scalars().all()
+        for wt in wts:
+            subs = list((wt.subscribed_channels or {}).keys())
+            if subs:
+                prejoined_map[wt.account_id] = subs
+        print(f"[start_campaign] Из прогрева {c.warmup_batch_id}: {len(prejoined_map)} аккаунтов с подписками")
+
+    # ── Распределяем каналы между аккаунтами ─────────────────────────────
     account_id_list = [a[0] for a in accounts_data]
-    channel_dist = _distribute_channels(channel_usernames, account_id_list)
+    from_warmup = bool(c.warmup_batch_id and prejoined_map)
+    if from_warmup:
+        # Каждый аккаунт комментит в СВОИ подписанные за прогрев каналы.
+        # Не используем случайное распределение — берём warmup-mapping.
+        channel_dist = {a: prejoined_map.get(a, []) for a in account_id_list}
+    else:
+        # Обычная матрица уникальности: 30 каналов / 5 аккаунтов
+        channel_dist = _distribute_channels(channel_usernames, account_id_list)
 
     # ── Сохраняем матрицу в БД (удаляем старую) ──────────────────────────
     from models.campaign_channel_assignment import CampaignChannelAssignment
@@ -318,20 +338,31 @@ async def start_campaign(
     )
     await db.flush()
 
-    # Считаем planned_join_day для каждого канала аккаунта
-    # joins_per_day: не более 2 вступлений в сутки
     import math
     for acc_id, assigned_chs in channel_dist.items():
-        jpd = min(2, max(1, math.ceil(len(assigned_chs) / max(1, total_days))))
-        for i, ch in enumerate(assigned_chs):
-            planned_day = (i // jpd) + 1  # день 1,1,2,2,3,3,...
-            db.add(CampaignChannelAssignment(
-                campaign_id=c.id,
-                account_id=acc_id,
-                channel_username=ch,
-                status="pending",
-                planned_join_day=planned_day,
-            ))
+        if from_warmup:
+            # Каналы УЖЕ подписаны за прогрев → status='joined', commentable с дня 1
+            for ch in assigned_chs:
+                db.add(CampaignChannelAssignment(
+                    campaign_id=c.id,
+                    account_id=acc_id,
+                    channel_username=ch,
+                    status="joined",            # ← уже подписан
+                    planned_join_day=0,
+                    joined_at=_dt.utcnow(),
+                ))
+        else:
+            # Органическая воронка: вступаем по дням (не более 2/сутки)
+            jpd = min(2, max(1, math.ceil(len(assigned_chs) / max(1, total_days))))
+            for i, ch in enumerate(assigned_chs):
+                planned_day = (i // jpd) + 1  # день 1,1,2,2,3,3,...
+                db.add(CampaignChannelAssignment(
+                    campaign_id=c.id,
+                    account_id=acc_id,
+                    channel_username=ch,
+                    status="pending",
+                    planned_join_day=planned_day,
+                ))
     await db.flush()
 
     # ── Распределяем комменты по дням ────────────────────────────────────
@@ -357,13 +388,21 @@ async def start_campaign(
             timing = assign_timing_profile(phone)
             style = assign_style_profile(phone)
 
-            # ── Вычисляем органический план подписок для этого дня ───────
+            # ── Вычисляем план подписок/комментов для этого дня ──────────
             assigned = channel_dist.get(acc_id, [])
-            jpd = min(2, max(1, math.ceil(len(assigned) / max(1, total_days))))
-            join_start = min(len(assigned), (day_num - 1) * jpd)
-            join_end   = min(len(assigned),  day_num      * jpd)
-            channels_to_join_today   = assigned[join_start:join_end]
-            commentable_before_today = assigned[:join_start]
+            if from_warmup:
+                # Каналы уже подписаны за прогрев → commentable с дня 1,
+                # вступать не нужно (НЕ пишем сразу после подписки — подписка
+                # была во время прогрева, дни назад).
+                channels_to_join_today   = []
+                commentable_before_today = assigned
+            else:
+                # Органическая воронка: вступаем по дням, комментим после
+                jpd = min(2, max(1, math.ceil(len(assigned) / max(1, total_days))))
+                join_start = min(len(assigned), (day_num - 1) * jpd)
+                join_end   = min(len(assigned),  day_num      * jpd)
+                channels_to_join_today   = assigned[join_start:join_end]
+                commentable_before_today = assigned[:join_start]
 
             plan = generate_daily_plan(
                 account_id=acc_id,
@@ -478,6 +517,103 @@ async def add_channels(
 
     await db.flush()
     return {"added": added, "message": f"Добавлено {added} каналов"}
+
+
+class ImportWarmupRequest(BaseModel):
+    batch_id: str
+
+
+@router.post("/campaigns/{campaign_id}/import-from-warmup")
+async def import_from_warmup(
+    campaign_id: int,
+    body: ImportWarmupRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Импортирует каналы из batch'а прогрева в кампанию.
+
+    Что делает:
+      1. Берёт из прогрева {account_id: [channels]} — на что аккаунты подписались
+      2. Добавляет все уникальные каналы как TargetChannel кампании
+      3. Добавляет эти аккаунты в кампанию (account_ids)
+      4. Связывает кампанию с batch'ем (warmup_batch_id)
+
+    При старте кампании эти каналы будут commentable с 1-го дня
+    (status='joined'), потому что аккаунты уже подписаны за прогрев.
+    Пишем НЕ сразу после подписки, а после прогрева → меньше банов.
+    """
+    from models.warmup import WarmupTask
+
+    c = await _get_campaign(db, campaign_id, current_user.id)
+
+    # ── Грузим warmup-задачи batch'а ──
+    tasks = (await db.execute(
+        select(WarmupTask).where(
+            WarmupTask.batch_id == body.batch_id,
+            WarmupTask.user_id == current_user.id,
+        )
+    )).scalars().all()
+
+    if not tasks:
+        raise HTTPException(status_code=404, detail="Batch прогрева не найден")
+
+    # Собираем mapping account → подписанные каналы
+    account_channels = {}     # {account_id: [channels]}
+    all_channels = set()
+    for t in tasks:
+        subs = list((t.subscribed_channels or {}).keys())
+        if subs:
+            account_channels[t.account_id] = subs
+            all_channels.update(subs)
+
+    if not all_channels:
+        raise HTTPException(
+            status_code=400,
+            detail="В прогреве ещё нет подписок. Дождись пока аккаунты подпишутся на каналы.",
+        )
+
+    # ── 1. Добавляем каналы как TargetChannel (без дублей) ──
+    existing_usernames = set()
+    ex_r = await db.execute(
+        select(TargetChannel.username).where(TargetChannel.campaign_id == c.id)
+    )
+    existing_usernames = {row[0] for row in ex_r.fetchall()}
+
+    added = 0
+    for username in sorted(all_channels):
+        if username in existing_usernames:
+            continue
+        db.add(TargetChannel(
+            campaign_id=c.id,
+            username=username,
+            link=f"https://t.me/{username}",
+            title=username,
+        ))
+        added += 1
+
+    # ── 2. Добавляем аккаунты прогрева в кампанию ──
+    current_accs = set(c.account_ids or [])
+    warmup_accs = set(account_channels.keys())
+    c.account_ids = sorted(current_accs | warmup_accs)
+
+    # ── 3. Связываем с batch'ем ──
+    c.warmup_batch_id = body.batch_id
+
+    await db.flush()
+    await db.commit()
+
+    return {
+        "imported_channels": added,
+        "total_unique_channels": len(all_channels),
+        "warmup_accounts": len(warmup_accs),
+        "campaign_accounts": len(c.account_ids),
+        "message": (
+            f"Импортировано {added} новых каналов из прогрева. "
+            f"Аккаунтов: {len(warmup_accs)}. "
+            f"При старте они будут commentable с 1-го дня (уже подписаны)."
+        ),
+    }
 
 
 @router.delete("/campaigns/{campaign_id}/channels/{channel_id}", status_code=204)

@@ -93,6 +93,11 @@ def _task_to_dict(t: WarmupTask, logs_count: int = 0) -> dict:
         "created_at": t.created_at.isoformat() + "Z",
         "batch_id": getattr(t, 'batch_id', None) or f"single_{t.id}",
         "batch_name": getattr(t, 'batch_name', None),
+        # Drip-подписка
+        "target_count": len(getattr(t, 'target_channels', []) or []),
+        "subscribed_count": len(getattr(t, 'subscribed_channels', {}) or {}),
+        "daily_join_max": getattr(t, 'daily_join_max', 0) or 0,
+        "joined_today": getattr(t, 'joined_today', 0) or 0,
     }
 
 

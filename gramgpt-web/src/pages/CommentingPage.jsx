@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { commentingAPI, accountsAPI, parserAPI, subscribeAPI } from '../services/api'
+import { commentingAPI, accountsAPI, parserAPI, subscribeAPI, warmupAPI } from '../services/api'
 import { Card, Button, Input, Modal, Badge, Spinner, Empty, StatCard } from '../components/ui'
 import { useAutoRefresh } from '../hooks/useAutoRefresh'
 
@@ -108,6 +108,7 @@ export default function CommentingPage() {
 
   const [channelText, setChannelText]     = useState('')
   const [channelFolders, setChannelFolders] = useState([])
+  const [warmupBatches, setWarmupBatches] = useState([])
 
   // Activity log
   const [activity, setActivity]           = useState([])
@@ -913,7 +914,23 @@ export default function CommentingPage() {
                 <div>
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
                     <span style={{ fontWeight: 700, fontSize: 13 }}>Целевые каналы ({(selected.channels || []).length})</span>
-                    <Button variant="outline" size="sm" onClick={async () => { setChannelModal(true); try { const { data } = await parserAPI.folders(); setChannelFolders(data) } catch { } }}>+ Добавить</Button>
+                    <Button variant="outline" size="sm" onClick={async () => {
+                      setChannelModal(true)
+                      try { const { data } = await parserAPI.folders(); setChannelFolders(data) } catch { }
+                      // Грузим батчи прогрева с подписками (для импорта pre-joined каналов)
+                      try {
+                        const { data: tasks } = await warmupAPI.list()
+                        const byBatch = {}
+                        for (const t of tasks) {
+                          if (!t.batch_id || (t.subscribed_count || 0) === 0) continue
+                          if (!byBatch[t.batch_id]) byBatch[t.batch_id] = { batch_id: t.batch_id, batch_name: t.batch_name || t.batch_id, accounts: 0, subscribed: 0, statuses: [] }
+                          byBatch[t.batch_id].accounts += 1
+                          byBatch[t.batch_id].subscribed += (t.subscribed_count || 0)
+                          byBatch[t.batch_id].statuses.push(t.status)
+                        }
+                        setWarmupBatches(Object.values(byBatch))
+                      } catch { setWarmupBatches([]) }
+                    }}>+ Добавить</Button>
                   </div>
                   {(selected.channels || []).length === 0 ? (
                     <div style={{ fontSize: 12, color: 'var(--text-3)', textAlign: 'center', padding: '16px 0' }}>Нет каналов — добавьте для запуска</div>
@@ -1000,6 +1017,34 @@ export default function CommentingPage() {
       {/* ── Add Channels Modal ─────────────────────────── */}
       <Modal open={channelModal} onClose={() => setChannelModal(false)} title="Добавить каналы" width={520}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          {/* Импорт из прогрева — pre-joined каналы (anti-ban) */}
+          {warmupBatches.length > 0 && (
+            <div style={{ padding: '14px', background: 'rgba(0,194,178,0.06)', border: '1px solid rgba(0,194,178,0.2)', borderRadius: 10 }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--teal)', marginBottom: 4 }}>🔥 Импорт из прогрева (рекомендуется)</div>
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 10, lineHeight: 1.6 }}>
+                Аккаунты уже подписаны на эти каналы за прогрев. При старте они будут commentable
+                <strong> с 1-го дня</strong> — без вступления и не сразу после подписки. Меньше банов.
+              </div>
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                {warmupBatches.map(b => {
+                  const allDone = b.statuses.every(s => s === 'finished')
+                  return (
+                    <Button key={b.batch_id} variant="outline" size="sm" loading={saving} onClick={async () => {
+                      setSaving(true)
+                      try {
+                        const { data } = await commentingAPI.importFromWarmup(selected.id, b.batch_id)
+                        showToast(data.message || `Импортировано ${data.imported_channels} каналов`)
+                        setChannelModal(false); await load()
+                      } catch (err) { showToast(err.response?.data?.detail || 'Ошибка', 'error') }
+                      setSaving(false)
+                    }}>
+                      {allDone ? '✅' : '▶'} {b.batch_name} · {b.subscribed} подписок / {b.accounts} акк.
+                    </Button>
+                  )
+                })}
+              </div>
+            </div>
+          )}
           <div style={{ padding: '14px', background: 'rgba(124,77,255,0.06)', border: '1px solid rgba(124,77,255,0.15)', borderRadius: 10 }}>
             <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-2)', marginBottom: 8 }}>📁 Добавить из папки</div>
             <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
