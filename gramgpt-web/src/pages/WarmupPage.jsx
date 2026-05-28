@@ -29,6 +29,38 @@ export default function WarmupPage() {
   const [planData, setPlanData] = useState(null)
   const [planLoading, setPlanLoading] = useState(false)
 
+  // Сворачивание батчей (компаний прогрева)
+  const [expandedBatches, setExpandedBatches] = useState({})
+  const toggleBatch = (bid) => setExpandedBatches(s => ({ ...s, [bid]: !s[bid] }))
+
+  // Группируем задачи по batch_id, сохраняя порядок (новые сверху)
+  const batchGroups = (() => {
+    const order = []
+    const map = {}
+    for (const t of tasks) {
+      const bid = t.batch_id || `single_${t.id}`
+      if (!map[bid]) {
+        map[bid] = { batch_id: bid, batch_name: t.batch_name || 'Прогрев', tasks: [] }
+        order.push(bid)
+      }
+      map[bid].tasks.push(t)
+    }
+    return order.map(bid => map[bid])
+  })()
+
+  // Массовые действия для батча
+  const handleBatchAction = async (batchTasks, action) => {
+    for (const t of batchTasks) {
+      try {
+        if (action === 'pause' && t.status === 'running') await warmupAPI.pause(t.id)
+        else if (action === 'resume' && t.status === 'paused') await warmupAPI.start(t.id)
+        else if (action === 'stop' && t.status === 'running') await warmupAPI.stop(t.id)
+        else if (action === 'start' && t.status === 'idle') await warmupAPI.start(t.id)
+      } catch { }
+    }
+    await load()
+  }
+
   const openPlan = async (task) => {
     setSelectedTask(task); setPlanModal(true); setPlanLoading(true); setPlanData(null)
     try { const { data } = await warmupAPI.plan(task.id); setPlanData(data) }
@@ -150,6 +182,83 @@ export default function WarmupPage() {
     catch (err) { alert(err.response?.data?.detail || 'Ошибка') }
   }
 
+  // Карточка одного аккаунта в прогреве
+  const renderTaskCard = (t) => {
+    const sb = statusBadge(t)
+    const pct = t.today_limit ? Math.round((t.today_actions / t.today_limit) * 100) : 0
+    return (
+      <div key={t.id} style={{ background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', padding: '16px 20px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div style={{ fontSize: 18 }}>{t.is_resting ? '😴' : '🔥'}</div>
+            <div>
+              <div style={{ fontWeight: 700, fontSize: 13 }}>{t.account_name || t.account_phone}</div>
+              <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
+                День {t.day}/{t.total_days} · {MODE_INFO[t.mode]?.label || t.mode}
+                {t.start_offset_min > 0 && t.status === 'idle' && ` · Старт +${t.start_offset_min} мин`}
+              </div>
+            </div>
+          </div>
+          <Badge color={sb.color}>{sb.label}</Badge>
+        </div>
+
+        {t.status === 'running' && (
+          <div style={{ marginBottom: 10 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>
+              <span>Сегодня: {t.today_actions}/{t.today_limit}</span>
+              <span>Всего: {t.actions_done}</span>
+            </div>
+            <div style={{ height: 4, borderRadius: 2, background: 'rgba(255,255,255,0.06)', overflow: 'hidden' }}>
+              <div style={{ height: '100%', width: `${Math.min(pct, 100)}%`, background: '#3dd68c', borderRadius: 2, transition: 'width 0.5s' }} />
+            </div>
+          </div>
+        )}
+        {t.status === 'running' && t.next_action_at && (
+          <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 8, padding: '6px 10px', background: 'rgba(255,255,255,0.03)', borderRadius: 6 }}>
+            ⏰ Следующая сессия: {new Date(t.next_action_at).toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit' })}
+            {' '}({Math.max(0, Math.round((new Date(t.next_action_at) - new Date()) / 60000))} мин)
+          </div>
+        )}
+        <div style={{ display: 'flex', gap: 12, fontSize: 11, color: 'var(--text-3)', marginBottom: 10 }}>
+          <span>📖 {t.feeds_read}</span>
+          <span>😍 {t.reactions_set}</span>
+          <span>👁 {t.stories_viewed}</span>
+          <span>📢 {t.channels_joined}</span>
+          <span>📋 {t.logs_count} логов</span>
+        </div>
+
+        {t.target_count > 0 && (
+          <div style={{ marginBottom: 10, padding: '8px 12px', background: 'rgba(124,77,255,0.06)', border: '1px solid rgba(124,77,255,0.15)', borderRadius: 8 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 4 }}>
+              <span style={{ color: 'var(--violet)', fontWeight: 600 }}>📢 Drip-подписка</span>
+              <span style={{ color: 'var(--text-3)' }}>
+                {t.subscribed_count}/{t.target_count} каналов
+                {t.status === 'running' && ` · сегодня ${t.joined_today}/${t.daily_join_max}`}
+              </span>
+            </div>
+            <div style={{ height: 4, borderRadius: 2, background: 'rgba(255,255,255,0.06)', overflow: 'hidden' }}>
+              <div style={{ height: '100%', width: `${t.target_count ? Math.round((t.subscribed_count / t.target_count) * 100) : 0}%`, background: 'var(--violet)', borderRadius: 2, transition: 'width 0.5s' }} />
+            </div>
+          </div>
+        )}
+
+        <div style={{ display: 'flex', gap: 6 }}>
+          {t.status === 'idle' && <Button variant="primary" size="sm" onClick={() => handleStart(t.id)}>▶ Старт</Button>}
+          {t.status === 'running' && (
+            <>
+              <Button variant="ghost" size="sm" onClick={() => handlePause(t.id)}>⏸ Пауза</Button>
+              <Button variant="danger" size="sm" onClick={() => handleStop(t.id)}>⏹ Завершить</Button>
+            </>
+          )}
+          {t.status === 'paused' && <Button variant="primary" size="sm" onClick={() => handleStart(t.id)}>▶ Продолжить</Button>}
+          <Button variant="ghost" size="sm" onClick={() => openPlan(t)}>📅 План</Button>
+          <Button variant="ghost" size="sm" onClick={() => openLogs(t)}>📋 Логи</Button>
+          {t.status !== 'running' && <Button variant="ghost" size="sm" onClick={() => handleDelete(t.id)}>✕</Button>}
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div style={{ padding: '28px 32px', animation: 'fadeUp 0.4s cubic-bezier(0.16,1,0.3,1)' }}>
       {/* Header */}
@@ -189,84 +298,48 @@ export default function WarmupPage() {
             <Empty icon="🔥" title="Нет задач" subtitle="Создай прогрев для аккаунтов"
               action={<Button variant="primary" onClick={() => setCreateModal(true)}>+ Создать</Button>} />
           ) : (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-              {tasks.map(t => {
-                const sb = statusBadge(t)
-                const pct = t.today_limit ? Math.round((t.today_actions / t.today_limit) * 100) : 0
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              {batchGroups.map(g => {
+                const isOpen = expandedBatches[g.batch_id]
+                const running = g.tasks.filter(t => t.status === 'running').length
+                const done = g.tasks.filter(t => t.status === 'finished').length
+                const subTotal = g.tasks.reduce((s, t) => s + (t.subscribed_count || 0), 0)
+                const targetTotal = g.tasks.reduce((s, t) => s + (t.target_count || 0), 0)
                 return (
-                  <div key={t.id} style={{ background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', padding: '16px 20px' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                        <div style={{ fontSize: 18 }}>{t.is_resting ? '😴' : '🔥'}</div>
+                  <div key={g.batch_id} style={{ background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', overflow: 'hidden' }}>
+                    {/* Заголовок батча (кликабельный) */}
+                    <div onClick={() => toggleBatch(g.batch_id)} style={{
+                      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                      padding: '14px 18px', cursor: 'pointer', userSelect: 'none',
+                      background: isOpen ? 'rgba(124,77,255,0.06)' : 'transparent',
+                      transition: 'background 0.15s',
+                    }}
+                      onMouseEnter={e => { if (!isOpen) e.currentTarget.style.background = 'rgba(255,255,255,0.02)' }}
+                      onMouseLeave={e => { if (!isOpen) e.currentTarget.style.background = 'transparent' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                        <span style={{ fontSize: 13, color: 'var(--text-3)', transition: 'transform 0.2s', transform: isOpen ? 'rotate(90deg)' : 'none' }}>▶</span>
                         <div>
-                          <div style={{ fontWeight: 700, fontSize: 13 }}>{t.account_name || t.account_phone}</div>
-                          <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
-                            День {t.day}/{t.total_days} · {MODE_INFO[t.mode]?.label || t.mode}
-                            {t.start_offset_min > 0 && t.status === 'idle' && ` · Старт +${t.start_offset_min} мин`}
+                          <div style={{ fontWeight: 700, fontSize: 14 }}>🔥 {g.batch_name}</div>
+                          <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 2 }}>
+                            {g.tasks.length} акк. · ▶ {running} работает{done > 0 ? ` · ✅ ${done} завершено` : ''}
+                            {targetTotal > 0 && ` · 📢 ${subTotal}/${targetTotal} подписок`}
                           </div>
                         </div>
                       </div>
-                      <Badge color={sb.color}>{sb.label}</Badge>
+                      <div style={{ display: 'flex', gap: 6, alignItems: 'center' }} onClick={e => e.stopPropagation()}>
+                        {running > 0 && <Button variant="ghost" size="sm" onClick={() => handleBatchAction(g.tasks, 'pause')}>⏸ Пауза всех</Button>}
+                        {g.tasks.some(t => t.status === 'paused') && <Button variant="ghost" size="sm" onClick={() => handleBatchAction(g.tasks, 'resume')}>▶ Продолжить всех</Button>}
+                        {g.tasks.some(t => t.status === 'idle') && <Button variant="primary" size="sm" onClick={() => handleBatchAction(g.tasks, 'start')}>▶ Старт всех</Button>}
+                        {running > 0 && <Button variant="danger" size="sm" onClick={() => { if (window.confirm(`Завершить весь прогрев "${g.batch_name}" (${running} акк.)?`)) handleBatchAction(g.tasks, 'stop') }}>⏹ Стоп всех</Button>}
+                      </div>
                     </div>
 
-                    {/* Progress today */}
-                    {t.status === 'running' && (
-                      <div style={{ marginBottom: 10 }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>
-                          <span>Сегодня: {t.today_actions}/{t.today_limit}</span>
-                          <span>Всего: {t.actions_done}</span>
-                        </div>
-                        <div style={{ height: 4, borderRadius: 2, background: 'rgba(255,255,255,0.06)', overflow: 'hidden' }}>
-                          <div style={{ height: '100%', width: `${Math.min(pct, 100)}%`, background: '#3dd68c', borderRadius: 2, transition: 'width 0.5s' }} />
-                        </div>
+                    {/* Развёрнутые карточки аккаунтов */}
+                    {isOpen && (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 10, padding: '0 14px 14px' }}>
+                        {g.tasks.map(t => renderTaskCard(t))}
                       </div>
                     )}
-                    {/* Next action time */}
-                    {t.status === 'running' && t.next_action_at && (
-                      <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 8, padding: '6px 10px', background: 'rgba(255,255,255,0.03)', borderRadius: 6 }}>
-                        ⏰ Следующая сессия: {new Date(t.next_action_at).toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit' })}
-                        {' '}({Math.max(0, Math.round((new Date(t.next_action_at) - new Date()) / 60000))} мин)
-                      </div>
-                    )}
-                    {/* Stats mini */}
-                    <div style={{ display: 'flex', gap: 12, fontSize: 11, color: 'var(--text-3)', marginBottom: 10 }}>
-                      <span>📖 {t.feeds_read}</span>
-                      <span>😍 {t.reactions_set}</span>
-                      <span>👁 {t.stories_viewed}</span>
-                      <span>📢 {t.channels_joined}</span>
-                      <span>📋 {t.logs_count} логов</span>
-                    </div>
-
-                    {/* Drip-подписка прогресс */}
-                    {t.target_count > 0 && (
-                      <div style={{ marginBottom: 10, padding: '8px 12px', background: 'rgba(124,77,255,0.06)', border: '1px solid rgba(124,77,255,0.15)', borderRadius: 8 }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 4 }}>
-                          <span style={{ color: 'var(--violet)', fontWeight: 600 }}>📢 Drip-подписка</span>
-                          <span style={{ color: 'var(--text-3)' }}>
-                            {t.subscribed_count}/{t.target_count} каналов
-                            {t.status === 'running' && ` · сегодня ${t.joined_today}/${t.daily_join_max}`}
-                          </span>
-                        </div>
-                        <div style={{ height: 4, borderRadius: 2, background: 'rgba(255,255,255,0.06)', overflow: 'hidden' }}>
-                          <div style={{ height: '100%', width: `${t.target_count ? Math.round((t.subscribed_count / t.target_count) * 100) : 0}%`, background: 'var(--violet)', borderRadius: 2, transition: 'width 0.5s' }} />
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Actions */}
-                    <div style={{ display: 'flex', gap: 6 }}>
-                      {t.status === 'idle' && <Button variant="primary" size="sm" onClick={() => handleStart(t.id)}>▶ Старт</Button>}
-                      {t.status === 'running' && (
-                        <>
-                          <Button variant="ghost" size="sm" onClick={() => handlePause(t.id)}>⏸ Пауза</Button>
-                          <Button variant="danger" size="sm" onClick={() => handleStop(t.id)}>⏹ Завершить</Button>
-                        </>
-                      )}
-                      {t.status === 'paused' && <Button variant="primary" size="sm" onClick={() => handleStart(t.id)}>▶ Продолжить</Button>}
-                      <Button variant="ghost" size="sm" onClick={() => openPlan(t)}>📅 План</Button>
-                      <Button variant="ghost" size="sm" onClick={() => openLogs(t)}>📋 Логи</Button>
-                      {t.status !== 'running' && <Button variant="ghost" size="sm" onClick={() => handleDelete(t.id)}>✕</Button>}
-                    </div>
                   </div>
                 )
               })}
