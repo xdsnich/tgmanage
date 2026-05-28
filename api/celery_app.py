@@ -141,15 +141,14 @@ celery_app.conf.update(
     # по расписанию. Так что Beat и Worker — это два РАЗНЫХ процесса.
     beat_schedule={
         "dispatch-plans": {
+            # Исполняет И commenting, И warmup планы (единый движок).
             "task": "tasks.plan_executor.dispatch_plans",
             "schedule": 60.0,                  # каждые 60 секунд
             "options": {"queue": "plans"},
         },
-        "dispatch-warmups": {
-            "task": "tasks.warmup_v2.dispatch_warmups",
-            "schedule": 60.0,
-            "options": {"queue": "warmup"},
-        },
+        # dispatch-warmups ОТКЛЮЧЁН: родной warmup_v2-движок больше не исполняет
+        # прогрев. Прогрев теперь гоняет plan_executor (см. dispatch-plans),
+        # чтобы план ВСЕГДА совпадал с выполнением (был баг двойного движка).
         "process-ai-dialogs": {
             "task": "tasks.ai_tasks.process_ai_dialogs",
             "schedule": 60.0,

@@ -119,12 +119,22 @@ async def _dispatch_plans():
             )
             plans = list(comm_result.scalars().all())
 
-            # ВАЖНО: WARMUP планы здесь НЕ обрабатываем.
-            # Прогрев исполняется СВОИМ движком (warmup_v2._run_single_warmup),
-            # у него своя логика сессий, drip-подписка, смена дней и логирование.
-            # Раньше plan_executor ТОЖЕ гонял warmup-CampaignPlan → двойное
-            # выполнение, гонка за account_lock, логи с task_id=None, рассинхрон
-            # счётчиков с UI. Теперь plan_executor трогает ТОЛЬКО commenting-планы.
+            # ═══ WARMUP планы: только для running задач ═══
+            # Прогрев исполняется ЕДИНЫМ движком — plan_executor (как комментинг).
+            # Родной warmup_v2-движок отключён (см. celery_app beat). Так план
+            # ВСЕГДА совпадает с выполнением — нет двух источников правды.
+            warmup_result = await db.execute(
+                select(CampaignPlan)
+                .join(WarmupTask, WarmupTask.id == CampaignPlan.warmup_task_id)
+                .where(
+                    CampaignPlan.plan_date == today,
+                    CampaignPlan.status == "active",
+                    CampaignPlan.campaign_id == None,
+                    CampaignPlan.warmup_task_id != None,
+                    WarmupTask.status == "running",
+                )
+            )
+            plans.extend(list(warmup_result.scalars().all()))
 
             for plan in plans:
                 sessions = plan.plan.get("sessions", [])
@@ -284,16 +294,11 @@ async def _execute_plan_session(plan_id: int):
                 logger.info(f"[plan_executor] Plan #{plan_id} status={plan.status} — пропуск")
                 return {"status": "not_active"}
 
-            # WARMUP-планы НЕ исполняем здесь — прогрев гоняет свой движок
-            # (warmup_v2). Защита от двойного выполнения если такой план
-            # каким-то образом попал в очередь plan_executor.
-            if plan.warmup_task_id:
-                logger.info(f"[plan_executor] Plan #{plan_id} — это warmup-план, исполняет warmup_v2, пропуск")
-                return {"status": "warmup_handled_elsewhere"}
-
             # Определяем тип плана: warmup или commenting
             plan_source = 'warmup' if plan.warmup_task_id else 'commenting'
             plan_campaign_id = plan.campaign_id if not plan.warmup_task_id else None
+            # Для warmup логи должны иметь task_id (иначе невидимы в UID задачи)
+            log_task_id = plan.warmup_task_id if plan.warmup_task_id else None
 
             # ═══ ПРОВЕРКА ЖИВОСТИ СВЯЗАННОЙ ЗАДАЧИ ═══
             if plan.warmup_task_id:
@@ -398,7 +403,7 @@ async def _execute_plan_session(plan_id: int):
 
                 logger.info(f"[plan][{phone}] ═══ Сессия {sess_num}/{total_sess} (день {plan.day_number}, {mood}) ═══")
 
-                await _safe_log(db, task_id=None, account_id=acc.id, action="session_start",
+                await _safe_log(db, task_id=log_task_id, account_id=acc.id, action="session_start",
                                  detail=f"Старт сессии {sess_num}/{total_sess} (день {plan.day_number}, {mood})",
                                  success=True, source=plan_source, campaign_id=plan_campaign_id)
 
@@ -411,7 +416,7 @@ async def _execute_plan_session(plan_id: int):
                     if not await client.is_user_authorized():
                         plan.executed_idx += 1
                         logger.warning(f"[plan][{phone}] Не авторизован")
-                        await _safe_log(db, task_id=None, account_id=acc.id, action="error",
+                        await _safe_log(db, task_id=log_task_id, account_id=acc.id, action="error",
                                          detail="Не авторизован", success=False,
                                          source=plan_source, campaign_id=plan_campaign_id)
                         await db.commit()
@@ -449,7 +454,7 @@ async def _execute_plan_session(plan_id: int):
 
                                     name = channel_name or getattr(entity, 'name', '?') or getattr(entity, 'title', '?')
                                     logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 📖 Прочитал {len(msgs)} постов в «{name}»")
-                                    await _safe_log(db, task_id=None, account_id=acc.id, action="read_feed",
+                                    await _safe_log(db, task_id=log_task_id, account_id=acc.id, action="read_feed",
                                                      detail=f"Прочитал {len(msgs)} в «{name}»",
                                                      channel=str(name), success=True,
                                                      source=plan_source, campaign_id=plan_campaign_id)
@@ -463,7 +468,7 @@ async def _execute_plan_session(plan_id: int):
                                     await client(GetAllReadPeerStoriesRequest())
                                     count = action.get("count", 3)
                                     logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 👁 Stories ({count})")
-                                    await _safe_log(db, task_id=None, account_id=acc.id, action="view_stories",
+                                    await _safe_log(db, task_id=log_task_id, account_id=acc.id, action="view_stories",
                                                      detail=f"Просмотрел stories ({count})", success=True,
                                                      source=plan_source, campaign_id=plan_campaign_id)
                                     done_actions += 1
@@ -535,7 +540,7 @@ async def _execute_plan_session(plan_id: int):
                                     if reacted_emoji:
                                         name = channel_name or getattr(entity, 'name', '?') or getattr(entity, 'title', '?')
                                         logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 😍 Реакция {reacted_emoji} в «{name}»")
-                                        await _safe_log(db, task_id=None, account_id=acc.id, action="set_reaction",
+                                        await _safe_log(db, task_id=log_task_id, account_id=acc.id, action="set_reaction",
                                                          detail=f"Реакция {reacted_emoji} в «{name}»",
                                                          channel=str(name), emoji=reacted_emoji, success=True,
                                                          source=plan_source, campaign_id=plan_campaign_id)
@@ -552,7 +557,7 @@ async def _execute_plan_session(plan_id: int):
                                         from telethon.tl.functions.users import GetFullUserRequest
                                         await client(GetFullUserRequest(u.input_entity))
                                         logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 👤 Профиль «{u.name or '?'}»")
-                                        await _safe_log(db, task_id=None, account_id=acc.id, action="view_profile",
+                                        await _safe_log(db, task_id=log_task_id, account_id=acc.id, action="view_profile",
                                                          detail=f"Просмотрел профиль «{u.name or '?'}»", success=True,
                                                          source=plan_source, campaign_id=plan_campaign_id)
                                         done_actions += 1
@@ -566,7 +571,7 @@ async def _execute_plan_session(plan_id: int):
                                     term = random.choice(terms)
                                     await client(SearchRequest(q=term, limit=5))
                                     logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 🔍 Поиск «{term}»")
-                                    await _safe_log(db, task_id=None, account_id=acc.id, action="search",
+                                    await _safe_log(db, task_id=log_task_id, account_id=acc.id, action="search",
                                                      detail=f"Поиск «{term}»", success=True,
                                                      source=plan_source, campaign_id=plan_campaign_id)
                                     done_actions += 1
@@ -579,7 +584,7 @@ async def _execute_plan_session(plan_id: int):
                                     me = await client.get_me()
                                     await client.send_message(me, text)
                                     logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 💬 Saved: {text}")
-                                    await _safe_log(db, task_id=None, account_id=acc.id, action="send_saved",
+                                    await _safe_log(db, task_id=log_task_id, account_id=acc.id, action="send_saved",
                                                      detail=f"Saved: {text}", success=True,
                                                      source=plan_source, campaign_id=plan_campaign_id)
                                     done_actions += 1
@@ -597,7 +602,7 @@ async def _execute_plan_session(plan_id: int):
                                             me = await client.get_me()
                                             await client.forward_messages(me, msgs[0])
                                             logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 💾 Переслал из «{ch.name or '?'}»")
-                                            await _safe_log(db, task_id=None, account_id=acc.id, action="forward_saved",
+                                            await _safe_log(db, task_id=log_task_id, account_id=acc.id, action="forward_saved",
                                                              detail=f"Переслал из «{ch.name or '?'}»", success=True,
                                                              source=plan_source, campaign_id=plan_campaign_id)
                                             done_actions += 1
@@ -614,7 +619,7 @@ async def _execute_plan_session(plan_id: int):
                                         for m in msgs:
                                             await client.send_read_acknowledge(u, m)
                                         logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] ↩️ Прочитал ЛС от «{u.name or '?'}»")
-                                        await _safe_log(db, task_id=None, account_id=acc.id, action="reply_dm",
+                                        await _safe_log(db, task_id=log_task_id, account_id=acc.id, action="reply_dm",
                                                          detail=f"Прочитал ЛС от «{u.name or '?'}»", success=True,
                                                          source=plan_source, campaign_id=plan_campaign_id)
                                         done_actions += 1
@@ -687,7 +692,7 @@ async def _execute_plan_session(plan_id: int):
 
                                     if random.random() < random.uniform(0.05, 0.15):
                                         logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 🚫 Передумал комментировать @{target_channel}")
-                                        await _safe_log(db, task_id=None, account_id=acc.id, action="smart_comment",
+                                        await _safe_log(db, task_id=log_task_id, account_id=acc.id, action="smart_comment",
                                                          detail=f"🚫 Передумал комментировать @{target_channel}",
                                                          channel=target_channel, success=True,
                                                          source=plan_source, campaign_id=plan_campaign_id)
@@ -752,7 +757,7 @@ async def _execute_plan_session(plan_id: int):
                                             try: await db.rollback()
                                             except: pass
 
-                                    await _safe_log(db, task_id=None, account_id=acc.id, action="smart_comment",
+                                    await _safe_log(db, task_id=log_task_id, account_id=acc.id, action="smart_comment",
                                                      detail=f"💬 @{target_channel}: {comment_text[:80]}",
                                                      channel=target_channel, success=True,
                                                      source=plan_source, campaign_id=plan_campaign_id)
@@ -842,7 +847,7 @@ async def _execute_plan_session(plan_id: int):
                                         except Exception as se:
                                             logger.warning(f"[stats] Ошибка записи: {se}")
 
-                                    await _safe_log(db, task_id=None, account_id=acc.id, action="smart_comment",
+                                    await _safe_log(db, task_id=log_task_id, account_id=acc.id, action="smart_comment",
                                                      detail=f"❌ Ошибка @{target_channel}: {err[:100]}",
                                                      channel=target_channel, success=False, error=err[:200],
                                                      source=plan_source, campaign_id=plan_campaign_id)
@@ -937,7 +942,7 @@ async def _execute_plan_session(plan_id: int):
 
                                         if reacted_emoji:
                                             logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 😍 Реакция {reacted_emoji} на коммент в @{target_channel}")
-                                            await _safe_log(db, task_id=None, account_id=acc.id, action="react_to_comment",
+                                            await _safe_log(db, task_id=log_task_id, account_id=acc.id, action="react_to_comment",
                                                              detail=f"Реакция {reacted_emoji} на коммент в @{target_channel}",
                                                              channel=target_channel, emoji=reacted_emoji, success=True,
                                                              source=plan_source, campaign_id=plan_campaign_id)
@@ -1038,7 +1043,7 @@ async def _execute_plan_session(plan_id: int):
                                         await db.flush()
 
                                     detail = f"Уже был в @{clean_ch}" if already_in else f"Вступил в @{clean_ch} (подтверждено)"
-                                    await _safe_log(db, task_id=None, account_id=acc.id, action="join_channel",
+                                    await _safe_log(db, task_id=log_task_id, account_id=acc.id, action="join_channel",
                                                      detail=detail, channel=clean_ch, success=True,
                                                      source=plan_source, campaign_id=plan_campaign_id)
                                     done_actions += 1
@@ -1062,13 +1067,74 @@ async def _execute_plan_session(plan_id: int):
                                         except Exception:
                                             pass
                                     # Логируем ошибку в warmup_logs чтобы было видно в UI
-                                    await _safe_log(db, task_id=None, account_id=acc.id, action="join_channel",
+                                    await _safe_log(db, task_id=log_task_id, account_id=acc.id, action="join_channel",
                                                      detail=f"❌ @{ch}: {err[:120]}",
                                                      channel=ch, success=False, error=err[:200],
                                                      source=plan_source, campaign_id=plan_campaign_id)
                                     import re as _re
                                     if "FLOOD_WAIT" in err:
                                         wait = int(_re.search(r"(\d+)", err).group(1)) if _re.search(r"(\d+)", err) else 60
+                                        await asyncio.sleep(wait + random.randint(5, 15))
+                                        break
+
+                            elif action_type == "warmup_subscribe":
+                                # WARMUP drip-подписка на КОНКРЕТНЫЙ target-канал.
+                                # Подписывается + верифицирует + пишет в
+                                # WarmupTask.subscribed_channels (для импорта в кампанию).
+                                # НЕ создаёт CampaignChannelAssignment.
+                                ch = action.get("channel", "")
+                                if not ch or not plan.warmup_task_id:
+                                    continue
+                                clean_ch = ch.lstrip('@').strip()
+                                try:
+                                    from telethon.tl.functions.contacts import ResolveUsernameRequest
+                                    from telethon.tl.functions.channels import JoinChannelRequest as _JCR, GetParticipantRequest
+                                    from telethon.errors import UserAlreadyParticipantError, FloodWaitError
+                                    me = await client.get_me()
+                                    resolved = await client(ResolveUsernameRequest(clean_ch))
+                                    if not resolved.chats:
+                                        raise Exception("канал не найден")
+                                    entity = resolved.chats[0]
+
+                                    already_in = False
+                                    try:
+                                        await client(GetParticipantRequest(channel=entity, participant=me))
+                                        already_in = True
+                                    except Exception:
+                                        pass
+
+                                    if not already_in:
+                                        await client(_JCR(entity))
+                                        await asyncio.sleep(random.uniform(2, 4))
+                                        await client(GetParticipantRequest(channel=entity, participant=me))
+
+                                    from models.warmup import WarmupTask as _WT
+                                    wt = (await db.execute(
+                                        select(_WT).where(_WT.id == plan.warmup_task_id)
+                                    )).scalar_one_or_none()
+                                    if wt:
+                                        subs = dict(wt.subscribed_channels or {})
+                                        subs[clean_ch] = datetime.utcnow().isoformat()
+                                        wt.subscribed_channels = subs
+                                        wt.channels_joined = (wt.channels_joined or 0) + 1
+                                        await db.flush()
+
+                                    logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 📢 Drip @{clean_ch}" + (" (был)" if already_in else ""))
+                                    await _safe_log(db, task_id=log_task_id, account_id=acc.id, action="drip_subscribe",
+                                                     detail=f"Подписался на @{clean_ch}" + (" (уже был)" if already_in else " (новый)"),
+                                                     channel=clean_ch, success=True,
+                                                     source=plan_source, campaign_id=plan_campaign_id)
+                                    done_actions += 1
+                                except Exception as e:
+                                    err = str(e)
+                                    logger.warning(f"[plan][{phone}]   [{action_num}/{len(actions)}] 📢 drip @{clean_ch} err ({type(e).__name__}): {err[:100]}")
+                                    await _safe_log(db, task_id=log_task_id, account_id=acc.id, action="drip_subscribe",
+                                                     detail=f"❌ @{clean_ch}: {err[:100]}", channel=clean_ch,
+                                                     success=False, error=err[:200],
+                                                     source=plan_source, campaign_id=plan_campaign_id)
+                                    import re as _re2
+                                    if "FLOOD_WAIT" in err:
+                                        wait = int(_re2.search(r"(\d+)", err).group(1)) if _re2.search(r"(\d+)", err) else 60
                                         await asyncio.sleep(wait + random.randint(5, 15))
                                         break
 
@@ -1111,7 +1177,7 @@ async def _execute_plan_session(plan_id: int):
                                         raise
                                     label = "🎭 Decoy-подписка" if is_decoy else "📢 Подписался"
                                     logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] {label} на @{ch}")
-                                    await _safe_log(db, task_id=None, account_id=acc.id, action="join_channel",
+                                    await _safe_log(db, task_id=log_task_id, account_id=acc.id, action="join_channel",
                                                      detail=f"{label} на @{ch} (не комментим)",
                                                      channel=ch, success=True,
                                                      source=plan_source, campaign_id=plan_campaign_id)
@@ -1154,7 +1220,7 @@ async def _execute_plan_session(plan_id: int):
 
                 except Exception as e:
                     logger.error(f"[plan][{phone}] Session error: {e}")
-                    await _safe_log(db, task_id=None, account_id=acc.id, action="error",
+                    await _safe_log(db, task_id=log_task_id, account_id=acc.id, action="error",
                                      detail=f"Ошибка сессии: {str(e)[:200]}", success=False,
                                      source=plan_source, campaign_id=plan_campaign_id)
                 finally:
@@ -1165,22 +1231,53 @@ async def _execute_plan_session(plan_id: int):
 
                 logger.info(f"[plan][{phone}] ═══ Сессия {sess_num}/{total_sess} завершена: {done_actions}/{len(actions)} действий ═══")
                 await _safe_log(db,
-                    task_id=None, account_id=acc.id,
+                    task_id=log_task_id, account_id=acc.id,
                     action="session_end",
                     detail=f"Сессия завершена: {done_actions} действий (план день {plan.day_number})",
                     success=True, created_at=datetime.utcnow(),
                     source=plan_source, campaign_id=plan_campaign_id,
                 )
 
-                # Обновляем счётчики WarmupTask ТОЛЬКО если это прогрев
+                # Обновляем счётчики/состояние WarmupTask ТОЛЬКО если это прогрев
                 if plan.warmup_task_id and plan_source == 'warmup':
                     wt = (await db.execute(
                         select(WarmupTask).where(WarmupTask.id == plan.warmup_task_id)
                     )).scalar_one_or_none()
                     if wt:
+                        now_utc = datetime.utcnow()
+                        # Новый день плана → сбрасываем today-счётчики
+                        if (wt.day or 0) != plan.day_number:
+                            wt.day = plan.day_number
+                            wt.day_started_at = now_utc
+                            wt.today_actions = 0
+                            wt.joined_today = 0
+
                         wt.actions_done = (wt.actions_done or 0) + done_actions
                         wt.today_actions = (wt.today_actions or 0) + done_actions
-                        logger.info(f"[plan][{phone}] ✅ Обновлён WarmupTask #{wt.id}: +{done_actions} действий (всего {wt.actions_done})")
+                        # today_limit = сколько действий запланировано на сегодня (для прогресс-бара)
+                        wt.today_limit = sum(len(s.get("actions", [])) for s in sessions) or wt.today_limit
+
+                        # next_action_at = время следующей невыполненной сессии (для карточки)
+                        next_idx = plan.executed_idx + 1
+                        if next_idx < len(sessions):
+                            ns = sessions[next_idx]
+                            local_now = now_utc + timedelta(hours=3)  # UTC+3
+                            cand = local_now.replace(
+                                hour=ns.get("connect_at_hour", local_now.hour),
+                                minute=ns.get("connect_at_minute", 0),
+                                second=0, microsecond=0,
+                            )
+                            wt.next_action_at = cand - timedelta(hours=3)  # обратно в UTC
+                        else:
+                            # сессии дня кончились — следующая активность завтра
+                            wt.next_action_at = now_utc + timedelta(hours=random.randint(8, 14))
+
+                        # Прогрев завершён? (последний день + все сессии)
+                        if (plan.executed_idx + 1) >= len(sessions) and plan.day_number >= (wt.total_days or 7):
+                            wt.status = "finished"
+                            wt.finished_at = now_utc
+
+                        logger.info(f"[plan][{phone}] ✅ WarmupTask #{wt.id}: день {wt.day}, +{done_actions} (сегодня {wt.today_actions}/{wt.today_limit}, всего {wt.actions_done})")
                 elif plan.campaign_id and plan_source == 'commenting':
                     logger.info(f"[plan][{phone}] 📝 Commenting сессия — WarmupTask НЕ трогаем (actions: {done_actions})")
 

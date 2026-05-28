@@ -103,16 +103,19 @@ def _task_to_dict(t: WarmupTask, logs_count: int = 0) -> dict:
 
 
 async def _activate_warmup_task(t: WarmupTask, db: AsyncSession) -> int:
-    """Переводит задачу прогрева в running. Возвращает start_offset_min.
+    """Переводит задачу прогрева в running + генерирует CampaignPlan на все дни.
 
-    ВАЖНО: НЕ генерирует CampaignPlan! Прогрев исполняется родным движком
-    warmup_v2 (динамические сессии, drip-подписка). Раньше тут создавался
-    CampaignPlan, который ПАРАЛЛЕЛЬНО подхватывал plan_executor → двойное
-    выполнение и рассинхрон с UI. Теперь чистим старые warmup-планы (если
-    остались с прошлой логики) и НЕ создаём новые.
+    Прогрев теперь исполняется ЕДИНЫМ движком plan_executor (как комментинг),
+    поэтому план генерируется заранее и точно исполняется. drip-подписки
+    на target_channels распределяются по дням как действия 'warmup_subscribe'
+    (видны в плане, не сразу — по дням). Родной warmup_v2-движок отключён.
     """
+    from tasks.plan_generator import generate_daily_plan
+    from tasks.behavior_engine import assign_personality
     from models.campaign_plan import CampaignPlan
+    from models.account import TelegramAccount
     from sqlalchemy import delete as sa_delete
+    from datetime import date
 
     now = datetime.utcnow()
     t.status = "running"
@@ -127,14 +130,72 @@ async def _activate_warmup_task(t: WarmupTask, db: AsyncSession) -> int:
     t.reactions_set = 0
     t.channels_joined = 0
 
-    day_mult = {"careful": 0.6, "normal": 1.0, "aggressive": 1.4}.get(t.mode, 1.0)
-    t.today_limit = max(3, int(random.randint(25, 50) * 0.4 * day_mult))
-
     offset = getattr(t, 'start_offset_min', 0) or 0
     t.next_action_at = now + timedelta(minutes=offset)
 
-    # Чистим осиротевшие warmup-CampaignPlan (наследие старой двойной логики)
+    acc = (await db.execute(
+        select(TelegramAccount).where(TelegramAccount.id == t.account_id)
+    )).scalar_one_or_none()
+
+    # Чистим старые планы этой задачи
     await db.execute(sa_delete(CampaignPlan).where(CampaignPlan.warmup_task_id == t.id))
+    await db.flush()
+
+    total_days = getattr(t, 'total_days', 7) or 7
+    personality = assign_personality(str(t.account_id))
+
+    # ── Распределяем target_channels по дням (drip) ──
+    # Каждый канал → случайный день (с capacity daily_join_max). Подписки
+    # начинаются НЕ с 1-го дня в основном — спред по прогреву.
+    targets = [c.lstrip('@').strip() for c in (t.target_channels or []) if c.strip()]
+    random.shuffle(targets)
+    daily_max = max(0, t.daily_join_max or 0)
+    day_subs = {d: [] for d in range(1, total_days + 1)}
+    if daily_max > 0:
+        for ch in targets:
+            days_order = list(range(1, total_days + 1))
+            random.shuffle(days_order)
+            for d in days_order:
+                if len(day_subs[d]) < daily_max:
+                    day_subs[d].append(ch)
+                    break
+
+    today_limit_set = False
+    for day_num in range(1, total_days + 1):
+        plan_date = date.today() + timedelta(days=day_num - 1)
+        plan = generate_daily_plan(
+            account_id=t.account_id,
+            phone=acc.phone if acc else str(t.account_id),
+            campaign_channels=[], campaign_id=0,
+            day_number=day_num, comments_today=0, personality=personality,
+        )
+
+        # Вставляем warmup_subscribe действия в сессии этого дня
+        subs_today = day_subs.get(day_num, [])
+        if subs_today:
+            sessions = [s for s in plan.get("sessions", []) if not s.get("skipped") and s.get("actions")]
+            for i, ch in enumerate(subs_today):
+                if sessions:
+                    sess = sessions[i % len(sessions)]
+                    pos = random.randint(0, len(sess["actions"]))
+                    sess["actions"].insert(pos, {
+                        "type": "warmup_subscribe",
+                        "channel": ch,
+                        "pause_after": random.randint(30, 120),
+                    })
+
+        # today_limit для карточки = действия 1-го дня
+        if not today_limit_set:
+            t.today_limit = sum(len(s.get("actions", [])) for s in plan.get("sessions", [])) or 5
+            today_limit_set = True
+
+        db.add(CampaignPlan(
+            campaign_id=None, warmup_task_id=t.id,
+            account_id=t.account_id, plan_date=plan_date,
+            day_number=day_num, plan=plan,
+            total_comments=0, executed_idx=0, status="active",
+        ))
+
     await db.flush()
     return offset
 
@@ -342,92 +403,86 @@ async def get_warmup_plan(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Мониторинг прогрева: РЕАЛЬНАЯ активность по дням из логов.
+    """План прогрева по дням: что запланировано, что выполнено, что предстоит.
 
-    ВАЖНО: прогрев исполняется родным движком warmup_v2 ДИНАМИЧЕСКИ (сессии
-    и действия решаются в рантайме), поэтому статичного «плана» нет —
-    показываем что аккаунт РЕАЛЬНО сделал (из WarmupLog) + drip-подписки.
+    Прогрев исполняется тем же plan_executor что и комментинг, по этому самому
+    CampaignPlan. Поэтому план ТОЧНО совпадает с выполнением:
+      - session.done   = сессия уже выполнена (executed_idx)
+      - session.is_next = следующая к выполнению
+      - иначе          = ещё впереди
     """
+    from models.campaign_plan import CampaignPlan
+    from datetime import date
+
     t = (await db.execute(
         select(WarmupTask).where(WarmupTask.id == task_id, WarmupTask.user_id == current_user.id)
     )).scalar_one_or_none()
     if not t:
         raise HTTPException(status_code=404, detail="Задача не найдена")
 
-    # ── Загружаем реальные логи активности ──
-    logs = (await db.execute(
-        select(WarmupLog)
-        .where(WarmupLog.task_id == task_id)
-        .order_by(WarmupLog.created_at.asc())
+    plans = (await db.execute(
+        select(CampaignPlan)
+        .where(CampaignPlan.warmup_task_id == task_id)
+        .order_by(CampaignPlan.day_number.asc())
     )).scalars().all()
 
     ACTION_RU = {
         "read_feed": "📖 Чтение", "set_reaction": "😍 Реакция", "view_stories": "👁 Stories",
         "view_profile": "👤 Профиль", "search": "🔍 Поиск", "send_saved": "💬 Saved",
         "forward_saved": "💾 Пересылка", "reply_dm": "↩️ ЛС", "typing": "⌨️ Печатает",
-        "join_channel": "🎭 Decoy-подписка", "drip_subscribe": "📢 Drip-подписка",
-        "session_start": "▶ Старт сессии", "session_end": "⏹ Конец сессии",
-        "new_day": "📅 Новый день", "rest_day": "😴 День отдыха",
-        "finished": "✅ Завершён", "error": "❌ Ошибка",
+        "join_channel": "🎭 Decoy", "warmup_subscribe": "📢 Подписка", "idle": "⏸ Пауза",
     }
-    # Маркеры — не считаем их как «действия»
-    MARKERS = {"session_start", "session_end", "new_day", "rest_day", "finished"}
 
-    # ── Подписки drip: группируем по дате таймстампа ──
+    today = date.today()
     subscribed = t.subscribed_channels or {}
     targets = t.target_channels or []
-    from collections import defaultdict, OrderedDict
-    subs_by_date = defaultdict(list)
-    for ch, ts in subscribed.items():
-        try:
-            subs_by_date[str(ts)[:10]].append(ch)
-        except Exception:
-            pass
-
-    # ── Группируем логи по календарной дате ──
-    by_date = OrderedDict()
-    for lg in logs:
-        d = lg.created_at.date().isoformat() if lg.created_at else "?"
-        by_date.setdefault(d, []).append(lg)
 
     days = []
-    for i, (date_str, day_logs) in enumerate(by_date.items()):
-        counts = {}
-        timeline = []
-        sessions_count = 0
-        for lg in day_logs:
-            act = lg.action
-            if act == "session_start":
-                sessions_count += 1
-            if act not in MARKERS:
-                counts[act] = counts.get(act, 0) + 1
-            timeline.append({
-                "time": lg.created_at.strftime("%H:%M") if lg.created_at else "?",
-                "action": act,
-                "label": ACTION_RU.get(act, act),
-                "detail": (lg.detail or "")[:120],
-                "channel": lg.channel or "",
-                "emoji": lg.emoji or "",
-                "success": lg.success,
+    for p in plans:
+        plan_data = p.plan or {}
+        sess_list = plan_data.get("sessions", [])
+        is_today = (p.plan_date == today)
+        is_past = (p.plan_date < today)
+        sessions_out = []
+        for si, sess in enumerate(sess_list):
+            acts = sess.get("actions", [])
+            counts = {}
+            for a in acts:
+                tp = a.get("type", "?")
+                counts[tp] = counts.get(tp, 0) + 1
+            # done/next/future
+            done = (si < p.executed_idx) or is_past
+            is_next = (not is_past) and is_today and (si == p.executed_idx)
+            sessions_out.append({
+                "session": si + 1,
+                "time": f"{sess.get('connect_at_hour', 0):02d}:{sess.get('connect_at_minute', 0):02d}",
+                "skipped": sess.get("skipped", False),
+                "skip_reason": sess.get("skip_reason"),
+                "done": done,
+                "is_next": is_next,
+                "action_count": len(acts),
+                "actions_summary": [{"label": ACTION_RU.get(k, k), "count": v} for k, v in counts.items()],
             })
-        total_actions = sum(counts.values())
         days.append({
-            "date": date_str,
-            "day_number": i + 1,
-            "sessions_count": sessions_count,
-            "total_actions": total_actions,
-            "actions_summary": [{"label": ACTION_RU.get(k, k), "count": v} for k, v in counts.items()],
-            "subscribed_today": subs_by_date.get(date_str, []),
-            "timeline": timeline,
+            "day_number": p.day_number,
+            "plan_date": p.plan_date.isoformat() if p.plan_date else None,
+            "mood": plan_data.get("mood", "?"),
+            "executed_idx": p.executed_idx,
+            "total_sessions": len(sess_list),
+            "status": p.status,
+            "is_today": is_today,
+            "is_past": is_past,
+            "sessions": sessions_out,
         })
 
-    # ── Общий список подписок: target-каналы со статусом ──
+    # ── Подписки: target-каналы со статусом (подписан/ожидает) ──
     subscriptions = []
     for ch in targets:
-        ts = subscribed.get(ch)
-        subscriptions.append({"channel": ch, "subscribed": ts is not None, "subscribed_at": ts})
+        c = ch.lstrip('@').strip()
+        ts = subscribed.get(c)
+        subscriptions.append({"channel": c, "subscribed": ts is not None, "subscribed_at": ts})
     for ch, ts in subscribed.items():
-        if ch not in targets:
+        if ch not in [x.lstrip('@').strip() for x in targets]:
             subscriptions.append({"channel": ch, "subscribed": True, "subscribed_at": ts})
 
     return {
@@ -440,7 +495,6 @@ async def get_warmup_plan(
         "today_limit": t.today_limit or 0,
         "next_action_at": (t.next_action_at.isoformat() + "Z") if t.next_action_at else None,
         "target_channels": targets,
-        "subscribed_channels": list(subscribed.keys()),
         "subscriptions": subscriptions,
         "subscribed_count": len(subscribed),
         "target_count": len(targets),

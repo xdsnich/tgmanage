@@ -258,7 +258,9 @@ async def check_celery_config():
 async def check_beat_schedule():
     from celery_app import celery_app
     schedule = celery_app.conf.beat_schedule
-    expected = {"dispatch-plans", "dispatch-warmups", "process-ai-dialogs"}
+    # dispatch-warmups убран: warmup теперь исполняется через dispatch-plans
+    # (единый движок plan_executor для commenting И warmup)
+    expected = {"dispatch-plans", "process-ai-dialogs"}
     missing = expected - set(schedule.keys())
     if missing:
         raise RuntimeError(f"в beat_schedule нет: {missing}")
