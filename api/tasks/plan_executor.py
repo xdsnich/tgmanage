@@ -119,20 +119,12 @@ async def _dispatch_plans():
             )
             plans = list(comm_result.scalars().all())
 
-            # ═══ WARMUP планы: только для running задач ═══
-            warmup_result = await db.execute(
-                select(CampaignPlan)
-                .join(WarmupTask, WarmupTask.id == CampaignPlan.warmup_task_id)
-                .where(
-                    CampaignPlan.plan_date == today,
-                    CampaignPlan.status == "active",
-                    CampaignPlan.campaign_id == None,
-                    CampaignPlan.warmup_task_id != None,
-                    WarmupTask.status == "running",
-                )
-            )
-            warmup_plans = list(warmup_result.scalars().all())
-            plans.extend(warmup_plans)
+            # ВАЖНО: WARMUP планы здесь НЕ обрабатываем.
+            # Прогрев исполняется СВОИМ движком (warmup_v2._run_single_warmup),
+            # у него своя логика сессий, drip-подписка, смена дней и логирование.
+            # Раньше plan_executor ТОЖЕ гонял warmup-CampaignPlan → двойное
+            # выполнение, гонка за account_lock, логи с task_id=None, рассинхрон
+            # счётчиков с UI. Теперь plan_executor трогает ТОЛЬКО commenting-планы.
 
             for plan in plans:
                 sessions = plan.plan.get("sessions", [])
@@ -291,6 +283,13 @@ async def _execute_plan_session(plan_id: int):
             if plan.status != "active":
                 logger.info(f"[plan_executor] Plan #{plan_id} status={plan.status} — пропуск")
                 return {"status": "not_active"}
+
+            # WARMUP-планы НЕ исполняем здесь — прогрев гоняет свой движок
+            # (warmup_v2). Защита от двойного выполнения если такой план
+            # каким-то образом попал в очередь plan_executor.
+            if plan.warmup_task_id:
+                logger.info(f"[plan_executor] Plan #{plan_id} — это warmup-план, исполняет warmup_v2, пропуск")
+                return {"status": "warmup_handled_elsewhere"}
 
             # Определяем тип плана: warmup или commenting
             plan_source = 'warmup' if plan.warmup_task_id else 'commenting'

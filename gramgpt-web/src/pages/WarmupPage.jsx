@@ -251,7 +251,7 @@ export default function WarmupPage() {
             </>
           )}
           {t.status === 'paused' && <Button variant="primary" size="sm" onClick={() => handleStart(t.id)}>▶ Продолжить</Button>}
-          <Button variant="ghost" size="sm" onClick={() => openPlan(t)}>📅 План</Button>
+          <Button variant="ghost" size="sm" onClick={() => openPlan(t)}>📊 Активность</Button>
           <Button variant="ghost" size="sm" onClick={() => openLogs(t)}>📋 Логи</Button>
           {t.status !== 'running' && <Button variant="ghost" size="sm" onClick={() => handleDelete(t.id)}>✕</Button>}
         </div>
@@ -505,18 +505,24 @@ export default function WarmupPage() {
         </Modal>
       )}
 
-      {/* ══ Plan Modal ══ */}
+      {/* ══ Plan/Activity Modal ══ */}
       {planModal && selectedTask && (
-        <Modal open={true} title={`План прогрева: ${selectedTask.account_name || selectedTask.account_phone}`} onClose={() => setPlanModal(false)} width={640}>
+        <Modal open={true} title={`Активность прогрева: ${selectedTask.account_name || selectedTask.account_phone}`} onClose={() => setPlanModal(false)} width={640}>
           {planLoading ? <Spinner size={24} /> : !planData ? (
             <div style={{ textAlign: 'center', padding: 40, color: 'var(--text-3)', fontSize: 13 }}>
-              План не сгенерирован. Запусти прогрев.
+              Нет данных. Запусти прогрев.
             </div>
           ) : (
             <div style={{ maxHeight: 560, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 12 }}>
               {/* Заголовок-сводка */}
               <div style={{ padding: '12px 14px', background: 'rgba(124,77,255,0.06)', border: '1px solid rgba(124,77,255,0.15)', borderRadius: 10, fontSize: 12, color: 'var(--text-2)', lineHeight: 1.6 }}>
                 День <strong>{planData.current_day}/{planData.total_days}</strong> · статус {planData.status}
+                {' '}· сегодня действий {planData.today_actions}/{planData.today_limit}
+                {planData.next_action_at && (
+                  <div style={{ marginTop: 4 }}>
+                    ⏰ Следующая сессия: {new Date(planData.next_action_at).toLocaleString('ru', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })}
+                  </div>
+                )}
                 {planData.target_count > 0 && (
                   <div style={{ marginTop: 6 }}>
                     📢 Drip-каналы: <strong style={{ color: 'var(--violet)' }}>{planData.subscribed_count}/{planData.target_count}</strong> подписано
@@ -553,21 +559,25 @@ export default function WarmupPage() {
                 </div>
               )}
 
-              {/* Дни */}
-              {planData.days.map(day => {
-                const isToday = day.day_number === planData.current_day
+              {/* Активность по дням (из реальных логов) */}
+              {planData.days.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: 24, color: 'var(--text-3)', fontSize: 12 }}>
+                  Пока нет активности. Первая сессия ещё не прошла.
+                </div>
+              ) : planData.days.map(day => {
+                const isToday = day.date === new Date().toISOString().slice(0, 10)
                 return (
-                  <div key={day.day_number} style={{
+                  <div key={day.date} style={{
                     background: 'var(--bg-2)', border: `1px solid ${isToday ? 'rgba(61,214,140,0.4)' : 'var(--border)'}`,
                     borderRadius: 10, padding: '12px 14px',
                   }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
                       <div style={{ fontSize: 13, fontWeight: 700 }}>
-                        День {day.day_number}
+                        День {day.day_number} <span style={{ fontWeight: 400, color: 'var(--text-3)', fontSize: 11 }}>· {day.date}</span>
                         {isToday && <span style={{ marginLeft: 8, fontSize: 10, color: 'var(--green)', fontWeight: 600 }}>● СЕГОДНЯ</span>}
                       </div>
                       <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
-                        {day.mood === 'rest' ? '😴 отдых' : `${day.mood} · ${day.total_sessions} сессий · выполнено ${day.executed_idx}/${day.total_sessions}`}
+                        {day.sessions_count} сессий · {day.total_actions} действий
                       </div>
                     </div>
                     {/* Подписки этого дня */}
@@ -576,31 +586,29 @@ export default function WarmupPage() {
                         📢 Подписался: {day.subscribed_today.map(c => `@${c}`).join(', ')}
                       </div>
                     )}
-                    {day.sessions.length === 0 ? (
-                      <div style={{ fontSize: 11, color: 'var(--text-3)' }}>День отдыха — без активности</div>
-                    ) : (
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                        {day.sessions.map(s => (
-                          <div key={s.session} style={{
-                            display: 'flex', alignItems: 'center', gap: 10, padding: '6px 10px',
-                            background: 'var(--bg-3)', borderRadius: 6,
-                            opacity: s.skipped ? 0.5 : (day.executed_idx >= s.session ? 0.6 : 1),
-                          }}>
-                            <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--blue)', minWidth: 42 }}>{s.time}</span>
-                            {day.executed_idx >= s.session && !s.skipped && <span style={{ fontSize: 11, color: 'var(--green)' }}>✓</span>}
-                            {s.skipped ? (
-                              <span style={{ fontSize: 11, color: 'var(--text-3)' }}>⏭ пропуск: {s.skip_reason}</span>
-                            ) : (
-                              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', fontSize: 11, color: 'var(--text-2)' }}>
-                                {s.actions_summary.map((a, i) => (
-                                  <span key={i}>{a.label}{a.count > 1 ? ` ×${a.count}` : ''}</span>
-                                ))}
-                              </div>
-                            )}
-                          </div>
+                    {/* Сводка действий чипами */}
+                    {day.actions_summary.length > 0 && (
+                      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
+                        {day.actions_summary.map((a, i) => (
+                          <span key={i} style={{ fontSize: 11, padding: '3px 8px', borderRadius: 6, background: 'var(--bg-3)', color: 'var(--text-2)' }}>
+                            {a.label}{a.count > 1 ? ` ×${a.count}` : ''}
+                          </span>
                         ))}
                       </div>
                     )}
+                    {/* Таймлайн действий */}
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                      {day.timeline.map((ev, i) => (
+                        <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 11, padding: '3px 6px', borderRadius: 4, opacity: ev.success ? 1 : 0.7 }}>
+                          <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--blue)', minWidth: 38 }}>{ev.time}</span>
+                          <span style={{ color: ev.success ? 'var(--text-2)' : 'var(--red)' }}>
+                            {ev.success ? '' : '❌ '}{ev.label}
+                            {ev.channel && <span style={{ color: 'var(--violet)' }}> @{ev.channel}</span>}
+                            {ev.emoji && <span> {ev.emoji}</span>}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 )
               })}
