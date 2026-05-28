@@ -1074,17 +1074,46 @@ async def _execute_plan_session(plan_id: int):
                                         break
 
                             elif action_type == "join_channel":
-                                # Устаревший тип: вступление в случайный популярный канал (прогрев)
+                                # DECOY-подписка: случайный популярный канал, в который
+                                # НЕ комментируем. Чистый шум. НЕ создаёт CampaignChannelAssignment,
+                                # поэтому smart_comment guard сюда коммент не пустит.
                                 try:
                                     from telethon.tl.functions.channels import JoinChannelRequest
-                                    popular = ["telegram", "durov", "techcrunch", "bbcnews", "reddit",
-                                               "cryptonews", "nytimes", "theverge", "mashable", "wired",
-                                               "sciencedaily", "nationalgeographic", "historyfacts"]
-                                    ch = random.choice(popular)
-                                    await client(JoinChannelRequest(ch))
-                                    logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 📢 Подписался на @{ch}")
+                                    from telethon.errors import (
+                                        UserAlreadyParticipantError, FloodWaitError,
+                                        ChannelsTooMuchError, ChannelPrivateError,
+                                    )
+                                    # Широкий пул нейтральных каналов — чтобы разные аккаунты
+                                    # не лезли в одни и те же 10 каналов (это тоже паттерн).
+                                    DECOY_POOL = [
+                                        "telegram", "durov", "techcrunch", "bbcnews", "reddit",
+                                        "nytimes", "theverge", "mashable", "wired", "engadget",
+                                        "sciencedaily", "nationalgeographic", "historyfacts",
+                                        "TheEconomist", "Forbes", "business", "Bloomberg", "Reuters",
+                                        "espn", "NBASphere", "footballtweet", "goal",
+                                        "netflix", "PrimeVideo", "Spotify", "YouTube",
+                                        "ProductHunt", "github", "hackernewsbot", "javascript_nuggets",
+                                        "designer_news", "uxdesignweekly", "photography",
+                                        "traveltips", "natgeotravel", "cookingdoc", "foodporn",
+                                        "MarvelStudios", "DCComics", "GameSpot", "IGN", "steam",
+                                        "cryptonews", "CoinDesk", "cointelegraph", "binance",
+                                    ]
+                                    ch = random.choice(DECOY_POOL)
+                                    is_decoy = action.get("decoy", False)
+                                    try:
+                                        await client(JoinChannelRequest(ch))
+                                    except UserAlreadyParticipantError:
+                                        pass  # уже подписан — норм
+                                    except (ChannelsTooMuchError, ChannelPrivateError):
+                                        raise
+                                    except FloodWaitError as fe:
+                                        logger.warning(f"[plan][{phone}] decoy join FloodWait {fe.seconds}с")
+                                        await asyncio.sleep(fe.seconds + random.randint(5, 15))
+                                        raise
+                                    label = "🎭 Decoy-подписка" if is_decoy else "📢 Подписался"
+                                    logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] {label} на @{ch}")
                                     await _safe_log(db, task_id=None, account_id=acc.id, action="join_channel",
-                                                     detail=f"Подписался на @{ch}",
+                                                     detail=f"{label} на @{ch} (не комментим)",
                                                      channel=ch, success=True,
                                                      source=plan_source, campaign_id=plan_campaign_id)
                                     done_actions += 1

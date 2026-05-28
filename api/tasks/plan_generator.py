@@ -141,6 +141,7 @@ def generate_daily_plan(
     timing=None, style=None,
     channels_to_join=None,            # каналы для вступления СЕГОДНЯ (1–2)
     commentable_from_prev_days=None,  # каналы, в которых уже можно комментировать
+    decoy_per_day=1,                  # макс. decoy-подписок в день (популярные каналы, БЕЗ комментов)
 ):
     """
     Генерирует УНИКАЛЬНЫЙ план дня для одного аккаунта.
@@ -150,6 +151,12 @@ def generate_daily_plan(
     - Commentable для session[i] = commentable_from_prev_days + каналы, вступление
       в которые произошло в session[0..i-1] ЭТОГО же дня.
     - smart_comment ставится ТОЛЬКО в commentable каналах.
+
+    Decoy-подписки:
+    - 0..decoy_per_day подписок в день на СЛУЧАЙНЫЕ популярные каналы.
+    - В эти каналы НИКОГДА не комментируем — чистый шум для Telegram.
+    - Эмулирует реального юзера который подписывается на разное, не только
+      на то где пишет. Ломает паттерн "подписан только туда где комменчу".
     """
 
     if not personality:
@@ -520,6 +527,27 @@ def generate_daily_plan(
             "actions": actions,
             "skipped": False,
         })
+
+    # ── DECOY-подписки: 0..decoy_per_day на популярные каналы ────
+    # Подписываемся на случайные нейтральные каналы, в которые НЕ комментим.
+    # Это шум: реальный юзер подписан не только туда где пишет.
+    # Смещение к 0-1 (не каждый день человек подписывается на новое).
+    if decoy_per_day > 0:
+        decoy_pool = list(range(decoy_per_day + 1))
+        decoy_weights = [55, 32, 13, 7, 4][:len(decoy_pool)]
+        decoy_budget = random.choices(decoy_pool, weights=decoy_weights, k=1)[0]
+
+        if decoy_budget > 0:
+            # Только в непропущенные сессии с действиями, не более 1 decoy на сессию
+            eligible = [s for s in sessions if not s.get("skipped") and s.get("actions")]
+            random.shuffle(eligible)
+            for s in eligible[:decoy_budget]:
+                pos = random.randint(0, len(s["actions"]))
+                s["actions"].insert(pos, {
+                    "type": "join_channel",   # executor джойнит случайный популярный канал
+                    "decoy": True,            # пометка: НЕ создаём assignment, НЕ комментим
+                    "pause_after": random.randint(20, 90),
+                })
 
     actual_comments = sum(
         1 for s in sessions
