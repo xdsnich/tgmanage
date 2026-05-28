@@ -325,7 +325,9 @@ async def _do_read_feed(client, phone):
 
 async def _do_reaction(client, phone):
     from telethon.tl.functions.messages import SendReactionRequest
+    from telethon.tl.functions.channels import GetFullChannelRequest
     from telethon.tl.types import ReactionEmoji
+    from telethon.errors import ReactionInvalidError
 
     dialogs = await client.get_dialogs(limit=20)
     channels = [d for d in dialogs if d.is_channel and not d.is_group]
@@ -344,20 +346,48 @@ async def _do_reaction(client, phone):
     if not messages:
         return "Нет постов", ch.name or ""
 
-    msg = random.choice(messages)
-    emoji = random.choice(REACTION_EMOJIS)
-
+    # ── Вытаскиваем РАЗРЕШЁННЫЕ реакции канала ──
+    # Слать случайный эмодзи без проверки = ReactionInvalidError = риск бана.
+    # ChatReactionsSome → только из whitelist; All/legacy → стандартные;
+    # None → реакции запрещены, не трогаем.
+    allowed = []
     try:
-        await client(SendReactionRequest(
-            peer=ch.entity,
-            msg_id=msg.id,
-            reaction=[ReactionEmoji(emoticon=emoji)],
-        ))
-        return f"Поставил {emoji} в «{ch.name or '?'}»", ch.name or ""
-    except Exception as e:
-        if "REACTION_INVALID" in str(e):
-            return "Реакции отключены", ch.name or ""
-        raise
+        full = await client(GetFullChannelRequest(ch.entity))
+        available = getattr(full.full_chat, 'available_reactions', None)
+        cls = type(available).__name__ if available is not None else "None"
+        if cls == "ChatReactionsSome":
+            for r in getattr(available, 'reactions', []):
+                if hasattr(r, 'emoticon'):
+                    allowed.append(r.emoticon)
+        elif cls == "ChatReactionsNone":
+            return "Реакции отключены в канале", ch.name or ""
+        else:
+            allowed = list(REACTION_EMOJIS)
+    except Exception:
+        allowed = list(REACTION_EMOJIS)
+
+    if not allowed:
+        return "Реакции недоступны", ch.name or ""
+
+    msg = random.choice(messages)
+    # Пробуем до 3 разных эмодзи — если канал отверг один, берём другой
+    candidates = random.sample(allowed, min(3, len(allowed)))
+    for emoji in candidates:
+        try:
+            await client(SendReactionRequest(
+                peer=ch.entity,
+                msg_id=msg.id,
+                reaction=[ReactionEmoji(emoticon=emoji)],
+            ))
+            return f"Поставил {emoji} в «{ch.name or '?'}»", ch.name or ""
+        except ReactionInvalidError:
+            continue  # этот эмодзи не подошёл — пробуем следующий
+        except Exception as e:
+            if "REACTION_INVALID" in str(e):
+                continue
+            raise
+
+    return "Не нашёл подходящую реакцию для канала", ch.name or ""
 
 
 async def _do_view_stories(client, phone):
