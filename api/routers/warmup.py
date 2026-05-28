@@ -32,6 +32,7 @@ class WarmupCreate(BaseModel):
     target_channels: list[str] = []      # 30+ каналов на 7 дней — рандомная подписка по дням
     daily_join_min: int = 0              # Минимум подписок в день
     daily_join_max: int = 3              # Максимум подписок в день
+    auto_start: bool = True              # Запустить сразу после создания (не кликать старт у каждого)
 
 
 class WarmupUpdate(BaseModel):
@@ -99,6 +100,62 @@ def _task_to_dict(t: WarmupTask, logs_count: int = 0) -> dict:
         "daily_join_max": getattr(t, 'daily_join_max', 0) or 0,
         "joined_today": getattr(t, 'joined_today', 0) or 0,
     }
+
+
+async def _activate_warmup_task(t: WarmupTask, db: AsyncSession) -> int:
+    """Переводит задачу в running + генерирует план прогрева (CampaignPlan).
+    Используется и одиночным стартом, и авто-стартом при создании.
+    Возвращает start_offset_min."""
+    from tasks.plan_generator import generate_daily_plan
+    from tasks.behavior_engine import assign_personality
+    from models.campaign_plan import CampaignPlan
+    from models.account import TelegramAccount
+    from sqlalchemy import delete as sa_delete
+    from datetime import date
+
+    now = datetime.utcnow()
+    t.status = "running"
+    t.started_at = now
+    t.day = 1
+    t.day_started_at = now
+    t.today_actions = 0
+    t.joined_today = 0
+    t.actions_done = 0
+    t.feeds_read = 0
+    t.stories_viewed = 0
+    t.reactions_set = 0
+    t.channels_joined = 0
+
+    day_mult = {"careful": 0.6, "normal": 1.0, "aggressive": 1.4}.get(t.mode, 1.0)
+    t.today_limit = max(3, int(random.randint(25, 50) * 0.4 * day_mult))
+
+    offset = getattr(t, 'start_offset_min', 0) or 0
+    t.next_action_at = now + timedelta(minutes=offset)
+    await db.flush()
+
+    acc = (await db.execute(
+        select(TelegramAccount).where(TelegramAccount.id == t.account_id)
+    )).scalar_one_or_none()
+    await db.execute(sa_delete(CampaignPlan).where(CampaignPlan.warmup_task_id == t.id))
+
+    total_days = getattr(t, 'total_days', 7) or 7
+    personality = assign_personality(str(t.account_id))
+    for day_num in range(1, total_days + 1):
+        plan_date = date.today() + timedelta(days=day_num - 1)
+        plan = generate_daily_plan(
+            account_id=t.account_id,
+            phone=acc.phone if acc else str(t.account_id),
+            campaign_channels=[], campaign_id=0,
+            day_number=day_num, comments_today=0, personality=personality,
+        )
+        db.add(CampaignPlan(
+            campaign_id=None, warmup_task_id=t.id,
+            account_id=t.account_id, plan_date=plan_date,
+            day_number=day_num, plan=plan,
+            total_comments=0, executed_idx=0, status="active",
+        ))
+    await db.flush()
+    return offset
 
 
 # ── Endpoints ────────────────────────────────────────────────
@@ -205,6 +262,11 @@ async def create_warmup_tasks(
         )
         db.add(t)
         await db.flush()
+
+        # Авто-старт: сразу запускаем + генерируем план (не нужно кликать старт у каждого)
+        if body.auto_start:
+            await _activate_warmup_task(t, db)
+
         created.append({
             "id": t.id,
             "account_id": acc_id,
@@ -212,12 +274,14 @@ async def create_warmup_tasks(
             "start_offset_min": offset,
         })
 
+    started_note = " и запущено" if body.auto_start else ""
     return {
         "created": len(created),
         "skipped": len(skipped),
         "tasks": created,
         "skipped_details": skipped,
-        "message": f"Создано {len(created)} задач. Пропущено: {len(skipped)}",
+        "auto_started": body.auto_start,
+        "message": f"Создано{started_note} {len(created)} задач. Пропущено: {len(skipped)}",
     }
 
 
@@ -291,6 +355,77 @@ async def get_batch_subscribed_channels(
     }
 
 
+@router.get("/tasks/{task_id}/plan")
+async def get_warmup_plan(
+    task_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Возвращает сгенерированный план прогрева по дням — что аккаунт будет делать.
+    Для мониторинга (как план в комментинге)."""
+    from models.campaign_plan import CampaignPlan
+
+    t = (await db.execute(
+        select(WarmupTask).where(WarmupTask.id == task_id, WarmupTask.user_id == current_user.id)
+    )).scalar_one_or_none()
+    if not t:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+
+    plans = (await db.execute(
+        select(CampaignPlan)
+        .where(CampaignPlan.warmup_task_id == task_id)
+        .order_by(CampaignPlan.day_number.asc())
+    )).scalars().all()
+
+    # Считаем сводку по типам действий
+    ACTION_RU = {
+        "read_feed": "📖 Чтение", "set_reaction": "😍 Реакция", "view_stories": "👁 Stories",
+        "view_profile": "👤 Профиль", "search": "🔍 Поиск", "send_saved": "💬 Saved",
+        "forward_saved": "💾 Пересылка", "reply_dm": "↩️ ЛС", "typing": "⌨️ Печатает",
+        "join_channel": "🎭 Decoy-подписка", "join_target_channel": "📢 Вступление",
+        "smart_comment": "💬 Коммент", "idle": "⏸ Пауза",
+    }
+
+    days = []
+    for p in plans:
+        sessions_out = []
+        plan_data = p.plan or {}
+        for si, sess in enumerate(plan_data.get("sessions", [])):
+            acts = sess.get("actions", [])
+            counts = {}
+            for a in acts:
+                tp = a.get("type", "?")
+                counts[tp] = counts.get(tp, 0) + 1
+            sessions_out.append({
+                "session": si + 1,
+                "time": f"{sess.get('connect_at_hour', 0):02d}:{sess.get('connect_at_minute', 0):02d}",
+                "skipped": sess.get("skipped", False),
+                "skip_reason": sess.get("skip_reason"),
+                "action_count": len(acts),
+                "actions_summary": [{"label": ACTION_RU.get(k, k), "count": v} for k, v in counts.items()],
+            })
+        days.append({
+            "day_number": p.day_number,
+            "plan_date": p.plan_date.isoformat() if p.plan_date else None,
+            "mood": plan_data.get("mood", "?"),
+            "executed_idx": p.executed_idx,
+            "total_sessions": len(plan_data.get("sessions", [])),
+            "status": p.status,
+            "sessions": sessions_out,
+        })
+
+    return {
+        "task_id": task_id,
+        "account_id": t.account_id,
+        "status": t.status,
+        "current_day": t.day,
+        "total_days": t.total_days,
+        "target_channels": t.target_channels or [],
+        "subscribed_channels": list((t.subscribed_channels or {}).keys()),
+        "days": days,
+    }
+
+
 @router.post("/tasks/{task_id}/start")
 async def start_warmup(
     task_id: int,
@@ -304,62 +439,7 @@ async def start_warmup(
     if not t:
         raise HTTPException(status_code=404, detail="Задача не найдена")
 
-    now = datetime.utcnow()
-    t.status = "running"
-    t.started_at = now
-    t.day = 1
-    t.day_started_at = now
-    t.today_actions = 0
-    # Сброс общих счётчиков чтобы не мешались со старыми
-    t.actions_done = 0
-    t.feeds_read = 0
-    t.stories_viewed = 0
-    t.reactions_set = 0
-    t.channels_joined = 0
-
-    # Случайный лимит для первого дня
-    day_mult = {"careful": 0.6, "normal": 1.0, "aggressive": 1.4}.get(t.mode, 1.0)
-    t.today_limit = int(random.randint(25, 50) * 0.4 * day_mult)
-
-    # Offset — первое действие не сразу
-    offset = getattr(t, 'start_offset_min', 0) or 0
-    t.next_action_at = now + timedelta(minutes=offset)
-
-    await db.flush()
-
-    # Генерируем план прогрева
-    from tasks.plan_generator import generate_daily_plan
-    from tasks.behavior_engine import assign_personality
-    from models.campaign_plan import CampaignPlan
-    from models.account import TelegramAccount
-    from sqlalchemy import delete as sa_delete
-    from datetime import date
-
-    acc = (await db.execute(select(TelegramAccount).where(TelegramAccount.id == t.account_id))).scalar_one_or_none()
-    await db.execute(sa_delete(CampaignPlan).where(CampaignPlan.warmup_task_id == t.id))
-
-    total_days = getattr(t, 'total_days', 7) or 7
-    personality = assign_personality(str(t.account_id))
-
-    for day_num in range(1, total_days + 1):
-        plan_date = date.today() + timedelta(days=day_num - 1)
-        plan = generate_daily_plan(
-            account_id=t.account_id,
-            phone=acc.phone if acc else str(t.account_id),
-            campaign_channels=[],
-            campaign_id=0,
-            day_number=day_num,
-            comments_today=0,
-            personality=personality,
-        )
-        db.add(CampaignPlan(
-            campaign_id=None, warmup_task_id=t.id,
-            account_id=t.account_id, plan_date=plan_date,
-            day_number=day_num, plan=plan,
-            total_comments=0, executed_idx=0, status="active",
-        ))
-
-    await db.flush()
+    offset = await _activate_warmup_task(t, db)
     return {"success": True, "status": "running", "start_offset_min": offset,
             "message": f"Прогрев запущен. Первое действие через {offset} мин."}
 

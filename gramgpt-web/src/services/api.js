@@ -397,6 +397,7 @@ export const warmupAPI = {
   pause: (id) => api.post(`/warmup/tasks/${id}/pause`),
   subscribedChannels: (id) => api.get(`/warmup/tasks/${id}/subscribed-channels`),
   batchSubscribedChannels: (batchId) => api.get(`/warmup/batches/${batchId}/subscribed-channels`),
+  plan: (id) => api.get(`/warmup/tasks/${id}/plan`),
 }
 
 export const subscribeAPI = {
