@@ -386,6 +386,17 @@ async def get_warmup_plan(
         "smart_comment": "💬 Коммент", "idle": "⏸ Пауза",
     }
 
+    # ── Подписки drip: группируем по дате таймстампа ──
+    subscribed = t.subscribed_channels or {}   # {channel: ISO timestamp}
+    targets = t.target_channels or []
+    from collections import defaultdict
+    subs_by_date = defaultdict(list)           # "YYYY-MM-DD" → [channels]
+    for ch, ts in subscribed.items():
+        try:
+            subs_by_date[str(ts)[:10]].append(ch)
+        except Exception:
+            pass
+
     days = []
     for p in plans:
         sessions_out = []
@@ -404,15 +415,28 @@ async def get_warmup_plan(
                 "action_count": len(acts),
                 "actions_summary": [{"label": ACTION_RU.get(k, k), "count": v} for k, v in counts.items()],
             })
+        plan_date_iso = p.plan_date.isoformat() if p.plan_date else None
         days.append({
             "day_number": p.day_number,
-            "plan_date": p.plan_date.isoformat() if p.plan_date else None,
+            "plan_date": plan_date_iso,
             "mood": plan_data.get("mood", "?"),
             "executed_idx": p.executed_idx,
             "total_sessions": len(plan_data.get("sessions", [])),
             "status": p.status,
             "sessions": sessions_out,
+            # Каналы на которые реально подписались в этот календарный день
+            "subscribed_today": subs_by_date.get(plan_date_iso, []) if plan_date_iso else [],
         })
+
+    # ── Общий список подписок: target-каналы со статусом ──
+    subscriptions = []
+    for ch in targets:
+        ts = subscribed.get(ch)
+        subscriptions.append({"channel": ch, "subscribed": ts is not None, "subscribed_at": ts})
+    # Подписки которых нет в targets (например ручные) — тоже показываем
+    for ch, ts in subscribed.items():
+        if ch not in targets:
+            subscriptions.append({"channel": ch, "subscribed": True, "subscribed_at": ts})
 
     return {
         "task_id": task_id,
@@ -420,8 +444,12 @@ async def get_warmup_plan(
         "status": t.status,
         "current_day": t.day,
         "total_days": t.total_days,
-        "target_channels": t.target_channels or [],
-        "subscribed_channels": list((t.subscribed_channels or {}).keys()),
+        "target_channels": targets,
+        "subscribed_channels": list(subscribed.keys()),
+        "subscriptions": subscriptions,              # [{channel, subscribed, subscribed_at}]
+        "subscribed_count": len(subscribed),
+        "target_count": len(targets),
+        "daily_join_max": t.daily_join_max or 0,
         "days": days,
     }
 

@@ -444,12 +444,41 @@ export default function WarmupPage() {
               {/* Заголовок-сводка */}
               <div style={{ padding: '12px 14px', background: 'rgba(124,77,255,0.06)', border: '1px solid rgba(124,77,255,0.15)', borderRadius: 10, fontSize: 12, color: 'var(--text-2)', lineHeight: 1.6 }}>
                 День <strong>{planData.current_day}/{planData.total_days}</strong> · статус {planData.status}
-                {planData.target_channels.length > 0 && (
+                {planData.target_count > 0 && (
                   <div style={{ marginTop: 6 }}>
-                    📢 Drip-каналы: <strong style={{ color: 'var(--violet)' }}>{planData.subscribed_channels.length}/{planData.target_channels.length}</strong> подписано
+                    📢 Drip-каналы: <strong style={{ color: 'var(--violet)' }}>{planData.subscribed_count}/{planData.target_count}</strong> подписано
+                    {' '}· до {planData.daily_join_max}/день
                   </div>
                 )}
               </div>
+
+              {/* Подписки drip — общий трекинг */}
+              {planData.subscriptions && planData.subscriptions.length > 0 && (
+                <div style={{ background: 'var(--bg-2)', border: '1px solid rgba(124,77,255,0.2)', borderRadius: 10, padding: '12px 14px' }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--violet)', marginBottom: 8 }}>
+                    📢 Подписки ({planData.subscribed_count}/{planData.target_count})
+                  </div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                    {planData.subscriptions.map((s, i) => (
+                      <div key={i} title={s.subscribed_at ? new Date(s.subscribed_at + 'Z').toLocaleString('ru') : 'ещё не подписан'}
+                        style={{
+                          fontSize: 11, padding: '4px 10px', borderRadius: 6,
+                          background: s.subscribed ? 'var(--green-dim)' : 'var(--bg-3)',
+                          border: `1px solid ${s.subscribed ? 'rgba(61,214,140,0.3)' : 'var(--border)'}`,
+                          color: s.subscribed ? 'var(--green)' : 'var(--text-3)',
+                          fontFamily: 'var(--font-mono)',
+                        }}>
+                        {s.subscribed ? '✓' : '⏳'} @{s.channel}
+                        {s.subscribed_at && (
+                          <span style={{ opacity: 0.7, marginLeft: 4 }}>
+                            {new Date(s.subscribed_at + 'Z').toLocaleDateString('ru', { day: '2-digit', month: '2-digit' })}
+                          </span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* Дни */}
               {planData.days.map(day => {
@@ -468,6 +497,12 @@ export default function WarmupPage() {
                         {day.mood === 'rest' ? '😴 отдых' : `${day.mood} · ${day.total_sessions} сессий · выполнено ${day.executed_idx}/${day.total_sessions}`}
                       </div>
                     </div>
+                    {/* Подписки этого дня */}
+                    {day.subscribed_today && day.subscribed_today.length > 0 && (
+                      <div style={{ marginBottom: 8, padding: '6px 10px', background: 'var(--green-dim)', border: '1px solid rgba(61,214,140,0.25)', borderRadius: 6, fontSize: 11, color: 'var(--green)' }}>
+                        📢 Подписался: {day.subscribed_today.map(c => `@${c}`).join(', ')}
+                      </div>
+                    )}
                     {day.sessions.length === 0 ? (
                       <div style={{ fontSize: 11, color: 'var(--text-3)' }}>День отдыха — без активности</div>
                     ) : (
