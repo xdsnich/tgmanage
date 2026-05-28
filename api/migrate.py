@@ -16,6 +16,15 @@ import importlib
 import glob
 from datetime import datetime
 
+# Windows-консоль может быть в cp1251 — эмодзи в print() роняют скрипт
+# с UnicodeEncodeError ДО применения миграции. Принудительно ставим utf-8.
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 # sys.path-cleanup: api/ — первым, parent (легаси) — убрать
 _API_DIR    = os.path.dirname(os.path.abspath(__file__))
 _PARENT_DIR = os.path.dirname(_API_DIR)
