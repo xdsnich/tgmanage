@@ -922,10 +922,11 @@ export default function CommentingPage() {
                         const { data: tasks } = await warmupAPI.list()
                         const byBatch = {}
                         for (const t of tasks) {
-                          if (!t.batch_id || (t.subscribed_count || 0) === 0) continue
-                          if (!byBatch[t.batch_id]) byBatch[t.batch_id] = { batch_id: t.batch_id, batch_name: t.batch_name || t.batch_id, accounts: 0, subscribed: 0, statuses: [] }
+                          if (!t.batch_id) continue   // показываем ВСЕ батчи прогрева (даже с 0 подписок)
+                          if (!byBatch[t.batch_id]) byBatch[t.batch_id] = { batch_id: t.batch_id, batch_name: t.batch_name || t.batch_id, accounts: 0, subscribed: 0, target: 0, statuses: [] }
                           byBatch[t.batch_id].accounts += 1
                           byBatch[t.batch_id].subscribed += (t.subscribed_count || 0)
+                          byBatch[t.batch_id].target += (t.target_count || 0)
                           byBatch[t.batch_id].statuses.push(t.status)
                         }
                         setWarmupBatches(Object.values(byBatch))
@@ -1025,20 +1026,25 @@ export default function CommentingPage() {
                 Аккаунты уже подписаны на эти каналы за прогрев. При старте они будут commentable
                 <strong> с 1-го дня</strong> — без вступления и не сразу после подписки. Меньше банов.
               </div>
-              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 {warmupBatches.map(b => {
                   const allDone = b.statuses.every(s => s === 'finished')
+                  const noSubs = b.subscribed === 0
                   return (
-                    <Button key={b.batch_id} variant="outline" size="sm" loading={saving} onClick={async () => {
-                      setSaving(true)
-                      try {
-                        const { data } = await commentingAPI.importFromWarmup(selected.id, b.batch_id)
-                        showToast(data.message || `Импортировано ${data.imported_channels} каналов`)
-                        setChannelModal(false); await load()
-                      } catch (err) { showToast(err.response?.data?.detail || 'Ошибка', 'error') }
-                      setSaving(false)
-                    }}>
-                      {allDone ? '✅' : '▶'} {b.batch_name} · {b.subscribed} подписок / {b.accounts} акк.
+                    <Button key={b.batch_id} variant="outline" size="sm" loading={saving}
+                      disabled={noSubs}
+                      onClick={async () => {
+                        if (noSubs) return
+                        setSaving(true)
+                        try {
+                          const { data } = await commentingAPI.importFromWarmup(selected.id, b.batch_id)
+                          showToast(data.message || `Импортировано ${data.imported_channels} каналов`)
+                          setChannelModal(false); await load()
+                        } catch (err) { showToast(err.response?.data?.detail || 'Ошибка', 'error') }
+                        setSaving(false)
+                      }}>
+                      {noSubs ? '⏳' : allDone ? '✅' : '▶'} {b.batch_name} · {b.subscribed}/{b.target} подписок · {b.accounts} акк.
+                      {noSubs ? ' (ещё не подписались)' : ''}
                     </Button>
                   )
                 })}

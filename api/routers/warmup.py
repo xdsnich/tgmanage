@@ -200,6 +200,39 @@ async def _activate_warmup_task(t: WarmupTask, db: AsyncSession) -> int:
     return offset
 
 
+def _distribute_warmup_channels(channels: list, account_ids: list, overlap: float = 0.25) -> dict:
+    """Распределяет каналы между аккаунтами с небольшим пересечением.
+
+    Зачем: Telegram связывает аккаунты по ОДИНАКОВЫМ подпискам. Если все
+    аккаунты подписаны на одни и те же каналы — это палит ферму. Поэтому
+    каждый канал идёт ОДНОМУ основному аккаунту (round-robin для баланса),
+    и ~overlap доля каналов дублируется ещё на 1 случайный аккаунт (чтобы
+    каналы были покрыты комментами от 1-2 аккаунтов, но наборы оставались
+    разными).
+
+    Пример: 24 канала, 3 аккаунта, overlap=0.25 → ~8 основных на аккаунт
+    + ~2 пересекающихся = ~10/акк, но наборы у всех разные.
+
+    Возвращает {account_id: [channels]}.
+    """
+    result = {a: [] for a in account_ids}
+    if not account_ids or not channels:
+        return result
+    n = len(account_ids)
+    shuffled = list(channels)
+    random.shuffle(shuffled)
+    for i, ch in enumerate(shuffled):
+        primary = account_ids[i % n]
+        result[primary].append(ch)
+        # Небольшое пересечение: иногда канал получает и 2-й аккаунт
+        if n > 1 and random.random() < overlap:
+            others = [a for a in account_ids if a != primary]
+            second = random.choice(others)
+            if ch not in result[second]:
+                result[second].append(ch)
+    return result
+
+
 # ── Endpoints ────────────────────────────────────────────────
 
 @router.get("/tasks")
@@ -238,53 +271,65 @@ async def create_warmup_tasks(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Создать прогрев для нескольких аккаунтов сразу."""
+    """Создать прогрев для нескольких аккаунтов сразу.
+
+    Каналы РАСПРЕДЕЛЯЮТСЯ между аккаунтами (с небольшим пересечением),
+    а НЕ дублируются всем — чтобы Telegram не связал аккаунты по одинаковым
+    подпискам. Каждый аккаунт получает свой набор target_channels.
+    """
     if not body.account_ids:
         raise HTTPException(status_code=400, detail="Выбери хотя бы один аккаунт")
 
-    created = []
-    skipped = []
-    # Генерируем batch_id для группировки
     import secrets
     batch_id = secrets.token_hex(8)
     batch_name = f"Прогрев {len(body.account_ids)} акк. — {datetime.utcnow().strftime('%d.%m %H:%M')}"
 
-    for i, acc_id in enumerate(body.account_ids):
-        # Проверяем аккаунт
-        acc_r = await db.execute(
+    skipped = []
+
+    # ── Шаг 1: валидируем аккаунты (нужно знать valid set до распределения) ──
+    valid = []  # [(acc_id, acc)]
+    for acc_id in body.account_ids:
+        acc = (await db.execute(
             select(TelegramAccount).where(
                 TelegramAccount.id == acc_id,
                 TelegramAccount.user_id == current_user.id,
             )
-        )
-        acc = acc_r.scalar_one_or_none()
+        )).scalar_one_or_none()
         if not acc:
             skipped.append({"id": acc_id, "reason": "Не найден"})
             continue
-
-        # Проверяем нет ли уже активного
-        existing = await db.execute(
+        existing = (await db.execute(
             select(WarmupTask).where(
                 WarmupTask.account_id == acc_id,
                 WarmupTask.status.in_(["idle", "running"]),
             )
-        )
-        if existing.scalar_one_or_none():
+        )).scalar_one_or_none()
+        if existing:
             skipped.append({"id": acc_id, "reason": "Уже есть активный прогрев"})
             continue
+        valid.append((acc_id, acc))
 
-        # Случайный offset старта (0–90 минут)
-        offset = random.randint(0, 90) * i  # Каждый следующий — ещё позже
-        offset = min(offset, 180)  # Максимум 3 часа
+    if not valid:
+        return {"created": 0, "skipped": len(skipped), "tasks": [],
+                "skipped_details": skipped, "message": "Нет аккаунтов для создания"}
 
-        # Чистим target_channels (убираем @, пустые, повторы)
-        clean_targets = []
-        seen = set()
-        for ch in (body.target_channels or []):
-            c = (ch or "").lstrip('@').strip()
-            if c and c.lower() not in seen:
-                clean_targets.append(c)
-                seen.add(c.lower())
+    # ── Шаг 2: чистим каналы + распределяем по валидным аккаунтам ──
+    clean_targets = []
+    seen = set()
+    for ch in (body.target_channels or []):
+        c = (ch or "").lstrip('@').strip()
+        if c and c.lower() not in seen:
+            clean_targets.append(c)
+            seen.add(c.lower())
+
+    valid_ids = [a for a, _ in valid]
+    distribution = _distribute_warmup_channels(clean_targets, valid_ids, overlap=0.25)
+
+    # ── Шаг 3: создаём задачи, каждой — свой набор каналов ──
+    created = []
+    for i, (acc_id, acc) in enumerate(valid):
+        offset = min(random.randint(0, 90) * i, 180)  # разброс старта до 3ч
+        my_channels = distribution.get(acc_id, [])
 
         t = WarmupTask(
             user_id=current_user.id,
@@ -298,14 +343,13 @@ async def create_warmup_tasks(
             join_channels=True,
             batch_id=batch_id,
             batch_name=batch_name,
-            target_channels=clean_targets,
+            target_channels=my_channels,                 # ← СВОЙ набор, не общий
             daily_join_min=max(0, body.daily_join_min),
             daily_join_max=max(body.daily_join_min, body.daily_join_max),
         )
         db.add(t)
         await db.flush()
 
-        # Авто-старт: сразу запускаем + генерируем план (не нужно кликать старт у каждого)
         if body.auto_start:
             await _activate_warmup_task(t, db)
 
@@ -314,16 +358,24 @@ async def create_warmup_tasks(
             "account_id": acc_id,
             "account_name": acc.first_name or acc.phone,
             "start_offset_min": offset,
+            "channels_assigned": len(my_channels),
         })
 
     started_note = " и запущено" if body.auto_start else ""
+    total_unique = len(clean_targets)
     return {
         "created": len(created),
         "skipped": len(skipped),
         "tasks": created,
         "skipped_details": skipped,
         "auto_started": body.auto_start,
-        "message": f"Создано{started_note} {len(created)} задач. Пропущено: {len(skipped)}",
+        "channels_total": total_unique,
+        "message": (
+            f"Создано{started_note} {len(created)} задач. "
+            + (f"{total_unique} каналов распределены по {len(created)} аккаунтам "
+               f"(~{total_unique // max(1, len(created))}/акк с пересечением). " if total_unique else "")
+            + (f"Пропущено: {len(skipped)}." if skipped else "")
+        ),
     }
 
 

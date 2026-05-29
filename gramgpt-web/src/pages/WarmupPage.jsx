@@ -473,12 +473,17 @@ export default function WarmupPage() {
               </div>
               {(() => {
                 const cnt = (form.target_channels || '').split(/[\s,\n]+/).map(c => c.trim()).filter(Boolean).length
+                const nAcc = form.account_ids.length || 1
+                const perAcc = Math.ceil(cnt / nAcc)
                 return cnt > 0 ? (
-                  <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 8 }}>
-                    Указано <strong style={{ color: 'var(--violet)' }}>{cnt}</strong> каналов.
+                  <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 8, lineHeight: 1.6 }}>
+                    <div>
+                      <strong style={{ color: 'var(--violet)' }}>{cnt}</strong> каналов
+                      {nAcc > 1 && <> ÷ <strong>{nAcc}</strong> акк = <strong style={{ color: 'var(--teal)' }}>~{perAcc}/акк</strong> (распределяются, не дублируются — анти-бан)</>}
+                    </div>
                     {form.daily_join_max > 0
-                      ? ` За ${form.total_days} дней аккаунт подпишется на ~${Math.min(cnt, Math.round(form.total_days * form.daily_join_max * 0.4))}–${Math.min(cnt, form.total_days * form.daily_join_max)} из них.`
-                      : ' (подписки выключены — daily_join_max = 0)'}
+                      ? <div>Каждый аккаунт подпишется на свой набор за {form.total_days} дней (до {form.daily_join_max}/день).</div>
+                      : <div style={{ color: 'var(--yellow)' }}>⚠ подписки выключены (макс/день = 0)</div>}
                   </div>
                 ) : null
               })()}
