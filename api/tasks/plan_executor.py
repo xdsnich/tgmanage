@@ -1257,20 +1257,38 @@ async def _execute_plan_session(plan_id: int):
                         # today_limit = сколько действий запланировано на сегодня (для прогресс-бара)
                         wt.today_limit = sum(len(s.get("actions", [])) for s in sessions) or wt.today_limit
 
-                        # next_action_at = время следующей невыполненной сессии (для карточки)
+                        # next_action_at = время следующей невыполненной сессии (для карточки).
+                        # Времена сессий хранятся в локальном UTC+3, next_action_at — в UTC.
+                        from datetime import datetime as _dt, time as _time
                         next_idx = plan.executed_idx + 1
                         if next_idx < len(sessions):
+                            # Ещё есть сессии СЕГОДНЯ
                             ns = sessions[next_idx]
-                            local_now = now_utc + timedelta(hours=3)  # UTC+3
-                            cand = local_now.replace(
-                                hour=ns.get("connect_at_hour", local_now.hour),
+                            local_today = (now_utc + timedelta(hours=3)).date()
+                            local_dt = _dt.combine(local_today, _time(
+                                hour=min(23, ns.get("connect_at_hour", 10)),
                                 minute=ns.get("connect_at_minute", 0),
-                                second=0, microsecond=0,
-                            )
-                            wt.next_action_at = cand - timedelta(hours=3)  # обратно в UTC
+                            ))
+                            wt.next_action_at = local_dt - timedelta(hours=3)  # UTC+3 → UTC
                         else:
-                            # сессии дня кончились — следующая активность завтра
-                            wt.next_action_at = now_utc + timedelta(hours=random.randint(8, 14))
+                            # Сессии сегодня кончились — берём ПЕРВУЮ сессию следующего дня плана
+                            next_plan = (await db.execute(
+                                select(CampaignPlan).where(
+                                    CampaignPlan.warmup_task_id == plan.warmup_task_id,
+                                    CampaignPlan.day_number == plan.day_number + 1,
+                                )
+                            )).scalar_one_or_none()
+                            np_sessions = (next_plan.plan.get("sessions", []) if next_plan else [])
+                            if next_plan and np_sessions:
+                                ns0 = np_sessions[0]
+                                local_dt = _dt.combine(next_plan.plan_date, _time(
+                                    hour=min(23, ns0.get("connect_at_hour", 10)),
+                                    minute=ns0.get("connect_at_minute", 0),
+                                ))
+                                wt.next_action_at = local_dt - timedelta(hours=3)  # UTC+3 → UTC
+                            else:
+                                # следующего дня нет (прогрев заканчивается) — ничего
+                                wt.next_action_at = None
 
                         # Прогрев завершён? (последний день + все сессии)
                         if (plan.executed_idx + 1) >= len(sessions) and plan.day_number >= (wt.total_days or 7):
