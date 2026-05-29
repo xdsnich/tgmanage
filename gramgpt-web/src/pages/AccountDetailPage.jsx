@@ -342,7 +342,7 @@ export default function AccountDetailPage() {
           {/* Actions */}
           <div style={{ display: 'flex', gap: 8 }}>
             <Button variant="outline" size="sm" onClick={() => setEditModal(true)}>Редактировать</Button>
-            <Button variant="ghost" size="sm" onClick={async () => { setAuthStep('idle'); setAuthMsg(''); try { const { data } = await proxiesAPI.list(); setProxies(data) } catch { }; setAuthModal(true) }}>Авторизовать</Button>
+            <Button variant="ghost" size="sm" onClick={async () => { setAuthStep('idle'); setAuthMsg(''); setAuthProxyId(a.proxy_id || null); try { const { data } = await proxiesAPI.list(); setProxies(data) } catch { }; setAuthModal(true) }}>Авторизовать</Button>
           </div>
         </div>
       </Card>

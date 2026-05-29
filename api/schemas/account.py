@@ -12,6 +12,7 @@ from models.account import AccountStatus, AccountRole
 class AccountCreate(BaseModel):
     phone: str
     api_app_id: Optional[int] = None   # какой API ID использовать для авторизации
+    proxy_id: Optional[int] = None     # какой прокси привязать к аккаунту
 
 
 class AccountUpdate(BaseModel):

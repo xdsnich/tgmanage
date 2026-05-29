@@ -28,7 +28,9 @@ export default function AccountsPage() {
   const [editModal, setEditModal] = useState(false)
   const [phone, setPhone] = useState('')
   const [addApiAppId, setAddApiAppId] = useState('')
+  const [addProxyId, setAddProxyId] = useState('')
   const [apiApps, setApiApps] = useState([])
+  const [addProxies, setAddProxies] = useState([])
   const [editData, setEditData] = useState({})
   const [saving, setSaving] = useState(false)
   const navigate = useNavigate()
@@ -89,9 +91,11 @@ export default function AccountsPage() {
   })
 
   const openAddModal = async () => {
-    setPhone(''); setAddApiAppId(''); setAddModal(true)
+    setPhone(''); setAddApiAppId(''); setAddProxyId(''); setAddModal(true)
     try { const { data } = await apiAppsAPI.list(); setApiApps(data || []) }
     catch { setApiApps([]) }
+    try { const { data } = await proxiesAPI.list(); setAddProxies(data || []) }
+    catch { setAddProxies([]) }
   }
 
   const handleAdd = async (e) => {
@@ -100,8 +104,9 @@ export default function AccountsPage() {
       await accountsAPI.create(
         phone.startsWith('+') ? phone : '+' + phone,
         addApiAppId ? parseInt(addApiAppId) : null,
+        addProxyId ? parseInt(addProxyId) : null,
       )
-      setAddModal(false); setPhone(''); setAddApiAppId(''); await load()
+      setAddModal(false); setPhone(''); setAddApiAppId(''); setAddProxyId(''); await load()
     } catch (err) { alert(err.response?.data?.detail || 'Ошибка') }
     setSaving(false)
   }
@@ -376,6 +381,24 @@ export default function AccountsPage() {
             </select>
             <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4 }}>
               Аккаунт будет авторизован через выбранный API ID. Управление ключами — на странице «API ключи».
+            </div>
+          </div>
+
+          <div>
+            <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>
+              Прокси
+            </label>
+            <select value={addProxyId} onChange={e => setAddProxyId(e.target.value)}
+              style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', color: 'var(--text)', fontSize: 14, outline: 'none' }}>
+              <option value="">Без прокси (назначу позже)</option>
+              {addProxies.filter(p => p.is_valid !== false).map(p => (
+                <option key={p.id} value={p.id}>
+                  {p.host}:{p.port} [{p.protocol}]{p.country ? ` · ${p.country}` : ''}{p.is_valid ? ' ✓' : ''}
+                </option>
+              ))}
+            </select>
+            <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4 }}>
+              Прокси привяжется к аккаунту сразу и будет предвыбран при авторизации.
             </div>
           </div>
 

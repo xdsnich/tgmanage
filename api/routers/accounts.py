@@ -212,18 +212,6 @@ async def create_account(data: AccountCreate, current_user: User = Depends(get_c
     if not phone.startswith("+"): phone = "+" + phone
 
     await acc_svc.check_limit(db, current_user)
-    existing = await acc_svc.get_account_by_phone(db, phone, current_user.id)
-    if existing:
-        # если передан api_app_id — проставим его существующему (на случай повторного добавления)
-        if data.api_app_id:
-            app = (await db.execute(
-                select(ApiApp).where(ApiApp.id == data.api_app_id, ApiApp.user_id == current_user.id)
-            )).scalar_one_or_none()
-            if app:
-                existing.api_app_id = app.id
-                await db.flush()
-        return {"account_id": existing.id, "phone": phone, "status": existing.status.value,
-                "already_exists": True, "next_step": "authorize"}
 
     # Валидируем api_app_id (должен принадлежать юзеру)
     api_app_id = None
@@ -235,11 +223,33 @@ async def create_account(data: AccountCreate, current_user: User = Depends(get_c
             raise HTTPException(status_code=400, detail="API приложение не найдено")
         api_app_id = app.id
 
-    account = TelegramAccount(user_id=current_user.id, phone=phone, api_app_id=api_app_id)
+    # Валидируем proxy_id (должен принадлежать юзеру)
+    proxy_id = None
+    if data.proxy_id:
+        proxy = (await db.execute(
+            select(Proxy).where(Proxy.id == data.proxy_id, Proxy.user_id == current_user.id)
+        )).scalar_one_or_none()
+        if not proxy:
+            raise HTTPException(status_code=400, detail="Прокси не найден")
+        proxy_id = proxy.id
+
+    existing = await acc_svc.get_account_by_phone(db, phone, current_user.id)
+    if existing:
+        # повторное добавление — проставим выбранные api_app/proxy если переданы
+        if api_app_id:
+            existing.api_app_id = api_app_id
+        if proxy_id:
+            existing.proxy_id = proxy_id
+        await db.flush()
+        return {"account_id": existing.id, "phone": phone, "status": existing.status.value,
+                "already_exists": True, "next_step": "authorize"}
+
+    account = TelegramAccount(user_id=current_user.id, phone=phone,
+                              api_app_id=api_app_id, proxy_id=proxy_id)
     db.add(account)
     await db.flush()
     return {"account_id": account.id, "phone": phone, "status": "pending_auth",
-            "api_app_id": api_app_id, "next_step": "authorize"}
+            "api_app_id": api_app_id, "proxy_id": proxy_id, "next_step": "authorize"}
 
 @router.patch("/{account_id}", response_model=AccountOut)
 async def update_account(account_id: int, data: AccountUpdate,
