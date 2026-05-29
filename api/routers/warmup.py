@@ -714,6 +714,38 @@ async def delete_warmup(
         await db.flush()
 
 
+@router.delete("/batches/{batch_id}", status_code=200)
+async def delete_warmup_batch(
+    batch_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Удаляет ВЕСЬ батч прогрева (все аккаунты) + их планы и логи."""
+    from sqlalchemy import delete as sa_delete
+    from models.campaign_plan import CampaignPlan
+
+    tasks = (await db.execute(
+        select(WarmupTask).where(
+            WarmupTask.batch_id == batch_id,
+            WarmupTask.user_id == current_user.id,
+        )
+    )).scalars().all()
+
+    if not tasks:
+        raise HTTPException(status_code=404, detail="Batch не найден")
+
+    task_ids = [t.id for t in tasks]
+    # 1. Планы
+    await db.execute(sa_delete(CampaignPlan).where(CampaignPlan.warmup_task_id.in_(task_ids)))
+    # 2. Логи
+    await db.execute(sa_delete(WarmupLog).where(WarmupLog.task_id.in_(task_ids)))
+    # 3. Сами задачи
+    await db.execute(sa_delete(WarmupTask).where(WarmupTask.id.in_(task_ids)))
+    await db.flush()
+
+    return {"deleted": len(task_ids), "message": f"Удалён прогрев ({len(task_ids)} аккаунтов)"}
+
+
 # ── ЛОГИ ─────────────────────────────────────────────────────
 
 @router.get("/tasks/{task_id}/logs")

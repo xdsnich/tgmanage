@@ -391,6 +391,7 @@ export const warmupAPI = {
   startAll: () => api.post('/warmup/tasks/start-all'),
   stop: (id) => api.post(`/warmup/tasks/${id}/stop`),
   delete: (id) => api.delete(`/warmup/tasks/${id}`),
+  deleteBatch: (batchId) => api.delete(`/warmup/batches/${batchId}`),
   taskLogs: (id, limit = 50) => api.get(`/warmup/tasks/${id}/logs`, { params: { limit } }),
   liveLogs: (limit = 30) => api.get('/warmup/logs/live', { params: { limit } }),
   modes: () => api.get('/warmup/modes'),

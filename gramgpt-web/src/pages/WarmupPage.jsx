@@ -61,6 +61,19 @@ export default function WarmupPage() {
     await load()
   }
 
+  const handleDeleteBatch = async (group) => {
+    if (!window.confirm(`Удалить весь прогрев "${group.batch_name}" (${group.tasks.length} акк.) со всеми логами?`)) return
+    try {
+      // batch_id вида single_N — это одиночная задача без батча, удаляем как задачу
+      if (group.batch_id.startsWith('single_')) {
+        for (const t of group.tasks) await warmupAPI.delete(t.id)
+      } else {
+        await warmupAPI.deleteBatch(group.batch_id)
+      }
+      await load()
+    } catch (err) { alert(err.response?.data?.detail || 'Ошибка') }
+  }
+
   const openPlan = async (task) => {
     setSelectedTask(task); setPlanModal(true); setPlanLoading(true); setPlanData(null)
     try { const { data } = await warmupAPI.plan(task.id); setPlanData(data) }
@@ -331,6 +344,7 @@ export default function WarmupPage() {
                         {g.tasks.some(t => t.status === 'paused') && <Button variant="ghost" size="sm" onClick={() => handleBatchAction(g.tasks, 'resume')}>▶ Продолжить всех</Button>}
                         {g.tasks.some(t => t.status === 'idle') && <Button variant="primary" size="sm" onClick={() => handleBatchAction(g.tasks, 'start')}>▶ Старт всех</Button>}
                         {running > 0 && <Button variant="danger" size="sm" onClick={() => { if (window.confirm(`Завершить весь прогрев "${g.batch_name}" (${running} акк.)?`)) handleBatchAction(g.tasks, 'stop') }}>⏹ Стоп всех</Button>}
+                        {running === 0 && <Button variant="ghost" size="sm" onClick={() => handleDeleteBatch(g)} title="Удалить весь прогрев">🗑 Удалить</Button>}
                       </div>
                     </div>
 
