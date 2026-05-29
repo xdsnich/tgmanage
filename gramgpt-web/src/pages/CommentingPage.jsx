@@ -1018,14 +1018,18 @@ export default function CommentingPage() {
       {/* ── Add Channels Modal ─────────────────────────── */}
       <Modal open={channelModal} onClose={() => setChannelModal(false)} title="Добавить каналы" width={520}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-          {/* Импорт из прогрева — pre-joined каналы (anti-ban) */}
-          {warmupBatches.length > 0 && (
-            <div style={{ padding: '14px', background: 'rgba(0,194,178,0.06)', border: '1px solid rgba(0,194,178,0.2)', borderRadius: 10 }}>
+          {/* Импорт из прогрева — pre-joined каналы (anti-ban). Показываем ВСЕГДА. */}
+          <div style={{ padding: '14px', background: 'rgba(0,194,178,0.06)', border: '1px solid rgba(0,194,178,0.2)', borderRadius: 10 }}>
               <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--teal)', marginBottom: 4 }}>🔥 Импорт из прогрева (рекомендуется)</div>
               <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 10, lineHeight: 1.6 }}>
                 Аккаунты уже подписаны на эти каналы за прогрев. При старте они будут commentable
                 <strong> с 1-го дня</strong> — без вступления и не сразу после подписки. Меньше банов.
               </div>
+              {warmupBatches.length === 0 ? (
+                <div style={{ fontSize: 11, color: 'var(--text-3)', fontStyle: 'italic' }}>
+                  Нет прогревов. Создай прогрев с каналами на вкладке «Прогрев» — после подписок они появятся тут.
+                </div>
+              ) : (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                 {warmupBatches.map(b => {
                   const allDone = b.statuses.every(s => s === 'finished')
@@ -1049,8 +1053,8 @@ export default function CommentingPage() {
                   )
                 })}
               </div>
-            </div>
-          )}
+              )}
+          </div>
           <div style={{ padding: '14px', background: 'rgba(124,77,255,0.06)', border: '1px solid rgba(124,77,255,0.15)', borderRadius: 10 }}>
             <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-2)', marginBottom: 8 }}>📁 Добавить из папки</div>
             <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
