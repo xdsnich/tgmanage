@@ -33,11 +33,20 @@ logger = logging.getLogger(__name__)
 
 
 def load_cli_config():
-    config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../config.py"))
-    spec = importlib.util.spec_from_file_location("cli_config_external", config_path)
-    cli_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(cli_module)
-    return cli_module
+    """Конфиг для авторизации: api_id/hash из env (TG_API_ID/TG_API_HASH),
+    sessions dir по пути. Раньше грузил легаси root config.py — он удалён
+    (переименован в config.py.legacy), поэтому больше не читаем файл."""
+    import types
+    cfg = types.SimpleNamespace()
+    try:
+        cfg.API_ID = int(os.getenv("TG_API_ID", "0"))
+    except (ValueError, TypeError):
+        cfg.API_ID = 0
+    cfg.API_HASH = (os.getenv("TG_API_HASH", "") or "").strip()
+    cfg.SESSIONS_DIR = Path(os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "sessions")
+    ))
+    return cfg
 
 
 router = APIRouter(prefix="/tg-auth", tags=["tg-auth"])

@@ -54,8 +54,8 @@ export const accountsAPI = {
   get: (id) =>
     api.get(`/accounts/${id}`),
 
-  create: (phone) =>
-    api.post('/accounts/', { phone }),
+  create: (phone, apiAppId = null) =>
+    api.post('/accounts/', { phone, api_app_id: apiAppId }),
 
   update: (id, data) =>
     api.patch(`/accounts/${id}`, data),

@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { accountsAPI, importAPI, proxiesAPI, channelsAPI, diagnosticsAPI } from '../services/api'
+import { accountsAPI, importAPI, proxiesAPI, channelsAPI, diagnosticsAPI, apiAppsAPI } from '../services/api'
 import { Card, Button, Input, Modal, TrustBar, StatusBadge, Empty, Spinner, Badge } from '../components/ui'
 
 const ROLES = ['default', 'продавец', 'прогреватель', 'читатель', 'консультант']
@@ -27,6 +27,8 @@ export default function AccountsPage() {
   const [addModal, setAddModal] = useState(false)
   const [editModal, setEditModal] = useState(false)
   const [phone, setPhone] = useState('')
+  const [addApiAppId, setAddApiAppId] = useState('')
+  const [apiApps, setApiApps] = useState([])
   const [editData, setEditData] = useState({})
   const [saving, setSaving] = useState(false)
   const navigate = useNavigate()
@@ -86,11 +88,20 @@ export default function AccountsPage() {
     return matchSearch && matchStatus && matchGeo && matchCategory
   })
 
+  const openAddModal = async () => {
+    setPhone(''); setAddApiAppId(''); setAddModal(true)
+    try { const { data } = await apiAppsAPI.list(); setApiApps(data || []) }
+    catch { setApiApps([]) }
+  }
+
   const handleAdd = async (e) => {
     e.preventDefault(); setSaving(true)
     try {
-      await accountsAPI.create(phone.startsWith('+') ? phone : '+' + phone)
-      setAddModal(false); setPhone(''); await load()
+      await accountsAPI.create(
+        phone.startsWith('+') ? phone : '+' + phone,
+        addApiAppId ? parseInt(addApiAppId) : null,
+      )
+      setAddModal(false); setPhone(''); setAddApiAppId(''); await load()
     } catch (err) { alert(err.response?.data?.detail || 'Ошибка') }
     setSaving(false)
   }
@@ -162,7 +173,7 @@ export default function AccountsPage() {
             setDiagAccountId(accounts[0]?.id || null); setDiagChannel(''); setDiagResult(null); setDiagLeaveAfter(false); setDiagModal(true)
           }}>🔍 Тест подписки</Button>
           <Button variant="ghost" onClick={() => { setImportType(null); setImportResult(null); setImportFiles([]); setImportPhone(''); setImportModal(true) }}>📦 Импорт</Button>
-          <Button variant="primary" onClick={() => setAddModal(true)}>+ Добавить</Button>
+          <Button variant="primary" onClick={openAddModal}>+ Добавить</Button>
         </div>
       </div>
 
@@ -262,7 +273,7 @@ export default function AccountsPage() {
       ) : filtered.length === 0 ? (
         <Empty icon="👤" title="Нет аккаунтов"
           subtitle={search || filterStatus !== 'all' ? 'Попробуй изменить фильтры' : 'Добавь первый аккаунт'}
-          action={!search && filterStatus === 'all' && <Button variant="primary" onClick={() => setAddModal(true)}>+ Добавить</Button>} />
+          action={!search && filterStatus === 'all' && <Button variant="primary" onClick={openAddModal}>+ Добавить</Button>} />
       ) : (
         <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', overflow: 'hidden' }}>
           {/* Header row */}
@@ -348,6 +359,26 @@ export default function AccountsPage() {
             Введите номер телефона аккаунта. После добавления используйте авторизацию на странице деталей аккаунта.
           </div>
           <Input label="Номер телефона" value={phone} onChange={e => setPhone(e.target.value)} placeholder="+380..." required autoFocus />
+
+          <div>
+            <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>
+              API ID (приложение)
+            </label>
+            <select value={addApiAppId} onChange={e => setAddApiAppId(e.target.value)}
+              style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', color: 'var(--text)', fontSize: 14, outline: 'none' }}>
+              <option value="">Публичный (Android по умолчанию)</option>
+              {apiApps.map(a => (
+                <option key={a.id} value={a.id}>
+                  {a.title || `API ${a.api_id}`} · id={a.api_id} · {a.platform || 'android'}
+                  {a.is_active === false ? ' (выкл)' : ''}
+                </option>
+              ))}
+            </select>
+            <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4 }}>
+              Аккаунт будет авторизован через выбранный API ID. Управление ключами — на странице «API ключи».
+            </div>
+          </div>
+
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
             <Button variant="ghost" type="button" onClick={() => setAddModal(false)}>Отмена</Button>
             <Button variant="primary" type="submit" loading={saving}>Добавить</Button>
