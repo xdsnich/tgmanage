@@ -238,7 +238,13 @@ async def send_code(
                 json.dumps({"phone_code_hash": sent.phone_code_hash, "phone": phone}))
 
         ctn = type(sent.type).__name__
-        if "App" in ctn: code_type, msg = "app", "Код отправлен в Telegram"
+        nxt = type(sent.next_type).__name__ if getattr(sent, "next_type", None) else None
+        print(f"🔑 ✅ КОД ОТПРАВЛЕН: тип={ctn}"
+              + (f", next={nxt}" if nxt else "")
+              + f" (api_id={api_id_use or 'default(env)'})")
+        if "App" in ctn:
+            code_type = "app"
+            msg = "Код отправлен в приложение Telegram (на другом устройстве), НЕ по SMS"
         elif "Sms" in ctn: code_type, msg = "sms", f"SMS на {phone}"
         else: code_type, msg = "call", f"Код (тип: {ctn})"
         if proxy_dict: msg += " [через прокси]"

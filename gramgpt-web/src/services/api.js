@@ -235,8 +235,8 @@ export const actionsAPI = {
 
 // ── TG AUTH (веб-авторизация Telegram) ───────────────────────
 export const tgAuthAPI = {
-  sendCode: (phone, proxyId = null) =>
-    api.post('/tg-auth/send-code', { phone, proxy_id: proxyId }),
+  sendCode: (phone, proxyId = null, apiAppId = null) =>
+    api.post('/tg-auth/send-code', { phone, proxy_id: proxyId, api_app_id: apiAppId }),
 
   confirm: (phone, code) =>
     api.post('/tg-auth/confirm', { phone, code }),

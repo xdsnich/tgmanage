@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { accountsAPI, securityAPI, channelsAPI, actionsAPI, tgAuthAPI, proxiesAPI } from '../services/api'
+import { accountsAPI, securityAPI, channelsAPI, actionsAPI, tgAuthAPI, proxiesAPI, apiAppsAPI } from '../services/api'
 import { Card, Button, Input, Modal, TrustBar, StatusBadge, Badge, Spinner, Empty } from '../components/ui'
 
 const ROLES = ['default', 'продавец', 'прогреватель', 'читатель', 'консультант']
@@ -42,6 +42,8 @@ export default function AccountDetailPage() {
   const [authPhone, setAuthPhone] = useState('')
   const [authCode, setAuthCode] = useState('')
   const [authProxyId, setAuthProxyId] = useState(null)
+  const [authApiAppId, setAuthApiAppId] = useState(null)
+  const [apiApps, setApiApps] = useState([])
   const [authStep, setAuthStep] = useState('idle') // idle | code_sent | needs_2fa
   const [authMsg, setAuthMsg] = useState('')
   const [channelTitle, setChannelTitle] = useState('')
@@ -200,7 +202,7 @@ export default function AccountDetailPage() {
       if (proxies.length === 0) {
         try { const { data } = await proxiesAPI.list(); setProxies(data) } catch { }
       }
-      const { data } = await tgAuthAPI.sendCode(authPhone, authProxyId || null)
+      const { data } = await tgAuthAPI.sendCode(authPhone, authProxyId || null, authApiAppId || null)
       setAuthStep('code_sent')
       setAuthMsg(data.message)
     } catch (err) { setAuthMsg(err.response?.data?.detail || 'Ошибка') }
@@ -342,7 +344,14 @@ export default function AccountDetailPage() {
           {/* Actions */}
           <div style={{ display: 'flex', gap: 8 }}>
             <Button variant="outline" size="sm" onClick={() => setEditModal(true)}>Редактировать</Button>
-            <Button variant="ghost" size="sm" onClick={async () => { setAuthStep('idle'); setAuthMsg(''); setAuthProxyId(a.proxy_id || null); try { const { data } = await proxiesAPI.list(); setProxies(data) } catch { }; setAuthModal(true) }}>Авторизовать</Button>
+            <Button variant="ghost" size="sm" onClick={async () => {
+              setAuthStep('idle'); setAuthMsg('');
+              setAuthProxyId(a.proxy_id || null);
+              setAuthApiAppId(a.api_app_id || null);
+              try { const { data } = await proxiesAPI.list(); setProxies(data) } catch { }
+              try { const { data } = await apiAppsAPI.list(); setApiApps(data || []) } catch { }
+              setAuthModal(true);
+            }}>Авторизовать</Button>
           </div>
         </div>
       </Card>
@@ -604,6 +613,18 @@ export default function AccountDetailPage() {
 
           {authStep === 'idle' && (
             <>
+              <div>
+                <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>API ID</label>
+                <select value={authApiAppId || ''} onChange={e => setAuthApiAppId(e.target.value ? parseInt(e.target.value) : null)} style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 13, outline: 'none' }}>
+                  <option value="">Публичный (Android по умолчанию)</option>
+                  {apiApps.filter(x => x.is_active !== false).map(x => (
+                    <option key={x.id} value={x.id}>#{x.id} · {x.name || `api_id ${x.api_id}`} [{x.platform || 'android'}]</option>
+                  ))}
+                </select>
+                <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 4 }}>
+                  Если код не приходит в SMS — попробуй свой API ID (публичный часто шлёт только в приложение).
+                </div>
+              </div>
               <div>
                 <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Прокси (опционально)</label>
                 <select value={authProxyId || ''} onChange={e => setAuthProxyId(e.target.value ? parseInt(e.target.value) : null)} style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 13, outline: 'none' }}>
