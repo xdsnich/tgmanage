@@ -487,6 +487,20 @@ export const accountMediaAPI = {
 
   clear: (accountId) =>
     api.delete(`/accounts/${accountId}/media`),
+
+  // ── Bulk: на несколько аккаунтов сразу ──
+  bulkUpload: (accountIds, formData) => {
+    // accountIds придёт как поле "account_ids" формы — CSV строкой
+    formData.append('account_ids', accountIds.join(','))
+    return api.post('/accounts/bulk/media/upload', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 120000,
+    })
+  },
+  bulkClear: (accountIds) =>
+    api.post('/accounts/bulk/media/clear', { account_ids: accountIds }),
+  bulkCounts: (accountIds) =>
+    api.post('/accounts/bulk/media/list', { account_ids: accountIds }),
 }
 
 // ── SERVICE CREDENTIALS (Claude / OpenAI / Gemini / Groq / TGStat) ──

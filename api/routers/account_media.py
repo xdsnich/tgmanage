@@ -20,7 +20,7 @@ import logging
 from pathlib import Path
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -31,6 +31,9 @@ from models.user import User
 from models.account import TelegramAccount
 
 router = APIRouter(prefix="/accounts/{account_id}/media", tags=["account-media"])
+
+# Отдельный роутер БЕЗ {account_id} в префиксе — для bulk-операций
+bulk_router = APIRouter(prefix="/accounts/bulk/media", tags=["account-media-bulk"])
 
 logger = logging.getLogger(__name__)
 
@@ -207,3 +210,178 @@ async def clear_media(
             except OSError:
                 pass
     return {"removed": removed}
+
+
+# ══════════════════════════════════════════════════════════════════
+# BULK операции — загрузить/очистить медиа сразу для N аккаунтов
+# ══════════════════════════════════════════════════════════════════
+
+@bulk_router.post("/upload")
+async def bulk_upload_media(
+    account_ids: str = Form(...),     # CSV: "1,2,3" — multipart не любит JSON arrays
+    files: List[UploadFile] = File(...),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Загрузить ОДИН И ТОТ ЖЕ набор фото в папки нескольких аккаунтов.
+
+    Пример: загрузил 10 фото, указал account_ids="48,51,52,53,..." — каждое
+    фото скопируется в папку каждого из аккаунтов с уникальным uuid-именем.
+    Полезно при онбординге 400 аккаунтов: один раз готовишь пак фоток и
+    раскидываешь на всех.
+
+    Все аккаунты должны принадлежать текущему юзеру (проверяется одним SQL).
+    """
+    try:
+        acc_ids = [int(x.strip()) for x in account_ids.split(",") if x.strip()]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="account_ids должен быть списком чисел через запятую")
+    if not acc_ids:
+        raise HTTPException(status_code=400, detail="Не указан ни один аккаунт")
+    if not files:
+        raise HTTPException(status_code=400, detail="Нет файлов")
+
+    # Проверяем владение всеми переданными account_ids одним запросом
+    r = await db.execute(
+        select(TelegramAccount.id).where(
+            TelegramAccount.id.in_(acc_ids),
+            TelegramAccount.user_id == current_user.id,
+        )
+    )
+    owned_ids = {row[0] for row in r.fetchall()}
+    not_owned = [a for a in acc_ids if a not in owned_ids]
+    if not_owned:
+        raise HTTPException(status_code=403, detail=f"Аккаунты не найдены или не принадлежат вам: {not_owned}")
+
+    # Читаем все файлы один раз в память (помним про MAX_FILE_BYTES)
+    bytes_per_file = []
+    rejected_files = []
+    for uf in files:
+        ext = Path(uf.filename or "").suffix.lower()
+        if ext not in ALLOWED_EXTS:
+            rejected_files.append({"filename": uf.filename, "reason": f"расш. {ext} не поддерживается"})
+            continue
+        content = await uf.read()
+        if len(content) > MAX_FILE_BYTES:
+            rejected_files.append({"filename": uf.filename, "reason": f"> {MAX_FILE_BYTES // 1024 // 1024}MB"})
+            continue
+        if len(content) < 1024:
+            rejected_files.append({"filename": uf.filename, "reason": "битый/слишком маленький"})
+            continue
+        bytes_per_file.append((ext, content, uf.filename))
+
+    if not bytes_per_file:
+        return {
+            "accounts_count": len(acc_ids),
+            "files_saved_per_account": 0,
+            "rejected_files": rejected_files,
+            "message": "Все файлы отклонены, ничего не сохранено",
+        }
+
+    # Раскидываем по папкам
+    per_account_stats = []
+    for acc_id in acc_ids:
+        target = _account_dir(acc_id)
+        saved = 0
+        for ext, content, _orig_name in bytes_per_file:
+            unique_name = f"{uuid.uuid4().hex[:12]}{ext}"
+            try:
+                (target / unique_name).write_bytes(content)
+                saved += 1
+            except OSError as e:
+                logger.warning(f"[bulk_media] account {acc_id} {unique_name}: {e}")
+        per_account_stats.append({"account_id": acc_id, "saved": saved})
+
+    total_saved = sum(s["saved"] for s in per_account_stats)
+    return {
+        "accounts_count": len(acc_ids),
+        "files_saved_per_account": len(bytes_per_file),
+        "total_saved": total_saved,
+        "rejected_files": rejected_files,
+        "per_account": per_account_stats,
+        "message": f"Скопировано {len(bytes_per_file)} фото в {len(acc_ids)} папок (итого {total_saved} файлов)",
+    }
+
+
+class BulkClearMediaRequest:
+    """Используем POST/DELETE с query — слишком ограниченно. Делаем POST с JSON."""
+    pass
+
+
+@bulk_router.post("/clear")
+async def bulk_clear_media(
+    payload: dict,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Удалить все фото у нескольких аккаунтов.
+    Body: {"account_ids": [1, 2, 3]}.
+    """
+    acc_ids = payload.get("account_ids", [])
+    if not isinstance(acc_ids, list) or not acc_ids:
+        raise HTTPException(status_code=400, detail="account_ids must be non-empty list")
+
+    r = await db.execute(
+        select(TelegramAccount.id).where(
+            TelegramAccount.id.in_(acc_ids),
+            TelegramAccount.user_id == current_user.id,
+        )
+    )
+    owned_ids = {row[0] for row in r.fetchall()}
+    not_owned = [a for a in acc_ids if a not in owned_ids]
+    if not_owned:
+        raise HTTPException(status_code=403, detail=f"Не ваши аккаунты: {not_owned}")
+
+    total_removed = 0
+    per_account = []
+    for acc_id in acc_ids:
+        d = _account_dir(acc_id)
+        removed = 0
+        for f in d.iterdir():
+            if f.is_file() and f.suffix.lower() in ALLOWED_EXTS:
+                try:
+                    f.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+        total_removed += removed
+        per_account.append({"account_id": acc_id, "removed": removed})
+
+    return {
+        "accounts_count": len(acc_ids),
+        "total_removed": total_removed,
+        "per_account": per_account,
+    }
+
+
+@bulk_router.post("/list")
+async def bulk_list_media(
+    payload: dict,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Сколько фото у каждого из переданных аккаунтов.
+    Body: {"account_ids": [1, 2, 3]}.
+    Используется UI чтобы показать "5 фото / 0 фото" на каждой строке списка.
+    """
+    acc_ids = payload.get("account_ids", [])
+    if not isinstance(acc_ids, list):
+        raise HTTPException(status_code=400, detail="account_ids must be a list")
+    if not acc_ids:
+        return {"counts": {}}
+
+    r = await db.execute(
+        select(TelegramAccount.id).where(
+            TelegramAccount.id.in_(acc_ids),
+            TelegramAccount.user_id == current_user.id,
+        )
+    )
+    owned_ids = {row[0] for row in r.fetchall()}
+
+    counts = {}
+    for acc_id in owned_ids:
+        counts[acc_id] = len(list_account_media_paths(acc_id))
+    return {"counts": counts}

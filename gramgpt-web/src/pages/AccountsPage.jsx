@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { accountsAPI, importAPI, proxiesAPI, channelsAPI, diagnosticsAPI, apiAppsAPI } from '../services/api'
+import { accountsAPI, importAPI, proxiesAPI, channelsAPI, diagnosticsAPI, apiAppsAPI, accountMediaAPI } from '../services/api'
 import { Card, Button, Input, Modal, TrustBar, StatusBadge, Empty, Spinner, Badge } from '../components/ui'
 
 const ROLES = ['default', 'продавец', 'прогреватель', 'читатель', 'консультант']
@@ -16,6 +16,55 @@ export default function AccountsPage() {
   const [accounts, setAccounts] = useState([])
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
+
+  // ── Multi-select (bulk operations) ────────────────────────
+  const [selectedIds, setSelectedIds] = useState(() => new Set())
+  const [bulkMediaModal, setBulkMediaModal] = useState(false)
+  const [bulkMediaFiles, setBulkMediaFiles] = useState([])
+  const [bulkUploading, setBulkUploading] = useState(false)
+  const bulkFileInputRef = useRef(null)
+
+  const toggleSelect = (id) => setSelectedIds(s => {
+    const n = new Set(s)
+    if (n.has(id)) n.delete(id); else n.add(id)
+    return n
+  })
+  const selectAll = (ids) => setSelectedIds(new Set(ids))
+  const clearSelection = () => setSelectedIds(new Set())
+
+  const openBulkMedia = () => {
+    setBulkMediaFiles([])
+    setBulkMediaModal(true)
+  }
+
+  const handleBulkUpload = async () => {
+    if (!bulkMediaFiles.length) { alert('Выбери хотя бы одно фото'); return }
+    if (!selectedIds.size) { alert('Не выбрано ни одного аккаунта'); return }
+    setBulkUploading(true)
+    try {
+      const fd = new FormData()
+      bulkMediaFiles.forEach(f => fd.append('files', f))
+      const { data } = await accountMediaAPI.bulkUpload([...selectedIds], fd)
+      alert(data.message)
+      setBulkMediaModal(false)
+      setBulkMediaFiles([])
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Ошибка загрузки')
+    }
+    setBulkUploading(false)
+  }
+
+  const handleBulkClearMedia = async () => {
+    if (!selectedIds.size) return
+    if (!window.confirm(`Удалить ВСЕ фото у ${selectedIds.size} выбранных аккаунтов?`)) return
+    try {
+      const { data } = await accountMediaAPI.bulkClear([...selectedIds])
+      alert(`Удалено ${data.total_removed} файлов из ${data.accounts_count} папок`)
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Ошибка')
+    }
+  }
+
   const [filterStatus, setFilterStatus] = useState('all')
   const [filterGeo, setFilterGeo] = useState('all')
   const [filterCategory, setFilterCategory] = useState('all')
@@ -310,22 +359,36 @@ export default function AccountsPage() {
         <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', overflow: 'hidden' }}>
           {/* Header row */}
           <div style={{
-            display: 'grid', gridTemplateColumns: '2fr 1.2fr 0.8fr 0.8fr 1fr 80px 130px',
+            display: 'grid', gridTemplateColumns: '36px 2fr 1.2fr 0.8fr 0.8fr 1fr 80px 130px',
             padding: '10px 20px', borderBottom: '1px solid var(--border)',
             fontSize: 10, color: 'var(--text-3)', letterSpacing: '0.1em', fontWeight: 700, textTransform: 'uppercase',
+            alignItems: 'center',
           }}>
+            <input type="checkbox"
+              onClick={e => e.stopPropagation()}
+              checked={filtered.length > 0 && filtered.every(a => selectedIds.has(a.id))}
+              onChange={e => e.target.checked ? selectAll(filtered.map(a => a.id)) : clearSelection()}
+              style={{ width: 16, height: 16, accentColor: 'var(--violet)', cursor: 'pointer' }}
+              title="Выбрать все на странице" />
             <span>Аккаунт</span><span>Телефон</span><span>Гео</span><span>Тема</span><span>Статус</span><span>Trust</span><span style={{ textAlign: 'right' }}>Действия</span>
           </div>
 
           {filtered.map((acc, i) => (
             <div key={acc.id} onClick={() => navigate(`/accounts/${acc.id}`)} style={{
-              display: 'grid', gridTemplateColumns: '2fr 1.2fr 0.8fr 0.8fr 1fr 80px 130px',
+              display: 'grid', gridTemplateColumns: '36px 2fr 1.2fr 0.8fr 0.8fr 1fr 80px 130px',
               padding: '14px 20px', alignItems: 'center',
               borderBottom: i < filtered.length - 1 ? '1px solid var(--border)' : 'none',
               transition: 'background 0.1s', cursor: 'pointer',
+              background: selectedIds.has(acc.id) ? 'rgba(124,77,255,0.06)' : 'transparent',
             }}
-              onMouseEnter={e => e.currentTarget.style.background = 'rgba(255,255,255,0.02)'}
-              onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+              onMouseEnter={e => { if (!selectedIds.has(acc.id)) e.currentTarget.style.background = 'rgba(255,255,255,0.02)' }}
+              onMouseLeave={e => { e.currentTarget.style.background = selectedIds.has(acc.id) ? 'rgba(124,77,255,0.06)' : 'transparent' }}>
+              {/* Checkbox */}
+              <input type="checkbox"
+                checked={selectedIds.has(acc.id)}
+                onClick={e => e.stopPropagation()}
+                onChange={() => toggleSelect(acc.id)}
+                style={{ width: 16, height: 16, accentColor: 'var(--violet)', cursor: 'pointer' }} />
               {/* Name + avatar */}
               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                 <div style={{
@@ -1002,6 +1065,97 @@ export default function AccountsPage() {
             </div>
           </div>
         )}
+      </Modal>
+
+      {/* ══ Floating action bar (multi-select) ══ */}
+      {selectedIds.size > 0 && (
+        <div style={{
+          position: 'fixed', bottom: 24, left: '50%', transform: 'translateX(-50%)',
+          zIndex: 100,
+          background: 'var(--bg-2)', border: '1px solid rgba(124,77,255,0.4)',
+          borderRadius: 14, padding: '12px 18px',
+          boxShadow: '0 10px 40px rgba(0,0,0,0.5), 0 0 20px rgba(124,77,255,0.15)',
+          display: 'flex', alignItems: 'center', gap: 14,
+        }}>
+          <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>
+            Выбрано: <span style={{ color: 'var(--violet)' }}>{selectedIds.size}</span>
+          </div>
+          <div style={{ width: 1, height: 22, background: 'var(--border)' }} />
+          <Button variant="primary" size="sm" onClick={openBulkMedia}>
+            📸 Загрузить фото
+          </Button>
+          <Button variant="ghost" size="sm" onClick={handleBulkClearMedia} title="Удалить все фото у выбранных">
+            🗑 Очистить фото
+          </Button>
+          <Button variant="ghost" size="sm" onClick={clearSelection}>Снять выбор</Button>
+        </div>
+      )}
+
+      {/* ══ Bulk media upload modal ══ */}
+      <Modal open={bulkMediaModal} onClose={() => setBulkMediaModal(false)}
+        title={`📸 Фото для ${selectedIds.size} аккаунтов`} width={500}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <div style={{ padding: '10px 12px', background: 'rgba(124,77,255,0.06)', border: '1px solid rgba(124,77,255,0.15)', borderRadius: 8, fontSize: 12, color: 'var(--text-2)', lineHeight: 1.6 }}>
+            Каждое выбранное фото будет скопировано в папку <b>каждого</b> из {selectedIds.size} аккаунтов
+            (с уникальными именами, не перезаписывая существующие).
+            Во время прогрева/комментинга акк случайно постит одно фото из своей папки в сториз.
+          </div>
+
+          <div onClick={() => bulkFileInputRef.current?.click()}
+            style={{
+              minHeight: 100, border: '2px dashed var(--border)', borderRadius: 10,
+              display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+              cursor: 'pointer', padding: 14, gap: 8, transition: 'border-color 0.15s',
+            }}
+            onMouseEnter={e => e.currentTarget.style.borderColor = 'var(--violet)'}
+            onMouseLeave={e => e.currentTarget.style.borderColor = 'var(--border)'}>
+            {bulkMediaFiles.length === 0 ? (
+              <>
+                <span style={{ fontSize: 24 }}>📸</span>
+                <span style={{ fontSize: 12, color: 'var(--text-3)' }}>Выбрать фото (можно несколько)</span>
+              </>
+            ) : (
+              <>
+                <span style={{ fontSize: 12, color: 'var(--green)', fontWeight: 600 }}>
+                  ✓ Выбрано {bulkMediaFiles.length} файл(ов)
+                </span>
+                <span style={{ fontSize: 11, color: 'var(--text-3)' }}>нажми чтобы выбрать другие</span>
+              </>
+            )}
+          </div>
+          <input ref={bulkFileInputRef} type="file" accept="image/*" multiple
+            style={{ display: 'none' }}
+            onChange={e => setBulkMediaFiles(Array.from(e.target.files || []))} />
+
+          {bulkMediaFiles.length > 0 && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, maxHeight: 200, overflowY: 'auto', padding: '6px 0' }}>
+              {bulkMediaFiles.map((f, i) => (
+                <div key={i} style={{
+                  fontSize: 11, padding: '4px 10px', background: 'var(--bg-3)',
+                  borderRadius: 6, border: '1px solid var(--border)', color: 'var(--text-2)',
+                  display: 'flex', alignItems: 'center', gap: 6,
+                }}>
+                  <span style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                  <button onClick={() => setBulkMediaFiles(prev => prev.filter((_, j) => j !== i))}
+                    style={{ background: 'none', border: 'none', color: 'var(--text-3)', cursor: 'pointer', fontSize: 14, padding: 0 }}>×</button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
+            Каждый акк получит {bulkMediaFiles.length} новых фото. Всего файлов будет создано: {bulkMediaFiles.length * selectedIds.size}.
+          </div>
+
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+            <Button variant="ghost" onClick={() => setBulkMediaModal(false)}>Отмена</Button>
+            <Button variant="primary" loading={bulkUploading}
+              disabled={bulkMediaFiles.length === 0 || selectedIds.size === 0}
+              onClick={handleBulkUpload}>
+              📤 Загрузить во все папки
+            </Button>
+          </div>
+        </div>
       </Modal>
     </div>
   )

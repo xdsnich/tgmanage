@@ -99,6 +99,7 @@ app.include_router(subscribe.router, prefix=PREFIX)
 app.include_router(health.router, prefix=f"{PREFIX}")
 app.include_router(service_credentials.router, prefix=PREFIX)
 app.include_router(account_media.router, prefix=PREFIX)  # Фото для сториз (per-account)
+app.include_router(account_media.bulk_router, prefix=PREFIX)  # Bulk-операции с медиа (несколько акков)
 app.include_router(web_session.router, prefix="/api/v1")
 app.include_router(diagnostics.router, prefix=PREFIX)  # Диагностика подписок и аккаунтов
 # ── Healthcheck ──────────────────────────────────────────────
