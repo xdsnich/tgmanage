@@ -40,7 +40,7 @@ from utils.logging_setup import setup_logging
 # Логи API → logs/api.log с ротацией 100MB × 10
 setup_logging("api")
 from routers import auth, accounts, proxies, tasks
-from routers import tg_auth, analytics, security, channels, actions, inbox, tdata, commenting, warmup, parser, api_apps, reactions, subscribe, service_credentials
+from routers import tg_auth, analytics, security, channels, actions, inbox, tdata, commenting, warmup, parser, api_apps, reactions, subscribe, service_credentials, account_media
 from routers import health
 from routers import web_session
 from routers import diagnostics
@@ -98,6 +98,7 @@ app.include_router(reactions.router, prefix=PREFIX)  # Реакции
 app.include_router(subscribe.router, prefix=PREFIX)
 app.include_router(health.router, prefix=f"{PREFIX}")
 app.include_router(service_credentials.router, prefix=PREFIX)
+app.include_router(account_media.router, prefix=PREFIX)  # Фото для сториз (per-account)
 app.include_router(web_session.router, prefix="/api/v1")
 app.include_router(diagnostics.router, prefix=PREFIX)  # Диагностика подписок и аккаунтов
 # ── Healthcheck ──────────────────────────────────────────────

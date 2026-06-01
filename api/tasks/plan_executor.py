@@ -660,6 +660,46 @@ async def _execute_plan_session(plan_id: int):
                                 except Exception:
                                     pass
 
+                            elif action_type == "post_story":
+                                # Постит рандомное фото из api/account_media/{account_id}/
+                                # в сториз. Premium-only — мягкий скип на не-Premium.
+                                try:
+                                    from routers.account_media import list_account_media_paths
+                                    paths = list_account_media_paths(acc.id)
+                                    if not paths:
+                                        logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 📸 Сториз: папка пустая, скип")
+                                        continue
+                                    photo_path = random.choice(paths)
+                                    try:
+                                        from telethon.tl.functions.stories import SendStoryRequest
+                                        from telethon.tl.types import InputMediaUploadedPhoto, InputPrivacyValueAllowAll
+                                    except ImportError:
+                                        logger.warning(f"[plan][{phone}] stories API недоступен в текущей Telethon")
+                                        continue
+                                    try:
+                                        f = await client.upload_file(str(photo_path))
+                                        media = InputMediaUploadedPhoto(file=f)
+                                        await client(SendStoryRequest(
+                                            peer="me",
+                                            media=media,
+                                            privacy_rules=[InputPrivacyValueAllowAll()],
+                                            random_id=random.getrandbits(63),
+                                            period=86400,
+                                        ))
+                                        logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 📸 Сториз опубликован ({photo_path.name})")
+                                        await _safe_log(db, task_id=log_task_id, account_id=acc.id, action="post_story",
+                                                         detail=f"Сториз: {photo_path.name}", success=True,
+                                                         source=plan_source, campaign_id=plan_campaign_id)
+                                        done_actions += 1
+                                    except Exception as e:
+                                        err = str(e)
+                                        if "PREMIUM" in err.upper() or "PremiumAccountRequired" in err:
+                                            logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 📸 Сториз: не Premium, скип")
+                                        else:
+                                            logger.warning(f"[plan][{phone}] post_story error: {err[:120]}")
+                                except Exception:
+                                    pass
+
                             elif action_type == "reply_dm":
                                 try:
                                     dialogs = await client.get_dialogs(limit=20)

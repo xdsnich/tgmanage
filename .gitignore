@@ -56,6 +56,10 @@ data/
 !data/.gitkeep
 !sessions/.gitkeep
 
+# Photos для сториз (per-account)
+api/account_media/
+!api/account_media/.gitkeep
+
 # ═══════════════════════════════════════════════════════════
 # Логи
 # ═══════════════════════════════════════════════════════════

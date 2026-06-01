@@ -464,6 +464,31 @@ export const apiAppsAPI = {
   stats: () => api.get('/api-apps/stats/overview'),
 }
 
+// ── ACCOUNT MEDIA (фото для сториз) ──────────────────────────
+export const accountMediaAPI = {
+  list: (accountId) =>
+    api.get(`/accounts/${accountId}/media`),
+
+  upload: (accountId, formData) =>
+    api.post(`/accounts/${accountId}/media/upload`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 60000,
+    }),
+
+  // Возвращает Blob — компонент сам делает URL.createObjectURL для <img src>
+  // (нужно потому что эндпоинт защищён JWT, который браузер не шлёт через <img>)
+  fetchFile: (accountId, filename) =>
+    api.get(`/accounts/${accountId}/media/file/${encodeURIComponent(filename)}`, {
+      responseType: 'blob',
+    }),
+
+  remove: (accountId, filename) =>
+    api.delete(`/accounts/${accountId}/media/file/${encodeURIComponent(filename)}`),
+
+  clear: (accountId) =>
+    api.delete(`/accounts/${accountId}/media`),
+}
+
 // ── SERVICE CREDENTIALS (Claude / OpenAI / Gemini / Groq / TGStat) ──
 export const serviceCredentialsAPI = {
   list:      () => api.get('/service-credentials'),

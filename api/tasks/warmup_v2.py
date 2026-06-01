@@ -50,6 +50,8 @@ ACTIONS = [
     {"name": "forward_saved",  "weight": 5,  "label": "💾 Пересылка в Saved"},
     {"name": "send_saved",     "weight": 10, "label": "💬 Сообщение в Saved"},
     {"name": "reply_dm",       "weight": 8,  "label": "↩️ Ответ на ЛС"},
+    # post_story — низкий вес (только Premium-акки, не каждый день уместно)
+    {"name": "post_story",     "weight": 3,  "label": "📸 Публикация сториз"},
     {"name": "smart_comment",  "weight": 0,  "label": "💬 Комментарий (v2)"},  # weight=0: не выбирается рандомно, вставляется из очереди
 ]
 
@@ -490,6 +492,51 @@ async def _do_send_saved(client, phone):
     return f"Написал «{msg}» в Saved", ""
 
 
+async def _do_post_story(client, phone, account_id: int):
+    """
+    Постит случайное фото из api/account_media/{account_id}/ в Telegram-сториз.
+
+    ВАЖНО: Telegram пускает SendStoryRequest только для Premium-аккаунтов.
+    Не-Premium получит PremiumAccountRequiredError — обрабатываем мягко, action
+    скипается без падения warmup'а.
+
+    Если в папке акка нет фото — также мягкий скип.
+    """
+    from routers.account_media import list_account_media_paths
+
+    paths = list_account_media_paths(account_id)
+    if not paths:
+        return "Сториз: нет фото в папке акка (пропуск)", ""
+
+    photo_path = random.choice(paths)
+
+    try:
+        from telethon.tl.functions.stories import SendStoryRequest
+        from telethon.tl.types import InputMediaUploadedPhoto, InputPrivacyValueAllowAll
+    except ImportError:
+        # Очень старая версия Telethon без stories API — мягкий скип
+        return "Сториз: stories API недоступен в текущей версии Telethon", ""
+
+    try:
+        file = await client.upload_file(str(photo_path))
+        media = InputMediaUploadedPhoto(file=file)
+        await client(SendStoryRequest(
+            peer="me",
+            media=media,
+            privacy_rules=[InputPrivacyValueAllowAll()],
+            random_id=random.getrandbits(63),
+            period=86400,   # 24 часа — стандартная длительность Telegram-сториз
+        ))
+        return f"Сториз опубликован ({photo_path.name})", ""
+    except Exception as e:
+        err = str(e)
+        # Premium-only: тихий скип без статуса 'failed' (не считаем за провал)
+        if "PREMIUM" in err.upper() or "PremiumAccountRequired" in err:
+            return f"Сториз: акк не Premium (skipped)", ""
+        # Любая другая ошибка — пробрасываем, общий обработчик warmup это залогирует
+        raise
+
+
 async def _do_read_dm(client, phone):
     """Читает непрочитанные ЛС (только read acknowledge, никогда не отвечает)."""
     dialogs = await client.get_dialogs(limit=20)
@@ -580,6 +627,7 @@ ACTION_FNS = {
     "forward_saved": _do_forward_saved,
     "send_saved":    _do_send_saved,
     "reply_dm":      _do_read_dm,
+    "post_story":    _do_post_story,    # сигнатура (client, phone, account_id) — обрабатывается в диспетчере
     "smart_comment": _do_smart_comment_warmup,
 }
 
@@ -899,7 +947,11 @@ async def _run_session(task_row, account, proxy, session_cfg, db):
                 continue
 
             try:
-                detail, channel = await action_fn(client, phone)
+                # post_story требует account_id (берёт фото из api/account_media/{id}/)
+                if action["name"] == "post_story":
+                    detail, channel = await action_fn(client, phone, account.id)
+                else:
+                    detail, channel = await action_fn(client, phone)
 
                 emoji = ""
                 if action["name"] == "set_reaction" and "Поставил" in detail:

@@ -357,6 +357,9 @@ def generate_daily_plan(
                 ("set_reaction", 15), ("view_profile", 8),
                 ("search", 5), ("send_saved", 10),
                 ("forward_saved", 5), ("reply_dm", 4),
+                # post_story — низкий вес, и только если у акка есть фото в папке
+                # (исполнитель сам делает skip если папка пустая или акк не Premium)
+                ("post_story", 3),
             ]
         else:
             available_actions = [
@@ -365,6 +368,7 @@ def generate_daily_plan(
                 ("search", 5), ("forward_saved", 7),
                 ("send_saved", 10), ("reply_dm", 7),
                 ("typing", 4),
+                ("post_story", 4),
             ]
 
         # ── Строим список действий ───────────────────────
@@ -491,6 +495,9 @@ def generate_daily_plan(
                 action["pause_after"] = random.randint(5, 30)
             elif chosen == "typing":
                 action["duration"] = random.randint(2, 15)
+            elif chosen == "post_story":
+                # Просто пауза после — executor сам решит публиковать или скипнуть
+                action["pause_after"] = random.randint(15, 60)
 
             if "pause_after" not in action:
                 action["pause_after"] = random.randint(3, 45)

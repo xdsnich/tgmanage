@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { accountsAPI, securityAPI, channelsAPI, actionsAPI, tgAuthAPI, proxiesAPI, apiAppsAPI } from '../services/api'
+import { accountsAPI, securityAPI, channelsAPI, actionsAPI, tgAuthAPI, proxiesAPI, apiAppsAPI, accountMediaAPI } from '../services/api'
 import { Card, Button, Input, Modal, TrustBar, StatusBadge, Badge, Spinner, Empty } from '../components/ui'
 
 const ROLES = ['default', 'продавец', 'прогреватель', 'читатель', 'консультант']
@@ -43,6 +43,12 @@ export default function AccountDetailPage() {
   const [mcSavingInfo, setMcSavingInfo] = useState(false)
   const [mcPosting, setMcPosting] = useState(false)
   const mcPhotoRef = useRef(null)
+
+  // Media (фото для сториз)
+  const [mediaFiles, setMediaFiles] = useState([])           // [{filename, size_bytes, ...}]
+  const [mediaPreviews, setMediaPreviews] = useState({})     // {filename: objectURL}
+  const [mediaUploading, setMediaUploading] = useState(false)
+  const mediaInputRef = useRef(null)
 
   // Forms
   const [editData, setEditData] = useState({})
@@ -98,7 +104,73 @@ export default function AccountDetailPage() {
     setChannelsLoading(false)
   }
 
-  useEffect(() => { load() }, [id])
+  // ── Media (фото для сториз) ─────────────────────────────────
+  const loadMedia = async () => {
+    try {
+      const { data } = await accountMediaAPI.list(id)
+      const files = data.files || []
+      setMediaFiles(files)
+
+      // Подтягиваем превью каждого файла как blob → objectURL
+      const previews = {}
+      await Promise.all(files.map(async f => {
+        try {
+          const resp = await accountMediaAPI.fetchFile(id, f.filename)
+          previews[f.filename] = URL.createObjectURL(resp.data)
+        } catch { /* ignore single failures */ }
+      }))
+      // Чистим старые URL'ы которые больше не нужны
+      setMediaPreviews(prev => {
+        Object.values(prev).forEach(url => { try { URL.revokeObjectURL(url) } catch { } })
+        return previews
+      })
+    } catch {
+      setMediaFiles([])
+    }
+  }
+
+  const handleMediaUpload = async (e) => {
+    const files = Array.from(e.target.files || [])
+    if (!files.length) return
+    setMediaUploading(true)
+    try {
+      const fd = new FormData()
+      files.forEach(f => fd.append('files', f))
+      const { data } = await accountMediaAPI.upload(id, fd)
+      showToast(`Загружено: ${data.saved_count}, отклонено: ${data.rejected_count}`)
+      await loadMedia()
+    } catch (err) {
+      showToast(err.response?.data?.detail || 'Ошибка загрузки', 'error')
+    }
+    setMediaUploading(false)
+    if (mediaInputRef.current) mediaInputRef.current.value = ''
+  }
+
+  const handleMediaDelete = async (filename) => {
+    if (!window.confirm('Удалить это фото?')) return
+    try {
+      await accountMediaAPI.remove(id, filename)
+      await loadMedia()
+    } catch (err) { showToast(err.response?.data?.detail || 'Ошибка', 'error') }
+  }
+
+  const handleMediaClear = async () => {
+    if (!window.confirm(`Удалить ВСЕ ${mediaFiles.length} фото аккаунта?`)) return
+    try {
+      await accountMediaAPI.clear(id)
+      await loadMedia()
+      showToast('Очищено')
+    } catch (err) { showToast(err.response?.data?.detail || 'Ошибка', 'error') }
+  }
+
+  useEffect(() => { load(); loadMedia() }, [id])
+
+  // На размонтировании страницы — отзываем все blob URL чтобы не текла память
+  useEffect(() => {
+    return () => {
+      Object.values(mediaPreviews).forEach(url => { try { URL.revokeObjectURL(url) } catch { } })
+    }
+  }, [])
 
   useEffect(() => {
     if (!mcPostPhoto) { setMcPostPhotoPreview(null); return }
@@ -641,6 +713,62 @@ export default function AccountDetailPage() {
                 </div>
               </div>
             ))}
+          </Card>
+
+          {/* Media (фото для сториз) */}
+          <Card>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+              <div>
+                <span style={{ fontWeight: 700, fontSize: 14, letterSpacing: '-0.02em' }}>📸 Медиа для сториз</span>
+                <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 2 }}>
+                  {mediaFiles.length} фото · во время прогрева/комментинга акк случайно постит одно в сториз
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <Button variant="primary" size="sm" loading={mediaUploading}
+                  onClick={() => mediaInputRef.current?.click()}>
+                  + Загрузить
+                </Button>
+                {mediaFiles.length > 0 && (
+                  <Button variant="ghost" size="sm" onClick={handleMediaClear} title="Удалить все">🗑</Button>
+                )}
+              </div>
+            </div>
+
+            <input ref={mediaInputRef} type="file" accept="image/*" multiple
+              style={{ display: 'none' }} onChange={handleMediaUpload} />
+
+            <div style={{ padding: '8px 12px', background: 'rgba(227,161,63,0.06)', border: '1px solid rgba(227,161,63,0.2)', borderRadius: 8, fontSize: 11, color: 'var(--text-2)', marginBottom: 10, lineHeight: 1.5 }}>
+              ⚠️ Telegram пускает публикацию сториз через API только <b>Premium-аккаунтам</b>.
+              На не-Premium action скипнется без падения прогрева.
+            </div>
+
+            {mediaFiles.length === 0 ? (
+              <div style={{ padding: '24px 0', textAlign: 'center', fontSize: 12, color: 'var(--text-3)' }}>
+                Папка пуста. Загрузи 5-20 фото для разнообразия — система будет рандомно их публиковать.
+              </div>
+            ) : (
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(80px, 1fr))', gap: 8 }}>
+                {mediaFiles.map(f => (
+                  <div key={f.filename} style={{ position: 'relative', aspectRatio: '1 / 1', borderRadius: 8, overflow: 'hidden', background: 'var(--bg-3)', border: '1px solid var(--border)' }}>
+                    {mediaPreviews[f.filename] ? (
+                      <img src={mediaPreviews[f.filename]} alt={f.filename}
+                        style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                    ) : (
+                      <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, color: 'var(--text-3)' }}>...</div>
+                    )}
+                    <button
+                      onClick={() => handleMediaDelete(f.filename)}
+                      title="Удалить"
+                      style={{
+                        position: 'absolute', top: 4, right: 4, width: 22, height: 22, borderRadius: '50%',
+                        background: 'rgba(0,0,0,0.65)', border: 'none', color: 'white',
+                        fontSize: 12, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      }}>×</button>
+                  </div>
+                ))}
+              </div>
+            )}
           </Card>
 
           {/* Quick Actions */}
