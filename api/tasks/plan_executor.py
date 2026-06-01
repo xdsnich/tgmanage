@@ -663,7 +663,13 @@ async def _execute_plan_session(plan_id: int):
                             elif action_type == "post_story":
                                 # Постит рандомное фото из api/account_media/{account_id}/
                                 # в сториз. Premium-only — мягкий скип на не-Premium.
+                                # Жёсткий лимит: 1 сториз в сутки (через Redis-счётчик).
                                 try:
+                                    from utils.story_limit import can_post_story_today, mark_story_posted_today
+                                    if not can_post_story_today(acc.id):
+                                        logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 📸 Сториз: уже постили сегодня, скип")
+                                        continue
+
                                     from routers.account_media import list_account_media_paths
                                     paths = list_account_media_paths(acc.id)
                                     if not paths:
@@ -686,6 +692,7 @@ async def _execute_plan_session(plan_id: int):
                                             random_id=random.getrandbits(63),
                                             period=86400,
                                         ))
+                                        mark_story_posted_today(acc.id)
                                         logger.info(f"[plan][{phone}]   [{action_num}/{len(actions)}] 📸 Сториз опубликован ({photo_path.name})")
                                         await _safe_log(db, task_id=log_task_id, account_id=acc.id, action="post_story",
                                                          detail=f"Сториз: {photo_path.name}", success=True,

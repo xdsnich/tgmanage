@@ -163,6 +163,28 @@ export default function AccountDetailPage() {
     } catch (err) { showToast(err.response?.data?.detail || 'Ошибка', 'error') }
   }
 
+  const [postingStoryNow, setPostingStoryNow] = useState(false)
+  const handlePostStoryNow = async (filename = '') => {
+    if (mediaFiles.length === 0) { showToast('Загрузи хотя бы одно фото', 'error'); return }
+    if (!window.confirm(filename
+      ? `Опубликовать "${filename}" как сториз прямо сейчас?`
+      : 'Опубликовать случайное фото как сториз прямо сейчас? (тест Premium-доступа)')) return
+    setPostingStoryNow(true)
+    try {
+      const { data } = await accountMediaAPI.postStoryNow(id, filename)
+      if (data.success) {
+        showToast(data.message)
+      } else if (data.premium_required) {
+        showToast('Этому аккаунту нужен Telegram Premium', 'error')
+      } else {
+        showToast(data.message || 'Не удалось', 'error')
+      }
+    } catch (err) {
+      showToast(err.response?.data?.detail || 'Ошибка', 'error')
+    }
+    setPostingStoryNow(false)
+  }
+
   useEffect(() => { load(); loadMedia() }, [id])
 
   // На размонтировании страницы — отзываем все blob URL чтобы не текла память
@@ -725,6 +747,13 @@ export default function AccountDetailPage() {
                 </div>
               </div>
               <div style={{ display: 'flex', gap: 6 }}>
+                {mediaFiles.length > 0 && (
+                  <Button variant="outline" size="sm" loading={postingStoryNow}
+                    onClick={() => handlePostStoryNow('')}
+                    title="Опубликовать случайное фото как сториз прямо сейчас (тест Premium)">
+                    🚀 Тест сториз
+                  </Button>
+                )}
                 <Button variant="primary" size="sm" loading={mediaUploading}
                   onClick={() => mediaInputRef.current?.click()}>
                   + Загрузить
@@ -757,6 +786,14 @@ export default function AccountDetailPage() {
                     ) : (
                       <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 11, color: 'var(--text-3)' }}>...</div>
                     )}
+                    <button
+                      onClick={() => handlePostStoryNow(f.filename)}
+                      title="Опубликовать именно это фото как сториз"
+                      style={{
+                        position: 'absolute', top: 4, left: 4, width: 22, height: 22, borderRadius: '50%',
+                        background: 'rgba(124,77,255,0.85)', border: 'none', color: 'white',
+                        fontSize: 11, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      }}>🚀</button>
                     <button
                       onClick={() => handleMediaDelete(f.filename)}
                       title="Удалить"

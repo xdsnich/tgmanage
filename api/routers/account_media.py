@@ -356,6 +356,110 @@ async def bulk_clear_media(
     }
 
 
+@router.post("/post-story-now")
+async def post_story_now(
+    account_id: int,
+    filename: str = "",
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Опубликовать сториз ВРУЧНУЮ — для теста что аккаунт Premium и API работает.
+    Если filename не передан — берётся рандомное фото из папки акка.
+    Игнорирует дневной лимит (но инкрементит счётчик после успешной публикации,
+    чтобы планировщик сегодня уже не пытался — иначе будет 2 сториз/сутки).
+    """
+    from sqlalchemy.orm import joinedload
+    from models.account import TelegramAccount
+    from models.proxy import Proxy
+    from utils.telegram import make_telethon_client
+    from utils.story_limit import mark_story_posted_today
+
+    # Грузим аккаунт + прокси
+    acc = (await db.execute(
+        select(TelegramAccount).options(joinedload(TelegramAccount.api_app))
+        .where(TelegramAccount.id == account_id, TelegramAccount.user_id == current_user.id)
+    )).scalar_one_or_none()
+    if not acc:
+        raise HTTPException(status_code=404, detail="Аккаунт не найден")
+
+    proxy = None
+    if acc.proxy_id:
+        proxy = (await db.execute(select(Proxy).where(Proxy.id == acc.proxy_id))).scalar_one_or_none()
+    if not proxy:
+        raise HTTPException(status_code=400, detail="У аккаунта нет прокси")
+
+    # Выбираем фото
+    paths = list_account_media_paths(account_id)
+    if not paths:
+        raise HTTPException(status_code=400, detail="В папке акка нет фото — загрузи хотя бы одно")
+
+    if filename:
+        if "/" in filename or "\\" in filename or ".." in filename:
+            raise HTTPException(status_code=400, detail="Невалидное имя файла")
+        target = _account_dir(account_id) / filename
+        if not target.exists():
+            raise HTTPException(status_code=404, detail="Файл не найден в папке акка")
+        photo_path = target
+    else:
+        import random
+        photo_path = random.choice(paths)
+
+    # Создаём клиента (через единую фабрику — прокси обязателен)
+    client = make_telethon_client(acc, proxy)
+    if not client:
+        raise HTTPException(status_code=400, detail="Не удалось создать Telethon-клиент (нет сессии или прокси)")
+
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            raise HTTPException(status_code=400, detail="Сессия не активна — нужна повторная авторизация")
+
+        try:
+            from telethon.tl.functions.stories import SendStoryRequest
+            from telethon.tl.types import InputMediaUploadedPhoto, InputPrivacyValueAllowAll
+        except ImportError:
+            await client.disconnect()
+            raise HTTPException(status_code=500, detail="Telethon без stories API (обновить пакет)")
+
+        import random
+        try:
+            f = await client.upload_file(str(photo_path))
+            media = InputMediaUploadedPhoto(file=f)
+            await client(SendStoryRequest(
+                peer="me",
+                media=media,
+                privacy_rules=[InputPrivacyValueAllowAll()],
+                random_id=random.getrandbits(63),
+                period=86400,
+            ))
+            mark_story_posted_today(account_id)
+            await client.disconnect()
+            return {
+                "success": True,
+                "filename": photo_path.name,
+                "message": f"✅ Сториз опубликован ({photo_path.name}). Длительность 24ч.",
+            }
+        except Exception as e:
+            try: await client.disconnect()
+            except Exception: pass
+            err = str(e)
+            if "PREMIUM" in err.upper() or "PremiumAccountRequired" in err:
+                return {
+                    "success": False,
+                    "premium_required": True,
+                    "message": "❌ Этому аккаунту нужен Telegram Premium для публикации сториз через API.",
+                }
+            raise HTTPException(status_code=500, detail=f"Ошибка публикации: {err[:200]}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        try: await client.disconnect()
+        except Exception: pass
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)[:200]}")
+
+
 @bulk_router.post("/list")
 async def bulk_list_media(
     payload: dict,

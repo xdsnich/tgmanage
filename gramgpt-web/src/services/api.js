@@ -488,6 +488,11 @@ export const accountMediaAPI = {
   clear: (accountId) =>
     api.delete(`/accounts/${accountId}/media`),
 
+  // Ручная публикация сториз — для теста Premium + API
+  postStoryNow: (accountId, filename = '') =>
+    api.post(`/accounts/${accountId}/media/post-story-now`,
+      null, { params: filename ? { filename } : {} }),
+
   // ── Bulk: на несколько аккаунтов сразу ──
   bulkUpload: (accountIds, formData) => {
     // accountIds придёт как поле "account_ids" формы — CSV строкой

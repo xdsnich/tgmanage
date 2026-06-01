@@ -500,9 +500,13 @@ async def _do_post_story(client, phone, account_id: int):
     Не-Premium получит PremiumAccountRequiredError — обрабатываем мягко, action
     скипается без падения warmup'а.
 
-    Если в папке акка нет фото — также мягкий скип.
+    Если в папке акка нет фото или уже постили сегодня — также мягкий скип.
     """
     from routers.account_media import list_account_media_paths
+    from utils.story_limit import can_post_story_today, mark_story_posted_today
+
+    if not can_post_story_today(account_id):
+        return "Сториз: уже постили сегодня (1/день лимит)", ""
 
     paths = list_account_media_paths(account_id)
     if not paths:
@@ -520,13 +524,15 @@ async def _do_post_story(client, phone, account_id: int):
     try:
         file = await client.upload_file(str(photo_path))
         media = InputMediaUploadedPhoto(file=file)
-        await client(SendStoryRequest(
+        result = await client(SendStoryRequest(
             peer="me",
             media=media,
             privacy_rules=[InputPrivacyValueAllowAll()],
             random_id=random.getrandbits(63),
             period=86400,   # 24 часа — стандартная длительность Telegram-сториз
         ))
+        _ = result  # подавляем "unused" — Telethon-объект ответа нам не нужен
+        mark_story_posted_today(account_id)
         return f"Сториз опубликован ({photo_path.name})", ""
     except Exception as e:
         err = str(e)
