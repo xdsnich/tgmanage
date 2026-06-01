@@ -15,16 +15,72 @@ api.interceptors.request.use((config) => {
   return config
 })
 
-// При 401 — очищаем токен и редиректим на логин
+// ── 401 handling: refresh-then-retry, logout только если refresh не отдал новый токен
+//
+// Раньше на ЛЮБОЙ 401 (даже если access-токен просто истёк, а refresh жив)
+// мы стирали оба токена и редиректили на /login — отсюда и было ощущение
+// «постоянно выкидывает». Теперь: пробуем /auth/refresh; если он вернул
+// новую пару — повторяем оригинальный запрос; если refresh сам отдал ошибку
+// — только тогда чистим хранилище и редиректим.
+
+let refreshPromise = null  // singleton чтобы 10 одновременных 401 не порождали 10 refresh-запросов
+
+function clearAuthAndRedirect() {
+  localStorage.removeItem('access_token')
+  localStorage.removeItem('refresh_token')
+  // Не редиректим если мы уже на /login или /register (иначе цикл и стёртая форма)
+  const p = window.location.pathname
+  if (p !== '/login' && p !== '/register') {
+    window.location.href = '/login'
+  }
+}
+
 api.interceptors.response.use(
   (res) => res,
-  (err) => {
-    if (err.response?.status === 401) {
-      localStorage.removeItem('access_token')
-      localStorage.removeItem('refresh_token')
-      window.location.href = '/login'
+  async (err) => {
+    const status = err.response?.status
+    const original = err.config
+    const url = original?.url || ''
+
+    // Не лезем в refresh-логику для самих auth-эндпоинтов (login/refresh/logout)
+    // — иначе при неверном пароле или невалидном refresh мы бесконечно зациклимся.
+    const isAuthEndpoint = url.startsWith('/auth/')
+    if (status !== 401 || isAuthEndpoint || original?._retried) {
+      return Promise.reject(err)
     }
-    return Promise.reject(err)
+
+    const refresh = localStorage.getItem('refresh_token')
+    if (!refresh) {
+      clearAuthAndRedirect()
+      return Promise.reject(err)
+    }
+
+    // Один общий refresh на все одновременные 401-ошибки
+    if (!refreshPromise) {
+      refreshPromise = axios
+        .post('/api/v1/auth/refresh', { refresh_token: refresh })
+        .then((r) => {
+          localStorage.setItem('access_token', r.data.access_token)
+          localStorage.setItem('refresh_token', r.data.refresh_token)
+          return r.data.access_token
+        })
+        .catch((e) => {
+          // Refresh-токен невалиден/истёк — реально logout
+          clearAuthAndRedirect()
+          throw e
+        })
+        .finally(() => { refreshPromise = null })
+    }
+
+    try {
+      const newAccess = await refreshPromise
+      original._retried = true
+      original.headers = original.headers || {}
+      original.headers.Authorization = `Bearer ${newAccess}`
+      return api(original)
+    } catch {
+      return Promise.reject(err)
+    }
   }
 )
 
@@ -38,6 +94,9 @@ export const authAPI = {
 
   me: () =>
     api.get('/auth/me'),
+
+  refresh: (refreshToken) =>
+    api.post('/auth/refresh', { refresh_token: refreshToken }),
 
   logout: () =>
     api.post('/auth/logout'),
