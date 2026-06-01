@@ -235,6 +235,10 @@ export default function CommentingPage() {
       if (action === 'start')       await commentingAPI.start(id)
       else if (action === 'pause')  await commentingAPI.pause(id)
       else if (action === 'stop')   await commentingAPI.stop(id)
+      else if (action === 'cancel-schedule') {
+        if (!window.confirm('Отменить планирование? Кампания вернётся в "Черновик".')) return
+        await commentingAPI.cancelSchedule(id)
+      }
       else if (action === 'delete') {
         if (!window.confirm('Удалить кампанию?')) return
         await commentingAPI.delete(id)
@@ -437,6 +441,22 @@ export default function CommentingPage() {
                           })()}
                         </div>
 
+                        {c.status === 'scheduled' && (
+                          <div style={{
+                            marginTop: 8, padding: '8px 12px', borderRadius: 8, fontSize: 12, display: 'inline-block',
+                            background: 'rgba(124,77,255,0.08)',
+                            color: 'var(--violet)',
+                            border: '1px solid rgba(124,77,255,0.25)',
+                            lineHeight: 1.5,
+                          }}>
+                            📅 <b>Стартует автоматически</b> — когда все прогревы batch'а закончатся
+                            {c.scheduled_start_at && (
+                              <>, либо не позднее <b>{new Date(c.scheduled_start_at).toLocaleString('ru')}</b></>
+                            )}
+                            . Кнопка <b>🚀 Запустить сейчас</b> справа — если не хочешь ждать.
+                          </div>
+                        )}
+
                         {sub && (
                           <div style={{
                             marginTop: 8, padding: '5px 10px', borderRadius: 6, fontSize: 11, display: 'inline-block',
@@ -475,6 +495,18 @@ export default function CommentingPage() {
                         )}
                         {(c.status === 'draft' || c.status === 'paused' || c.status === 'stopped') && (
                           <Button variant="primary" size="sm" onClick={() => handleAction(c.id, 'start')}>▶ Старт</Button>
+                        )}
+                        {c.status === 'scheduled' && (
+                          <>
+                            <Button variant="primary" size="sm" title="Запустить сейчас, не дожидаясь окончания прогрева"
+                              onClick={() => handleAction(c.id, 'start')}>
+                              🚀 Запустить сейчас
+                            </Button>
+                            <Button variant="ghost" size="sm" title="Отменить планирование — кампания вернётся в «Черновик»"
+                              onClick={() => handleAction(c.id, 'cancel-schedule')}>
+                              ❌ Отменить
+                            </Button>
+                          </>
                         )}
                         {c.status === 'active' && (
                           <>

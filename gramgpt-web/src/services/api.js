@@ -401,6 +401,9 @@ export const commentingAPI = {
   scheduleAfterWarmup: (data) =>
     api.post('/commenting/campaigns/schedule-after-warmup', data),
 
+  cancelSchedule: (id) =>
+    api.post(`/commenting/campaigns/${id}/cancel-schedule`),
+
   get: (id) =>
     api.get(`/commenting/campaigns/${id}`),
 

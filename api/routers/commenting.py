@@ -485,6 +485,26 @@ async def stop_campaign(
     return {"success": True, "status": "stopped"}
 
 
+@router.post("/campaigns/{campaign_id}/cancel-schedule")
+async def cancel_schedule(
+    campaign_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Отменить запланированный авто-старт. Кампания возвращается в 'draft',
+    scheduled_start_at очищается, warmup_batch_id сохраняется (можно
+    запустить вручную и каналы из прогрева всё равно будут pre-joined).
+    """
+    c = await _get_campaign(db, campaign_id, current_user.id)
+    if c.status != CampaignStatus.scheduled:
+        raise HTTPException(status_code=400, detail=f"Кампания не в статусе scheduled (status={c.status})")
+    c.status = CampaignStatus.draft
+    c.scheduled_start_at = None
+    await db.flush()
+    return {"success": True, "status": "draft", "message": "Планирование отменено. Можно запустить вручную."}
+
+
 # ── Target Channels ──────────────────────────────────────────
 
 @router.post("/campaigns/{campaign_id}/channels")
