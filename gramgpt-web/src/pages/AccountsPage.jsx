@@ -57,7 +57,10 @@ export default function AccountsPage() {
   const [channelForm, setChannelForm] = useState({ title: '', username: '', description: '', first_post: '', pin_to_profile: true })
   const [channelAvatar, setChannelAvatar] = useState(null)
   const [channelPostPhoto, setChannelPostPhoto] = useState(null)
+  const [channelAvatarPreview, setChannelAvatarPreview] = useState(null)
+  const [channelPostPhotoPreview, setChannelPostPhotoPreview] = useState(null)
   const [creating, setCreating] = useState(false)
+  const [creatingStage, setCreatingStage] = useState(null) // 'setup' | 'reconnect' | 'post'
   const [channelResult, setChannelResult] = useState(null)
 
   // Diagnostics: test join
@@ -80,6 +83,20 @@ export default function AccountsPage() {
   }
 
   useEffect(() => { load() }, [])
+
+  // Превью загруженных фото в модалке создания канала
+  useEffect(() => {
+    if (!channelAvatar) { setChannelAvatarPreview(null); return }
+    const url = URL.createObjectURL(channelAvatar)
+    setChannelAvatarPreview(url)
+    return () => URL.revokeObjectURL(url)
+  }, [channelAvatar])
+  useEffect(() => {
+    if (!channelPostPhoto) { setChannelPostPhotoPreview(null); return }
+    const url = URL.createObjectURL(channelPostPhoto)
+    setChannelPostPhotoPreview(url)
+    return () => URL.revokeObjectURL(url)
+  }, [channelPostPhoto])
 
   const filtered = accounts.filter(a => {
     const q = search.toLowerCase()
@@ -145,6 +162,14 @@ export default function AccountsPage() {
   const handleCreateChannel = async (e) => {
     e.preventDefault()
     setCreating(true)
+    setCreatingStage('setup')
+    const hasFirstPost = !!(channelForm.first_post.trim() || channelPostPhoto)
+    // Этапы по времени совпадают с серверным flow (см. POST /channels/create-full)
+    const stageTimers = []
+    if (hasFirstPost) {
+      stageTimers.push(setTimeout(() => setCreatingStage('reconnect'), 6000))
+      stageTimers.push(setTimeout(() => setCreatingStage('post'), 9000))
+    }
     try {
       const fd = new FormData()
       fd.append('account_id', channelAccount.id)
@@ -161,6 +186,8 @@ export default function AccountsPage() {
     } catch (err) {
       setChannelResult({ success: false, error: err.response?.data?.detail || 'Ошибка создания канала' })
     }
+    stageTimers.forEach(clearTimeout)
+    setCreatingStage(null)
     setCreating(false)
   }
 
@@ -617,6 +644,9 @@ export default function AccountsPage() {
                 onChange={e => setChannelForm(f => ({ ...f, first_post: e.target.value }))}
                 placeholder="Текст первого сообщения (необязательно)"
                 style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 14, outline: 'none', resize: 'vertical', fontFamily: 'var(--font-sans)' }} />
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4, lineHeight: 1.5 }}>
+                Пост публикуется отдельным этапом: канал создаётся → сессия переподключается → пост уходит. Так Telegram не режет первое сообщение на свежем канале.
+              </div>
             </div>
 
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
@@ -624,16 +654,32 @@ export default function AccountsPage() {
               <div>
                 <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Аватар канала</label>
                 <div onClick={() => avatarInputRef.current?.click()} style={{
-                  height: 80, border: '2px dashed var(--border)', borderRadius: 10,
-                  display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-                  cursor: 'pointer', transition: 'border-color 0.15s', gap: 4,
+                  position: 'relative', height: 80, border: '2px dashed var(--border)', borderRadius: 10,
+                  display: 'flex', flexDirection: channelAvatarPreview ? 'row' : 'column',
+                  alignItems: 'center', justifyContent: 'center',
+                  cursor: 'pointer', transition: 'border-color 0.15s', gap: 8, padding: channelAvatarPreview ? '6px 10px' : 0,
+                  overflow: 'hidden',
                 }}
                   onMouseEnter={e => e.currentTarget.style.borderColor = 'var(--violet)'}
                   onMouseLeave={e => e.currentTarget.style.borderColor = 'var(--border)'}>
                   {channelAvatar ? (
                     <>
-                      <span style={{ fontSize: 11, color: 'var(--green)', fontWeight: 600 }}>✓ {channelAvatar.name.length > 16 ? channelAvatar.name.slice(0, 14) + '…' : channelAvatar.name}</span>
-                      <span style={{ fontSize: 10, color: 'var(--text-3)' }}>нажми чтобы сменить</span>
+                      {channelAvatarPreview && (
+                        <img src={channelAvatarPreview} alt="avatar preview"
+                          style={{ width: 56, height: 56, borderRadius: '50%', objectFit: 'cover', flexShrink: 0, border: '1px solid var(--border)' }} />
+                      )}
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0, flex: 1 }}>
+                        <span style={{ fontSize: 11, color: 'var(--green)', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          ✓ {channelAvatar.name}
+                        </span>
+                        <span style={{ fontSize: 10, color: 'var(--text-3)' }}>нажми чтобы сменить</span>
+                      </div>
+                      <button type="button" onClick={(ev) => { ev.stopPropagation(); setChannelAvatar(null) }}
+                        title="Удалить" style={{
+                          position: 'absolute', top: 4, right: 4, width: 18, height: 18, borderRadius: '50%',
+                          background: 'var(--bg-2)', border: '1px solid var(--border)', color: 'var(--text-3)',
+                          fontSize: 11, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0,
+                        }}>×</button>
                     </>
                   ) : (
                     <>
@@ -650,16 +696,32 @@ export default function AccountsPage() {
               <div>
                 <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Фото к посту</label>
                 <div onClick={() => postPhotoInputRef.current?.click()} style={{
-                  height: 80, border: '2px dashed var(--border)', borderRadius: 10,
-                  display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-                  cursor: 'pointer', transition: 'border-color 0.15s', gap: 4,
+                  position: 'relative', height: 80, border: '2px dashed var(--border)', borderRadius: 10,
+                  display: 'flex', flexDirection: channelPostPhotoPreview ? 'row' : 'column',
+                  alignItems: 'center', justifyContent: 'center',
+                  cursor: 'pointer', transition: 'border-color 0.15s', gap: 8, padding: channelPostPhotoPreview ? '6px 10px' : 0,
+                  overflow: 'hidden',
                 }}
                   onMouseEnter={e => e.currentTarget.style.borderColor = 'var(--violet)'}
                   onMouseLeave={e => e.currentTarget.style.borderColor = 'var(--border)'}>
                   {channelPostPhoto ? (
                     <>
-                      <span style={{ fontSize: 11, color: 'var(--green)', fontWeight: 600 }}>✓ {channelPostPhoto.name.length > 16 ? channelPostPhoto.name.slice(0, 14) + '…' : channelPostPhoto.name}</span>
-                      <span style={{ fontSize: 10, color: 'var(--text-3)' }}>нажми чтобы сменить</span>
+                      {channelPostPhotoPreview && (
+                        <img src={channelPostPhotoPreview} alt="post photo preview"
+                          style={{ width: 56, height: 56, borderRadius: 8, objectFit: 'cover', flexShrink: 0, border: '1px solid var(--border)' }} />
+                      )}
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0, flex: 1 }}>
+                        <span style={{ fontSize: 11, color: 'var(--green)', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          ✓ {channelPostPhoto.name}
+                        </span>
+                        <span style={{ fontSize: 10, color: 'var(--text-3)' }}>нажми чтобы сменить</span>
+                      </div>
+                      <button type="button" onClick={(ev) => { ev.stopPropagation(); setChannelPostPhoto(null) }}
+                        title="Удалить" style={{
+                          position: 'absolute', top: 4, right: 4, width: 18, height: 18, borderRadius: '50%',
+                          background: 'var(--bg-2)', border: '1px solid var(--border)', color: 'var(--text-3)',
+                          fontSize: 11, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0,
+                        }}>×</button>
                     </>
                   ) : (
                     <>
@@ -683,6 +745,29 @@ export default function AccountsPage() {
                 <div style={{ fontSize: 11, color: 'var(--text-3)' }}>Канал появится как личный канал аккаунта</div>
               </div>
             </label>
+
+            {creating && (
+              <div style={{ padding: '10px 12px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {[
+                  { key: 'setup', label: 'Создаю канал, ставлю аватар и закрепляю в профиле' },
+                  { key: 'reconnect', label: 'Переподключаю сессию (2 сек пауза)' },
+                  { key: 'post', label: 'Публикую первый пост' },
+                ].map((s, i, arr) => {
+                  const stages = arr.map(x => x.key)
+                  const curIdx = stages.indexOf(creatingStage)
+                  const myIdx = stages.indexOf(s.key)
+                  const done = myIdx < curIdx
+                  const active = myIdx === curIdx
+                  return (
+                    <div key={s.key} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12,
+                      color: done ? 'var(--green)' : active ? 'var(--violet)' : 'var(--text-3)' }}>
+                      <span style={{ width: 14 }}>{done ? '✓' : active ? '◐' : '○'}</span>
+                      <span style={{ fontWeight: active ? 600 : 400 }}>{s.label}</span>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
 
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
               <Button variant="ghost" type="button" onClick={() => setChannelModal(false)}>Отмена</Button>

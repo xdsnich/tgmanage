@@ -181,6 +181,9 @@ export const securityAPI = {
   terminateSessions: (accountId) =>
     api.post(`/security/accounts/${accountId}/terminate-sessions`),
 
+  terminateSession: (accountId, hash) =>
+    api.post(`/security/accounts/${accountId}/terminate-session/${hash}`),
+
   set2FA: (accountId, password, hint = '') =>
     api.post(`/security/accounts/${accountId}/set-2fa`, { password, hint }),
 
@@ -205,11 +208,22 @@ export const channelsAPI = {
   createFull: (formData) =>
     api.post('/channels/create-full', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
-      timeout: 60000,
+      timeout: 120000,
     }),
 
   pin: (accountId, channelLink) =>
     api.post('/channels/pin', { account_id: accountId, channel_link: channelLink }),
+
+  editInfo: (accountId, channelId, { title = null, description = null } = {}) =>
+    api.post('/channels/edit-info', {
+      account_id: accountId, channel_id: channelId, title, description,
+    }),
+
+  postToChannel: (formData) =>
+    api.post('/channels/post', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 60000,
+    }),
 }
 
 // ── ACTIONS (быстрые действия) ──────────────────────────────
@@ -308,6 +322,16 @@ export const parserAPI = {
   statsTopSeeds: (limit = 10) => api.get('/parser/stats/top-seeds', { params: { limit } }),
   statsByAccount: () => api.get('/parser/stats/by-account'),
   statsSessions: (limit = 15) => api.get('/parser/stats/sessions', { params: { limit } }),
+
+  // Verify: has_comments проверка
+  verifyStart: (data) => api.post('/parser/verify/start', data),
+  verifyProgress: () => api.get('/parser/verify/progress'),
+  verifyStop: () => api.post('/parser/verify/stop'),
+
+  // Alive: проверка живости (последний пост за N дней)
+  aliveStart: (data) => api.post('/parser/alive/start', data),
+  aliveProgress: () => api.get('/parser/alive/progress'),
+  aliveStop: () => api.post('/parser/alive/stop'),
 }
 
 // ── COMMENTING (нейрокомментинг) ─────────────────────────────
@@ -365,7 +389,7 @@ export const commentingAPI = {
     api.get(`/commenting/campaigns/${id}/plans`, { params: day ? { day } : {} }),
 }
 
-// ── API APPS (мульти-API ключи) ──────────────────────────────
+// ── API APPS (Telegram api_id/api_hash) ──────────────────────
 export const apiAppsAPI = {
   list: () => api.get('/api-apps'),
   get: (id) => api.get(`/api-apps/${id}`),
@@ -373,6 +397,17 @@ export const apiAppsAPI = {
   update: (id, data) => api.patch(`/api-apps/${id}`, data),
   delete: (id) => api.delete(`/api-apps/${id}`),
   stats: () => api.get('/api-apps/stats/overview'),
+}
+
+// ── SERVICE CREDENTIALS (Claude / OpenAI / Gemini / Groq / TGStat) ──
+export const serviceCredentialsAPI = {
+  list:      () => api.get('/service-credentials'),
+  providers: () => api.get('/service-credentials/providers'),
+  stats:     () => api.get('/service-credentials/stats'),
+  create:    (data) => api.post('/service-credentials', data),
+  update:    (id, data) => api.patch(`/service-credentials/${id}`, data),
+  delete:    (id) => api.delete(`/service-credentials/${id}`),
+  test:      (id) => api.post(`/service-credentials/${id}/test`),
 }
 
 // ── REACTIONS (реакции на посты) ──────────────────────────────

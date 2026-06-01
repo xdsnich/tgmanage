@@ -119,6 +119,56 @@ async def list_sessions(
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)[:200]}")
 
 
+@router.post("/accounts/{account_id}/terminate-session/{hash}")
+async def terminate_single_session(
+    account_id: int,
+    hash: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Завершить одну конкретную сессию по hash. Текущую завершить нельзя."""
+    acc = await _get_account(db, account_id, current_user.id)
+    client = await _get_client(acc, db)
+
+    try:
+        target_hash = int(hash)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Невалидный hash")
+
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            raise HTTPException(status_code=400, detail="Сессия не активна")
+
+        from telethon.tl.functions.account import GetAuthorizationsRequest, ResetAuthorizationRequest
+        result = await client(GetAuthorizationsRequest())
+
+        target = next((a for a in result.authorizations if a.hash == target_hash), None)
+        if not target:
+            await client.disconnect()
+            raise HTTPException(status_code=404, detail="Сессия не найдена")
+        if target.current:
+            await client.disconnect()
+            raise HTTPException(status_code=400, detail="Нельзя завершить текущую сессию (она нас же и держит)")
+
+        await client(ResetAuthorizationRequest(hash=target.hash))
+        print(f"  ℹ️  [{acc.phone}] Завершил: {target.app_name} на {target.device_model} ({target.country})")
+
+        if acc.active_sessions and acc.active_sessions > 1:
+            acc.active_sessions -= 1
+            await db.flush()
+
+        await client.disconnect()
+        return {"success": True, "terminated": {"device": target.device_model, "app": target.app_name}}
+
+    except HTTPException: raise
+    except Exception as e:
+        try: await client.disconnect()
+        except: pass
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)[:200]}")
+
+
 @router.post("/accounts/{account_id}/terminate-sessions")
 async def terminate_sessions(
     account_id: int,

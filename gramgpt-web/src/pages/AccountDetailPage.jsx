@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { accountsAPI, securityAPI, channelsAPI, actionsAPI, tgAuthAPI, proxiesAPI, apiAppsAPI } from '../services/api'
 import { Card, Button, Input, Modal, TrustBar, StatusBadge, Badge, Spinner, Empty } from '../components/ui'
@@ -32,6 +32,17 @@ export default function AccountDetailPage() {
   const [channelModal, setChannelModal] = useState(false)
   const [proxyModal, setProxyModal] = useState(false)
   const [exportModal, setExportModal] = useState(false)
+
+  // Manage existing channel (click on channel card)
+  const [manageChannel, setManageChannel] = useState(null) // выбранный канал из списка
+  const [mcTitle, setMcTitle] = useState('')
+  const [mcDescription, setMcDescription] = useState('')
+  const [mcPostText, setMcPostText] = useState('')
+  const [mcPostPhoto, setMcPostPhoto] = useState(null)
+  const [mcPostPhotoPreview, setMcPostPhotoPreview] = useState(null)
+  const [mcSavingInfo, setMcSavingInfo] = useState(false)
+  const [mcPosting, setMcPosting] = useState(false)
+  const mcPhotoRef = useRef(null)
 
   // Forms
   const [editData, setEditData] = useState({})
@@ -88,6 +99,72 @@ export default function AccountDetailPage() {
   }
 
   useEffect(() => { load() }, [id])
+
+  useEffect(() => {
+    if (!mcPostPhoto) { setMcPostPhotoPreview(null); return }
+    const url = URL.createObjectURL(mcPostPhoto)
+    setMcPostPhotoPreview(url)
+    return () => URL.revokeObjectURL(url)
+  }, [mcPostPhoto])
+
+  const openManageChannel = (ch) => {
+    setManageChannel(ch)
+    setMcTitle(ch.title || '')
+    setMcDescription(ch.description || '')
+    setMcPostText('')
+    setMcPostPhoto(null)
+  }
+
+  const closeManageChannel = () => {
+    setManageChannel(null)
+    setMcPostPhoto(null)
+  }
+
+  const handleSaveChannelInfo = async () => {
+    if (!manageChannel) return
+    setMcSavingInfo(true)
+    try {
+      const payload = {}
+      if (mcTitle.trim() && mcTitle.trim() !== manageChannel.title) payload.title = mcTitle.trim()
+      if (mcDescription !== (manageChannel.description || '')) payload.description = mcDescription
+      if (!('title' in payload) && !('description' in payload)) {
+        showToast('Нечего изменять', 'info'); setMcSavingInfo(false); return
+      }
+      const { data } = await channelsAPI.editInfo(account.id, manageChannel.id, payload)
+      const updated = {
+        ...manageChannel,
+        ...(data.title_updated ? { title: payload.title } : {}),
+        ...(data.description_updated ? { description: payload.description } : {}),
+      }
+      setManageChannel(updated)
+      setChannels(prev => prev.map(c => c.id === updated.id ? updated : c))
+      showToast('Канал обновлён')
+    } catch (err) {
+      showToast(err.response?.data?.detail || 'Ошибка', 'error')
+    }
+    setMcSavingInfo(false)
+  }
+
+  const handlePostToChannel = async () => {
+    if (!manageChannel) return
+    if (!mcPostText.trim() && !mcPostPhoto) {
+      showToast('Пустой пост', 'error'); return
+    }
+    setMcPosting(true)
+    try {
+      const fd = new FormData()
+      fd.append('account_id', account.id)
+      fd.append('channel_id', manageChannel.id)
+      fd.append('text', mcPostText)
+      if (mcPostPhoto) fd.append('photo', mcPostPhoto)
+      await channelsAPI.postToChannel(fd)
+      setMcPostText(''); setMcPostPhoto(null)
+      showToast('Пост опубликован')
+    } catch (err) {
+      showToast(err.response?.data?.detail || 'Ошибка публикации', 'error')
+    }
+    setMcPosting(false)
+  }
 
   // ── Handlers ──────────────────────────────────────────────
 
@@ -158,6 +235,22 @@ export default function AccountDetailPage() {
       showToast('Сессии завершены'); await loadSessions()
     } catch (err) { showToast(err.response?.data?.detail || 'Ошибка', 'error') }
     setSaving(false)
+  }
+
+  const [terminatingHash, setTerminatingHash] = useState(null)
+  const handleTerminateOne = async (s) => {
+    if (s.current) { showToast('Нельзя завершить текущую сессию', 'info'); return }
+    const label = s.device || s.app_name || 'эту сессию'
+    if (!window.confirm(`Завершить сессию «${label}»?`)) return
+    setTerminatingHash(s.hash)
+    try {
+      await securityAPI.terminateSession(id, s.hash)
+      showToast('Сессия завершена')
+      setSessions(prev => prev.filter(x => x.hash !== s.hash))
+    } catch (err) {
+      showToast(err.response?.data?.detail || 'Ошибка', 'error')
+    }
+    setTerminatingHash(null)
   }
 
   const handleExportSession = async () => {
@@ -442,14 +535,50 @@ export default function AccountDetailPage() {
                 Нажмите «Загрузить» для получения списка сессий
               </div>
             ) : sessions.map((s, i) => (
-              <div key={i} style={{
-                padding: '10px 12px', borderRadius: 8, background: 'var(--bg-3)',
-                marginBottom: 6, fontSize: 12,
-              }}>
-                <div style={{ fontWeight: 600, color: 'var(--text)' }}>{s.device_model || s.app_name || 'Устройство'}</div>
-                <div style={{ color: 'var(--text-3)', marginTop: 2 }}>
-                  {s.platform || ''} · {s.ip || ''} · {s.country || ''}
+              <div key={s.hash || i}
+                onClick={() => !s.current && handleTerminateOne(s)}
+                onMouseEnter={e => { if (!s.current) e.currentTarget.style.borderColor = 'var(--red)' }}
+                onMouseLeave={e => { e.currentTarget.style.borderColor = 'transparent' }}
+                style={{
+                  padding: '10px 12px', borderRadius: 8, background: 'var(--bg-3)',
+                  marginBottom: 6, fontSize: 12,
+                  display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8,
+                  border: '1px solid transparent', transition: 'border-color 0.15s',
+                  cursor: s.current ? 'default' : 'pointer',
+                  opacity: terminatingHash === s.hash ? 0.5 : 1,
+                }}>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ fontWeight: 600, color: 'var(--text)', display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {s.device || s.app_name || 'Устройство'}
+                    </span>
+                    {s.current && (
+                      <span style={{ fontSize: 9, padding: '2px 6px', borderRadius: 4, background: 'var(--green-dim)', color: 'var(--green)', fontWeight: 700, letterSpacing: '0.04em', textTransform: 'uppercase' }}>
+                        текущая
+                      </span>
+                    )}
+                  </div>
+                  <div style={{ color: 'var(--text-3)', marginTop: 2 }}>
+                    {s.platform || ''} {s.country ? `· ${s.country}` : ''}{s.region ? `, ${s.region}` : ''} {s.ip ? `· ${s.ip}` : ''}
+                  </div>
                 </div>
+                {!s.current && (
+                  <button
+                    type="button"
+                    onClick={(ev) => { ev.stopPropagation(); handleTerminateOne(s) }}
+                    disabled={terminatingHash === s.hash}
+                    title="Завершить сессию"
+                    style={{
+                      width: 26, height: 26, borderRadius: '50%',
+                      background: 'transparent', border: '1px solid var(--border)', color: 'var(--text-3)',
+                      fontSize: 14, cursor: terminatingHash === s.hash ? 'wait' : 'pointer',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+                      transition: 'all 0.15s',
+                    }}
+                    onMouseEnter={e => { e.currentTarget.style.background = 'var(--red-dim)'; e.currentTarget.style.color = 'var(--red)'; e.currentTarget.style.borderColor = 'var(--red)' }}
+                    onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; e.currentTarget.style.color = 'var(--text-3)'; e.currentTarget.style.borderColor = 'var(--border)' }}
+                  >×</button>
+                )}
               </div>
             ))}
           </Card>
@@ -493,17 +622,23 @@ export default function AccountDetailPage() {
                 Нажмите «Загрузить» для получения списка каналов
               </div>
             ) : channels.map((ch, i) => (
-              <div key={i} style={{
-                padding: '10px 12px', borderRadius: 8, background: 'var(--bg-3)',
-                marginBottom: 6, display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-              }}>
-                <div>
+              <div key={i}
+                onClick={() => openManageChannel(ch)}
+                onMouseEnter={e => e.currentTarget.style.borderColor = 'var(--violet)'}
+                onMouseLeave={e => e.currentTarget.style.borderColor = 'transparent'}
+                style={{
+                  padding: '10px 12px', borderRadius: 8, background: 'var(--bg-3)',
+                  marginBottom: 6, display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                  cursor: 'pointer', border: '1px solid transparent', transition: 'border-color 0.15s',
+                }}>
+                <div style={{ minWidth: 0, flex: 1 }}>
                   <div style={{ fontWeight: 600, fontSize: 13, color: 'var(--text)' }}>{ch.title}</div>
-                  <div style={{ fontSize: 11, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{ch.link || ch.username || ''}</div>
+                  <div style={{ fontSize: 11, color: 'var(--text-3)', fontFamily: 'var(--font-mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{ch.link || ch.username || ''}</div>
                 </div>
-                {ch.members !== undefined && (
-                  <Badge color="blue">{ch.members} подп.</Badge>
-                )}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginLeft: 8 }}>
+                  {ch.members !== undefined && <Badge color="blue">{ch.members} подп.</Badge>}
+                  <span style={{ fontSize: 11, color: 'var(--text-3)' }}>›</span>
+                </div>
               </div>
             ))}
           </Card>
@@ -726,6 +861,89 @@ export default function AccountDetailPage() {
             }}>Сохранить</Button>
           </div>
         </div>
+      </Modal>
+
+      {/* Manage existing channel */}
+      <Modal open={!!manageChannel} onClose={closeManageChannel}
+        title={manageChannel ? `Канал · ${manageChannel.title || ''}` : 'Канал'} width={500}>
+        {manageChannel && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            <div style={{ padding: '8px 12px', background: 'var(--bg-3)', borderRadius: 8, fontSize: 11, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
+              {manageChannel.link || manageChannel.username || `id ${manageChannel.id}`}
+              {manageChannel.members !== undefined && <span style={{ marginLeft: 8 }}>· {manageChannel.members} подп.</span>}
+            </div>
+
+            {/* Edit info */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, padding: '12px 14px', background: 'var(--bg-3)', borderRadius: 10, border: '1px solid var(--border)' }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-2)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Изменить</div>
+              <Input label="Название" value={mcTitle} onChange={e => setMcTitle(e.target.value)} placeholder="Название канала" />
+              <div>
+                <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Описание</label>
+                <textarea value={mcDescription} rows={3}
+                  onChange={e => setMcDescription(e.target.value)}
+                  placeholder="Описание канала (about)"
+                  style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 13, outline: 'none', resize: 'vertical', fontFamily: 'var(--font-sans)' }} />
+              </div>
+              <Button variant="primary" size="sm" onClick={handleSaveChannelInfo} loading={mcSavingInfo} style={{ alignSelf: 'flex-end' }}>
+                Сохранить
+              </Button>
+            </div>
+
+            {/* New post */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10, padding: '12px 14px', background: 'var(--bg-3)', borderRadius: 10, border: '1px solid var(--border)' }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-2)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Новый пост</div>
+              <div>
+                <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Текст</label>
+                <textarea value={mcPostText} rows={3}
+                  onChange={e => setMcPostText(e.target.value)}
+                  placeholder="Текст поста (опционально если есть фото)"
+                  style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 13, outline: 'none', resize: 'vertical', fontFamily: 'var(--font-sans)' }} />
+              </div>
+              <div>
+                <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Фото (опционально)</label>
+                <div onClick={() => mcPhotoRef.current?.click()} style={{
+                  position: 'relative', minHeight: 70, border: '2px dashed var(--border)', borderRadius: 10,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  cursor: 'pointer', transition: 'border-color 0.15s', gap: 8,
+                  padding: mcPostPhotoPreview ? '6px 10px' : '12px', overflow: 'hidden',
+                }}
+                  onMouseEnter={e => e.currentTarget.style.borderColor = 'var(--violet)'}
+                  onMouseLeave={e => e.currentTarget.style.borderColor = 'var(--border)'}>
+                  {mcPostPhoto ? (
+                    <>
+                      {mcPostPhotoPreview && (
+                        <img src={mcPostPhotoPreview} alt="preview"
+                          style={{ width: 56, height: 56, borderRadius: 8, objectFit: 'cover', flexShrink: 0, border: '1px solid var(--border)' }} />
+                      )}
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0, flex: 1 }}>
+                        <span style={{ fontSize: 11, color: 'var(--green)', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          ✓ {mcPostPhoto.name}
+                        </span>
+                        <span style={{ fontSize: 10, color: 'var(--text-3)' }}>нажми чтобы сменить</span>
+                      </div>
+                      <button type="button" onClick={(ev) => { ev.stopPropagation(); setMcPostPhoto(null) }}
+                        title="Удалить" style={{
+                          position: 'absolute', top: 4, right: 4, width: 18, height: 18, borderRadius: '50%',
+                          background: 'var(--bg-2)', border: '1px solid var(--border)', color: 'var(--text-3)',
+                          fontSize: 11, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0,
+                        }}>×</button>
+                    </>
+                  ) : (
+                    <>
+                      <span style={{ fontSize: 18 }}>📸</span>
+                      <span style={{ fontSize: 11, color: 'var(--text-3)' }}>выбрать фото к посту</span>
+                    </>
+                  )}
+                </div>
+                <input ref={mcPhotoRef} type="file" accept="image/*" style={{ display: 'none' }}
+                  onChange={e => setMcPostPhoto(e.target.files[0] || null)} />
+              </div>
+              <Button variant="primary" size="sm" onClick={handlePostToChannel} loading={mcPosting} style={{ alignSelf: 'flex-end' }}>
+                Опубликовать
+              </Button>
+            </div>
+          </div>
+        )}
       </Modal>
 
       {/* Export session */}

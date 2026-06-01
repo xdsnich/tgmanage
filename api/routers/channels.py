@@ -195,12 +195,22 @@ async def create_channel_full(
     username: str = Form(""),
     first_post: str = Form(""),
     pin_to_profile: bool = Form(True),
+    reconnect_pause_sec: int = Form(2),
     post_photo: UploadFile = File(None),
     avatar: UploadFile = File(None),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Создать канал + описание + первый пост (с фото) + аватар + закрепить в профиле."""
+    """
+    Создание канала в два сетевых этапа на одном session-файле:
+    1) Сетап канала: create + username + аватар + закрепить в профиле.
+    2) client.disconnect() → sleep(reconnect_pause_sec=2) → client.connect()
+       (та же сессия, без повторной авторизации — просто сброс сетевого
+       коннекта, чтобы Telegram увидел пост как новую активность).
+    3) Первый пост.
+    Это даёт результат как «человек закрыл и снова открыл приложение перед
+    тем как написать пост» и не триггерит флуд-фильтр на свежем канале.
+    """
     import tempfile
 
     acc = await _get_account(db, account_id, current_user.id)
@@ -273,29 +283,7 @@ async def create_channel_full(
             except Exception as e:
                 logger.warning(f"Avatar upload: {e}")
 
-        # 4. Первый пост (с фото или без)
-        first_post_ok = False
-        has_post_text = first_post.strip()
-        has_post_photo = post_photo_path is not None
-
-        if has_post_text or has_post_photo:
-            try:
-                if has_post_photo:
-                    # Пост с фото (текст как caption)
-                    await client.send_file(
-                        entity=channel,
-                        file=post_photo_path,
-                        caption=first_post if has_post_text else "",
-                    )
-                else:
-                    # Только текст
-                    await client.send_message(entity=channel, message=first_post)
-                await asyncio.sleep(1)
-                first_post_ok = True
-            except Exception as e:
-                logger.warning(f"First post: {e}")
-
-        # 5. Закрепляем канал в профиле
+        # 4. Закрепляем канал в профиле (это часть «настройки канала», не контента)
         pin_ok = False
         if pin_to_profile:
             try:
@@ -309,6 +297,41 @@ async def create_channel_full(
                 pin_ok = True
             except Exception as e:
                 logger.warning(f"Pin channel: {e}")
+
+        # === КАНАЛ СОЗДАН ===
+        # Дальше — отдельный сетевой этап «первый пост»: тот же session-файл,
+        # но disconnect → пауза → reconnect (имитация «закрыл и снова открыл
+        # приложение») — иначе Telegram режет пост на свежем канале.
+        first_post_ok = False
+        has_post_text = bool(first_post.strip())
+        has_post_photo = post_photo_path is not None
+
+        if has_post_text or has_post_photo:
+            pause = max(0, int(reconnect_pause_sec))
+            logger.info(f"[create-full] channel {channel.id} setup done — disconnect, sleep {pause}s, reconnect, then first post")
+            try:
+                await client.disconnect()
+            except Exception as e:
+                logger.warning(f"disconnect before post: {e}")
+            if pause:
+                await asyncio.sleep(pause)
+            try:
+                await asyncio.wait_for(client.connect(), timeout=30)
+            except Exception as e:
+                logger.warning(f"reconnect before post: {e}")
+
+            try:
+                if has_post_photo:
+                    await client.send_file(
+                        entity=channel,
+                        file=post_photo_path,
+                        caption=first_post if has_post_text else "",
+                    )
+                else:
+                    await client.send_message(entity=channel, message=first_post)
+                first_post_ok = True
+            except Exception as e:
+                logger.warning(f"First post: {e}")
 
         channel_data = {
             "id": channel.id,
@@ -440,6 +463,123 @@ async def pin_channel(
         try: await client.disconnect()
         except: pass
         raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)[:200]}")
+
+
+class EditChannelInfoRequest(BaseModel):
+    account_id: int
+    channel_id: int
+    title: Optional[str] = None
+    description: Optional[str] = None
+
+
+@router.post("/edit-info")
+async def edit_channel_info(
+    body: EditChannelInfoRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Изменить название и/или описание канала."""
+    acc = await _get_account(db, body.account_id, current_user.id)
+    client = await _get_client(acc, db)
+
+    title = (body.title or "").strip()
+    description = body.description if body.description is not None else None
+    if not title and description is None:
+        raise HTTPException(status_code=400, detail="Нечего изменять")
+
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            raise HTTPException(status_code=400, detail="Сессия не активна")
+
+        from telethon.tl.functions.channels import EditTitleRequest
+        from telethon.tl.functions.messages import EditChatAboutRequest
+
+        entity = await client.get_entity(body.channel_id)
+
+        title_ok = False
+        if title and title != getattr(entity, "title", ""):
+            await client(EditTitleRequest(channel=entity, title=title))
+            title_ok = True
+
+        about_ok = False
+        if description is not None:
+            await client(EditChatAboutRequest(peer=entity, about=description))
+            about_ok = True
+
+        # Обновим кэшированную запись в acc.channels
+        channels = acc.channels or []
+        for c in channels:
+            if c.get("id") == body.channel_id:
+                if title_ok: c["title"] = title
+                if about_ok: c["description"] = description
+                break
+        acc.channels = channels
+        await db.flush()
+
+        await client.disconnect()
+        return {"success": True, "title_updated": title_ok, "description_updated": about_ok}
+
+    except HTTPException: raise
+    except Exception as e:
+        try: await client.disconnect()
+        except: pass
+        logger.error(f"edit-info error: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)[:200]}")
+
+
+@router.post("/post")
+async def post_to_channel(
+    account_id: int = Form(...),
+    channel_id: int = Form(...),
+    text: str = Form(""),
+    photo: UploadFile = File(None),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Опубликовать пост (текст + опционально фото) в существующий канал аккаунта."""
+    import tempfile
+
+    if not text.strip() and not (photo and photo.filename):
+        raise HTTPException(status_code=400, detail="Пустой пост (нет ни текста, ни фото)")
+
+    acc = await _get_account(db, account_id, current_user.id)
+    client = await _get_client(acc, db)
+
+    photo_path = None
+    if photo and photo.filename:
+        suffix = "." + (photo.filename.split(".")[-1] if "." in photo.filename else "jpg")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(await photo.read())
+            photo_path = tmp.name
+
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            raise HTTPException(status_code=400, detail="Сессия не активна")
+
+        entity = await client.get_entity(channel_id)
+
+        if photo_path:
+            msg = await client.send_file(entity=entity, file=photo_path, caption=text or "")
+        else:
+            msg = await client.send_message(entity=entity, message=text)
+
+        await client.disconnect()
+        return {"success": True, "message_id": getattr(msg, "id", None)}
+
+    except HTTPException: raise
+    except Exception as e:
+        try: await client.disconnect()
+        except: pass
+        logger.error(f"post-to-channel error: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка: {str(e)[:200]}")
+    finally:
+        if photo_path:
+            try: os.unlink(photo_path)
+            except: pass
 
 
 @router.post("/batch-create")
