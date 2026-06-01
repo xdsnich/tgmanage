@@ -666,6 +666,8 @@ class VerifyCommentsRequest(BaseModel):
     only_unverified: bool = True
     active_hours: int = 0
     min_verify_interval_days: int = 0
+    stop_on_flood: bool = True            # на первом FloodWait — стоп
+    flood_cooldown_sec: int = 300         # если stop_on_flood=False: сколько ждать сверх FloodWait перед retry
 
 
 @router.post("/verify/start")
@@ -736,6 +738,79 @@ async def stop_verify_comments(
     r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
     r.setex(f"parser:verify:stop:{current_user.id}", 300, "1")
     return {"status": "stopping"}
+
+
+# ══════════════════════════════════════════════════════════
+# Alive Check — был ли пост за последние N дней
+# ══════════════════════════════════════════════════════════
+
+class AliveCheckRequest(BaseModel):
+    account_id: Optional[int] = None  # только для логов — таск работает через web (t.me/s/), не через API
+    folder: str = ""
+    limit: int = 200
+    max_days_inactive: int = 30  # каналы без поста дольше этого — «мёртвые»
+    pause_min: float = 0.3
+    pause_max: float = 0.8
+
+
+@router.post("/alive/start")
+async def start_alive_check(
+    body: AliveCheckRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Проверяет дату последнего поста для каналов в папке через web (t.me/s/{username}).
+    НЕ дёргает Telegram API — никакого риска флуда/бана. account_id опционален и
+    используется только для логирования.
+    """
+    from celery_app import celery_app
+    task = celery_app.send_task(
+        "tasks.parser_similar_tasks.run_alive_check",
+        args=[current_user.id, body.account_id or 0, body.model_dump()],
+        queue="ai_dialogs",
+    )
+    return {
+        "task_id": task.id,
+        "status": "started",
+        "message": f"Проверка живости запущена (лимит {body.limit}, порог {body.max_days_inactive} дн.)",
+    }
+
+
+@router.get("/alive/progress")
+async def get_alive_progress(
+    current_user: User = Depends(get_current_user),
+):
+    """Прогресс проверки живости."""
+    import redis as redis_lib
+    import os
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    progress = r.get(f"parser:alive:progress:{current_user.id}")
+    if not progress:
+        return {"status": "idle"}
+    try:
+        parts = progress.decode().split("|")
+        return {
+            "status": parts[0],
+            "checked": int(parts[1]),
+            "alive": int(parts[2]),
+            "remaining": int(parts[3]),
+            "current": parts[4] if len(parts) > 4 else "",
+        }
+    except Exception:
+        return {"status": "idle"}
+
+
+@router.post("/alive/stop")
+async def stop_alive_check(
+    current_user: User = Depends(get_current_user),
+):
+    """Прерывает проверку живости."""
+    import redis as redis_lib
+    import os
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    r.setex(f"parser:alive:stop:{current_user.id}", 300, "1")
+    return {"status": "stopping"}
+
 
 # ══════════════════════════════════════════════════════════
 # Keyword Expander — расширение ключевых слов

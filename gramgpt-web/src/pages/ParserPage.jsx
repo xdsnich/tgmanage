@@ -3,6 +3,40 @@ import { accountsAPI, parserAPI } from '../services/api'
 import { Card, Button, Input, Modal, Badge, Spinner, Empty, StatCard } from '../components/ui'
 import { useAutoRefresh } from '../hooks/useAutoRefresh'
 import ParserMetrics from './ParserMetrics'
+
+function CheckBanner({ icon, label, status, current, line, color, onStop, onDismiss }) {
+  const running = status === 'running'
+  const done = status === 'done'
+  const bg = running ? 'rgba(255,255,255,0.04)' : done ? 'rgba(61,214,140,0.06)' : 'rgba(248,81,73,0.06)'
+  const border = running ? 'rgba(255,255,255,0.12)' : done ? 'rgba(61,214,140,0.2)' : 'rgba(248,81,73,0.2)'
+  const textColor = running ? color : done ? 'var(--green)' : 'var(--red)'
+  return (
+    <div style={{
+      marginBottom: 10, padding: '12px 16px', borderRadius: 12,
+      background: bg, border: `1px solid ${border}`,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: running ? 8 : 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span style={{ fontSize: 15 }}>{running ? icon : done ? '✅' : '❌'}</span>
+          <span style={{ fontWeight: 700, fontSize: 13, color: textColor }}>
+            {running ? `${label}...` : done ? `${label} — готово` : `${label} — ошибка`}
+          </span>
+          <span style={{ fontSize: 12, color: 'var(--text-3)' }}>{line}</span>
+        </div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          {running && <button onClick={onStop} style={{ background: 'var(--red-dim)', color: 'var(--red)', border: '1px solid rgba(248,81,73,0.3)', padding: '4px 10px', borderRadius: 6, fontSize: 11, fontWeight: 600, cursor: 'pointer' }}>⏹ Стоп</button>}
+          {!running && <button onClick={onDismiss} style={{ background: 'none', border: 'none', color: 'var(--text-3)', cursor: 'pointer', fontSize: 16 }}>✕</button>}
+        </div>
+      </div>
+      {running && current && (
+        <div style={{ fontSize: 11, color: 'var(--text-3)', paddingLeft: 25 }}>
+          Сейчас: <span style={{ color }}>@{current}</span>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function ParserPage() {
   const [channels, setChannels] = useState([])
   const [accounts, setAccounts] = useState([])
@@ -80,9 +114,28 @@ export default function ParserPage() {
   const [spiderProgress, setSpiderProgress]   = useState(null)
   const [spiderForm, setSpiderForm]           = useState({
     account_id: null, seeds: '', max_depth: 2, max_channels: 500,
-    folder: '', pause_min: 2.0, pause_max: 5.0,
+    folder: '', pause_min: 8.0, pause_max: 15.0,
+    stop_on_flood: true, flood_cooldown_sec: 300,
   })
   const spiderPollRef = useRef(null)
+
+  // Check modal (verify_comments + alive_check)
+  const [checkModal, setCheckModal]    = useState(false)
+  const [checkMode, setCheckMode]      = useState('verify') // 'verify' | 'alive'
+  const [checkSaving, setCheckSaving]  = useState(false)
+  const [verifyForm, setVerifyForm]    = useState({
+    account_id: null, folder: '', limit: 200, active_hours: 0,
+    only_unverified: true, pause_min: 2.0, pause_max: 4.0,
+    stop_on_flood: true, flood_cooldown_sec: 300,
+  })
+  const [aliveForm, setAliveForm]      = useState({
+    account_id: null, folder: '', limit: 200, max_days_inactive: 30,
+    pause_min: 0.3, pause_max: 0.8,
+  })
+  const [verifyProgress, setVerifyProgress] = useState(null)
+  const [aliveProgress, setAliveProgress]   = useState(null)
+  const verifyPollRef = useRef(null)
+  const alivePollRef  = useRef(null)
 
   const showToast = (t, type = 'success') => { setToast({ text: t, type }); setTimeout(() => setToast(null), 3500) }
 
@@ -202,6 +255,74 @@ export default function ParserPage() {
     } catch { }
   }
 
+  // ── Verify / Alive progress polling ──────────────────────────
+  const loadVerifyProgress = async () => {
+    try {
+      const { data } = await parserAPI.verifyProgress()
+      setVerifyProgress(data.status === 'idle' ? null : data)
+      return data.status
+    } catch { return 'idle' }
+  }
+  const loadAliveProgress = async () => {
+    try {
+      const { data } = await parserAPI.aliveProgress()
+      setAliveProgress(data.status === 'idle' ? null : data)
+      return data.status
+    } catch { return 'idle' }
+  }
+
+  useEffect(() => { loadVerifyProgress(); loadAliveProgress() }, [])
+
+  useEffect(() => {
+    if (verifyPollRef.current) clearInterval(verifyPollRef.current)
+    if (verifyProgress?.status === 'running') {
+      verifyPollRef.current = setInterval(async () => {
+        const status = await loadVerifyProgress()
+        if (status !== 'running') { clearInterval(verifyPollRef.current); load() }
+      }, 3000)
+    }
+    return () => { if (verifyPollRef.current) clearInterval(verifyPollRef.current) }
+  }, [verifyProgress?.status])
+
+  useEffect(() => {
+    if (alivePollRef.current) clearInterval(alivePollRef.current)
+    if (aliveProgress?.status === 'running') {
+      alivePollRef.current = setInterval(async () => {
+        const status = await loadAliveProgress()
+        if (status !== 'running') { clearInterval(alivePollRef.current); load() }
+      }, 3000)
+    }
+    return () => { if (alivePollRef.current) clearInterval(alivePollRef.current) }
+  }, [aliveProgress?.status])
+
+  const handleVerifyStart = async () => {
+    if (!verifyForm.account_id) { showToast('Выбери аккаунт', 'error'); return }
+    setCheckSaving(true)
+    try {
+      await parserAPI.verifyStart(verifyForm)
+      setCheckModal(false)
+      showToast('Проверка комментариев запущена')
+      await loadVerifyProgress()
+    } catch (err) { showToast(err.response?.data?.detail || 'Ошибка', 'error') }
+    setCheckSaving(false)
+  }
+  const handleVerifyStop = async () => {
+    try { await parserAPI.verifyStop(); showToast('Останавливаю...'); setTimeout(loadVerifyProgress, 1500) } catch { }
+  }
+  const handleAliveStart = async () => {
+    setCheckSaving(true)
+    try {
+      await parserAPI.aliveStart(aliveForm)
+      setCheckModal(false)
+      showToast('Проверка живости запущена (web-only, без API)')
+      await loadAliveProgress()
+    } catch (err) { showToast(err.response?.data?.detail || 'Ошибка', 'error') }
+    setCheckSaving(false)
+  }
+  const handleAliveStop = async () => {
+    try { await parserAPI.aliveStop(); showToast('Останавливаю...'); setTimeout(loadAliveProgress, 1500) } catch { }
+  }
+
   const loadWhitelist = async (sortBy = wlSortBy, minRate = wlMinRate) => {
     setWlLoading(true)
     try {
@@ -310,6 +431,11 @@ export default function ParserPage() {
           <Button variant="outline" onClick={() => { setSpiderModal(true) }}
             style={spiderProgress?.status === 'running' ? { borderColor: 'rgba(0,194,178,0.5)', color: 'var(--teal)' } : {}}>
             🕷 Паутинка
+          </Button>
+          <Button variant="outline" onClick={() => setCheckModal(true)}
+            style={(verifyProgress?.status === 'running' || aliveProgress?.status === 'running')
+              ? { borderColor: 'rgba(255,176,32,0.5)', color: 'var(--orange, #ffb020)' } : {}}>
+            🛡 Проверка
           </Button>
           <Button variant="primary" onClick={() => { setSearchModal(true); loadGeos() }}>🔍 Поиск</Button>
         </div>
@@ -450,6 +576,28 @@ export default function ParserPage() {
             </div>
           )}
         </div>
+      )}
+
+      {/* Verify progress banner */}
+      {verifyProgress && (
+        <CheckBanner
+          icon="💬" label="Проверка комментариев"
+          status={verifyProgress.status} current={verifyProgress.current}
+          line={`Проверено: ${verifyProgress.checked} · С комментами: ${verifyProgress.with_comments}${verifyProgress.status === 'running' ? ` · Осталось: ${verifyProgress.remaining}` : ''}`}
+          color="var(--blue)"
+          onStop={handleVerifyStop} onDismiss={() => setVerifyProgress(null)}
+        />
+      )}
+
+      {/* Alive progress banner */}
+      {aliveProgress && (
+        <CheckBanner
+          icon="🩺" label="Проверка живости"
+          status={aliveProgress.status} current={aliveProgress.current}
+          line={`Проверено: ${aliveProgress.checked} · Живых: ${aliveProgress.alive}${aliveProgress.status === 'running' ? ` · Осталось: ${aliveProgress.remaining}` : ''}`}
+          color="#ffb020"
+          onStop={handleAliveStop} onDismiss={() => setAliveProgress(null)}
+        />
       )}
 
       {pageTab === 'channels' && (channels.length === 0 ? (
@@ -908,6 +1056,29 @@ export default function ParserPage() {
             </div>
           </div>
 
+          {/* Паузы и поведение при FloodWait */}
+          <div style={{ padding: '12px 14px', background: 'var(--bg-3)', borderRadius: 10, border: '1px solid var(--border)', display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+              Anti-flood
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+              <Input label="Пауза мин. (сек)" type="number" step="0.5" value={spiderForm.pause_min}
+                onChange={e => setSpiderForm(f => ({ ...f, pause_min: parseFloat(e.target.value) || 0 }))} />
+              <Input label="Пауза макс. (сек)" type="number" step="0.5" value={spiderForm.pause_max}
+                onChange={e => setSpiderForm(f => ({ ...f, pause_max: parseFloat(e.target.value) || 0 }))} />
+            </div>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', fontSize: 12, color: 'var(--text-2)' }}>
+              <input type="checkbox" checked={spiderForm.stop_on_flood}
+                onChange={e => setSpiderForm(f => ({ ...f, stop_on_flood: e.target.checked }))}
+                style={{ width: 16, height: 16, accentColor: 'var(--violet)' }} />
+              <span><b>Стоп при FloodWait</b> (безопасно — даём аккаунту реально остыть)</span>
+            </label>
+            {!spiderForm.stop_on_flood && (
+              <Input label="Cool-down после FloodWait (сек, сверх Telegram-wait)" type="number" value={spiderForm.flood_cooldown_sec}
+                onChange={e => setSpiderForm(f => ({ ...f, flood_cooldown_sec: parseInt(e.target.value) || 0 }))} />
+            )}
+          </div>
+
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
             <Button variant="ghost" onClick={() => setSpiderModal(false)}>Отмена</Button>
             <Button
@@ -920,6 +1091,139 @@ export default function ParserPage() {
               🕷 Запустить
             </Button>
           </div>
+        </div>
+      </Modal>
+
+      {/* Check modal (verify_comments + alive_check) */}
+      <Modal open={checkModal} onClose={() => setCheckModal(false)} title="🛡 Проверка каналов" width={500}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <div style={{ padding: '10px 12px', background: 'rgba(124,77,255,0.06)', border: '1px solid rgba(124,77,255,0.15)', borderRadius: 8, fontSize: 12, color: 'var(--text-2)', lineHeight: 1.5 }}>
+            Проверки запускаются в фоне через выбранный аккаунт (с прокси). Каналы берутся из выбранной папки (или вся база).
+          </div>
+
+          {/* Mode tabs */}
+          <div style={{ display: 'flex', gap: 4, padding: 4, background: 'var(--bg-2)', borderRadius: 10, border: '1px solid var(--border)' }}>
+            {[
+              { key: 'verify', label: '💬 Есть ли комменты' },
+              { key: 'alive',  label: '🩺 Живой ли канал' },
+            ].map(t => (
+              <button key={t.key} type="button" onClick={() => setCheckMode(t.key)} style={{
+                flex: 1, padding: '8px 12px', borderRadius: 7, fontSize: 12, fontWeight: checkMode === t.key ? 700 : 500,
+                border: 'none', cursor: 'pointer', transition: 'all 0.15s',
+                background: checkMode === t.key ? 'var(--bg-card)' : 'transparent',
+                color: checkMode === t.key ? 'var(--text)' : 'var(--text-3)',
+              }}>{t.label}</button>
+            ))}
+          </div>
+
+          {checkMode === 'verify' && (
+            <>
+              <div>
+                <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Аккаунт (с прокси)</label>
+                <select value={verifyForm.account_id || ''} onChange={e => setVerifyForm(f => ({ ...f, account_id: parseInt(e.target.value) || null }))} style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 13, outline: 'none' }}>
+                  <option value="">— Выбрать аккаунт —</option>
+                  {accounts.map(a => (
+                    <option key={a.id} value={a.id} disabled={!a.proxy_id}>
+                      {a.first_name || a.phone} {a.proxy_id ? '' : ' (нет прокси)'}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                <div>
+                  <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Папка</label>
+                  <select value={verifyForm.folder} onChange={e => setVerifyForm(f => ({ ...f, folder: e.target.value }))} style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 13, outline: 'none' }}>
+                    <option value="">Вся база</option>
+                    {folders.map(f => <option key={f.name} value={f.name}>{f.name} ({f.count})</option>)}
+                  </select>
+                </div>
+                <Input label="Лимит" type="number" value={verifyForm.limit}
+                  onChange={e => setVerifyForm(f => ({ ...f, limit: parseInt(e.target.value) || 0 }))} />
+              </div>
+
+              <Input label="Активен за (часов, 0 — выключить веб-фильтр)" type="number" value={verifyForm.active_hours}
+                onChange={e => setVerifyForm(f => ({ ...f, active_hours: parseInt(e.target.value) || 0 }))} />
+
+              <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', padding: '8px 10px', background: 'var(--bg-3)', borderRadius: 8, border: '1px solid var(--border)', fontSize: 12 }}>
+                <input type="checkbox" checked={verifyForm.only_unverified}
+                  onChange={e => setVerifyForm(f => ({ ...f, only_unverified: e.target.checked }))}
+                  style={{ width: 16, height: 16, accentColor: 'var(--violet)' }} />
+                Только непроверенные (где has_comments = false)
+              </label>
+
+              {/* Паузы и Anti-flood */}
+              <div style={{ padding: '12px 14px', background: 'var(--bg-3)', borderRadius: 10, border: '1px solid var(--border)', display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <div style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+                  Anti-flood
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                  <Input label="Пауза мин. (сек)" type="number" step="0.5" value={verifyForm.pause_min}
+                    onChange={e => setVerifyForm(f => ({ ...f, pause_min: parseFloat(e.target.value) || 0 }))} />
+                  <Input label="Пауза макс. (сек)" type="number" step="0.5" value={verifyForm.pause_max}
+                    onChange={e => setVerifyForm(f => ({ ...f, pause_max: parseFloat(e.target.value) || 0 }))} />
+                </div>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', fontSize: 12, color: 'var(--text-2)' }}>
+                  <input type="checkbox" checked={verifyForm.stop_on_flood}
+                    onChange={e => setVerifyForm(f => ({ ...f, stop_on_flood: e.target.checked }))}
+                    style={{ width: 16, height: 16, accentColor: 'var(--violet)' }} />
+                  <span><b>Стоп при FloodWait</b> (безопасно — даём аккаунту реально остыть)</span>
+                </label>
+                {!verifyForm.stop_on_flood && (
+                  <Input label="Cool-down после FloodWait (сек, сверх Telegram-wait)" type="number" value={verifyForm.flood_cooldown_sec}
+                    onChange={e => setVerifyForm(f => ({ ...f, flood_cooldown_sec: parseInt(e.target.value) || 0 }))} />
+                )}
+              </div>
+
+              <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
+                <Button variant="ghost" onClick={() => setCheckModal(false)}>Отмена</Button>
+                <Button variant="primary" loading={checkSaving} disabled={!verifyForm.account_id} onClick={handleVerifyStart}>
+                  💬 Запустить проверку
+                </Button>
+              </div>
+            </>
+          )}
+
+          {checkMode === 'alive' && (
+            <>
+              <div style={{ padding: '8px 12px', background: 'rgba(61,214,140,0.06)', border: '1px solid rgba(61,214,140,0.18)', borderRadius: 8, fontSize: 11, color: 'var(--text-2)', lineHeight: 1.5 }}>
+                ✅ Web-only: парсит preview <code style={{ background: 'var(--bg-3)', padding: '1px 5px', borderRadius: 4 }}>t.me/s/{`{username}`}</code>, <b>не дёргает Telegram API</b> — никакого риска флуда/бана. Аккаунт не нужен.
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                <div>
+                  <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Папка</label>
+                  <select value={aliveForm.folder} onChange={e => setAliveForm(f => ({ ...f, folder: e.target.value }))} style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 13, outline: 'none' }}>
+                    <option value="">Вся база</option>
+                    {folders.map(f => <option key={f.name} value={f.name}>{f.name} ({f.count})</option>)}
+                  </select>
+                </div>
+                <Input label="Лимит" type="number" value={aliveForm.limit}
+                  onChange={e => setAliveForm(f => ({ ...f, limit: parseInt(e.target.value) || 0 }))} />
+              </div>
+
+              <Input label="«Живой» = пост за последние N дней" type="number" value={aliveForm.max_days_inactive}
+                onChange={e => setAliveForm(f => ({ ...f, max_days_inactive: parseInt(e.target.value) || 1 }))} />
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: -8 }}>
+                Каналы без поста дольше этого срока считаются «мёртвыми». В БД пишется <code>last_post_date</code> — потом можно отфильтровать список вручную.
+              </div>
+
+              {/* Паузы (только для web — FloodWait нерелевантен) */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                <Input label="Пауза мин. (сек)" type="number" step="0.1" value={aliveForm.pause_min}
+                  onChange={e => setAliveForm(f => ({ ...f, pause_min: parseFloat(e.target.value) || 0 }))} />
+                <Input label="Пауза макс. (сек)" type="number" step="0.1" value={aliveForm.pause_max}
+                  onChange={e => setAliveForm(f => ({ ...f, pause_max: parseFloat(e.target.value) || 0 }))} />
+              </div>
+
+              <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
+                <Button variant="ghost" onClick={() => setCheckModal(false)}>Отмена</Button>
+                <Button variant="primary" loading={checkSaving} onClick={handleAliveStart}>
+                  🩺 Запустить проверку
+                </Button>
+              </div>
+            </>
+          )}
         </div>
       </Modal>
 

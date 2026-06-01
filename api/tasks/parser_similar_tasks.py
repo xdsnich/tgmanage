@@ -186,6 +186,11 @@ async def _run_similar_crawler(user_id: int, account_id: int, params: dict):
     pause_max = float(params.get("pause_max", 15.0))
     flood_threshold = int(params.get("flood_threshold", 120))
 
+    # На FloodWait по умолчанию — стоп (защита от эскалации Telegram).
+    # Если отключено, ждём wait + flood_cooldown_sec перед ретраем.
+    stop_on_flood = bool(params.get("stop_on_flood", True))
+    flood_cooldown_sec = int(params.get("flood_cooldown_sec", 300))
+
     # Start event
     start_time = time.time()
     await _log_event(
@@ -238,20 +243,24 @@ async def _run_similar_crawler(user_id: int, account_id: int, params: dict):
 
             r.setex(progress_key, 3600, f"running|{found_count}|{saved_count}|{len(queue)}|{username}")
 
-            entity = await _get_entity_safe(client, username, max_flood_wait=flood_threshold)
+            # Если stop_on_flood — любая FloodWait должна сразу всплыть наверх (а не ретраиться внутри _get_entity_safe)
+            entity_max_fw = 0 if stop_on_flood else flood_threshold
+            entity = await _get_entity_safe(client, username, max_flood_wait=entity_max_fw)
             if entity is None:
                 continue
             if isinstance(entity, tuple) and entity[0] == 'flood':
                 wait = entity[1]
                 flood_events += 1
+                flood_total_wait += wait
                 await _log_event(user_id, "flood_wait", source="similar",
                                  account_id=account_id, wait_seconds=wait, seed=username,
                                  details="get_entity")
-                if wait > flood_threshold:
-                    r.setex(progress_key, 300, f"error|{found_count}|{saved_count}|{len(queue)}|FLOOD_WAIT {wait}s")
+                if stop_on_flood or wait > flood_threshold:
+                    logger.warning(f"[similar] FloodWait @{username}: {wait}s — STOP")
+                    r.setex(progress_key, 300, f"error|{found_count}|{saved_count}|{len(queue)}|FLOOD_WAIT {wait}s — стоп")
                     break
-                flood_total_wait += wait
-                stopped = await _interruptible_sleep(wait + 2, r, stop_key)
+                logger.info(f"[similar] FloodWait @{username}: {wait}s, cooldown {flood_cooldown_sec}s + retry")
+                stopped = await _interruptible_sleep(wait + flood_cooldown_sec, r, stop_key)
                 if stopped:
                     break
                 queue.appendleft((username, depth))
@@ -265,14 +274,16 @@ async def _run_similar_crawler(user_id: int, account_id: int, params: dict):
             if isinstance(result, tuple) and result[0] == 'flood':
                 wait = result[1]
                 flood_events += 1
+                flood_total_wait += wait
                 await _log_event(user_id, "flood_wait", source="similar",
                                  account_id=account_id, wait_seconds=wait, seed=username,
                                  details="recommendations")
-                if wait > flood_threshold:
-                    r.setex(progress_key, 300, f"error|{found_count}|{saved_count}|{len(queue)}|FLOOD_WAIT {wait}s")
+                if stop_on_flood or wait > flood_threshold:
+                    logger.warning(f"[similar] FloodWait recommendations @{username}: {wait}s — STOP")
+                    r.setex(progress_key, 300, f"error|{found_count}|{saved_count}|{len(queue)}|FLOOD_WAIT {wait}s — стоп")
                     break
-                flood_total_wait += wait
-                stopped = await _interruptible_sleep(wait + 2, r, stop_key)
+                logger.info(f"[similar] FloodWait recommendations @{username}: {wait}s, cooldown {flood_cooldown_sec}s + retry")
+                stopped = await _interruptible_sleep(wait + flood_cooldown_sec, r, stop_key)
                 if stopped:
                     break
                 queue.appendleft((username, depth))
@@ -469,7 +480,12 @@ async def _run_verify_comments(user_id: int, account_id: int, params: dict):
     pause_min = float(params.get("pause_min", 2.0))
     pause_max = float(params.get("pause_max", 4.0))
     only_unverified = bool(params.get("only_unverified", True))
-    
+
+    # На FloodWait по умолчанию — сразу стоп (защита от эскалации Telegram).
+    # Если выключено, ждём flood_wait + flood_cooldown_sec и ретраим.
+    stop_on_flood = bool(params.get("stop_on_flood", True))
+    flood_cooldown_sec = int(params.get("flood_cooldown_sec", 300))
+
     # НОВОЕ ПОЛЕ: извлекаем часы активности (по умолчанию 0 = отключено)
     active_hours = int(params.get("active_hours", 0))
 
@@ -559,16 +575,30 @@ async def _run_verify_comments(user_id: int, account_id: int, params: dict):
                     flood_events += 1
                     await _log_event(user_id, "flood_wait", source="verify",
                                      account_id=account_id, wait_seconds=flood_wait, seed=username)
-                    if flood_wait > 300:
-                        r.setex(progress_key, 300, f"error|{checked}|{with_comments}|{total - checked}|FLOOD {flood_wait}s")
-                        has_critical_error = True
-                        break 
-                    logger.info(f"💬 Коментарі @{username}: has_comments={has_comments}, flood_wait={flood_wait}")
                     flood_total_wait += flood_wait
-                    stopped = await _interruptible_sleep(flood_wait + 2, r, stop_key)
+
+                    # Безопасный путь по умолчанию: на первом же FloodWait — стоп.
+                    # Эскалация (повторные FW подряд) ведёт к hard-банам Telegram,
+                    # поэтому лучше дать аккаунту реально остыть, чем дотягивать сессию.
+                    if stop_on_flood:
+                        logger.warning(f"💬 FloodWait @{username}: {flood_wait}s — STOP (stop_on_flood=True)")
+                        r.setex(progress_key, 300,
+                                f"error|{checked}|{with_comments}|{total - checked}|FLOOD {flood_wait}s — стоп")
+                        break
+
+                    # Опционально: длинный cool-down + ретрай.
+                    logger.info(f"💬 FloodWait @{username}: {flood_wait}s, cooldown {flood_cooldown_sec}s + retry")
+                    stopped = await _interruptible_sleep(flood_wait + flood_cooldown_sec, r, stop_key)
                     if stopped:
                         break
                     has_comments, flood_wait2 = await _check_channel_has_comments(client, username)
+                    if flood_wait2 > 0:
+                        # Второй FloodWait подряд — точно стоп, без вариантов.
+                        logger.warning(f"💬 Повторный FloodWait @{username}: {flood_wait2}s — STOP")
+                        flood_total_wait += flood_wait2
+                        r.setex(progress_key, 300,
+                                f"error|{checked}|{with_comments}|{total - checked}|FLOOD x2 ({flood_wait2}s)")
+                        break
 
                 if has_comments:
                     reason += " | есть комменты"
@@ -645,6 +675,157 @@ def run_similar_crawler(self, user_id: int, account_id: int, params: dict):
 )
 def run_verify_comments(self, user_id: int, account_id: int, params: dict):
     return run_async(_run_verify_comments(user_id, account_id, params))
+
+
+# ═══════════════════════════════════════════════════════════
+# Alive check — был ли пост за последние N дней
+# ═══════════════════════════════════════════════════════════
+
+async def _update_channel_last_post(channel_id: int, last_post_date):
+    if API_DIR not in sys.path:
+        sys.path.insert(0, API_DIR)
+    from sqlalchemy import select
+    from models.parsed_channel import ParsedChannel
+    from utils.db_pool import async_session as Session
+
+    async with Session() as db:
+        r = await db.execute(select(ParsedChannel).where(ParsedChannel.id == channel_id))
+        ch = r.scalar_one_or_none()
+        if ch:
+            ch.last_post_date = last_post_date
+            ch.last_verification = datetime.utcnow()
+            await db.commit()
+
+
+async def _get_last_post_via_web(username: str) -> "datetime | None":
+    """Возвращает дату последнего поста через t.me/s/{username} — без API Telegram.
+
+    Парсит preview-страницу t.me/s/, ищет теги <time datetime="...">. Последний
+    элемент в списке — самый свежий пост. Если канал приватный, не существует,
+    или preview закрыт — возвращает None.
+    """
+    from datetime import datetime, timezone
+    url = f"https://t.me/s/{username}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10) as resp:
+                if resp.status != 200:
+                    return None
+                html = await resp.text()
+        times = re.findall(r'<time[^>]+datetime="([^"]+)"', html)
+        if not times:
+            return None
+        last_time_str = times[-1]
+        return datetime.fromisoformat(last_time_str.replace('Z', '+00:00'))
+    except Exception as e:
+        logger.warning(f"[alive_web] @{username}: {str(e)[:100]}")
+        return None
+
+
+async def _run_alive_check(user_id: int, account_id: int, params: dict):
+    """Проверка живости каналов ТОЛЬКО через web (t.me/s/), без Telegram API.
+
+    account_id остаётся в сигнатуре для логирования и совместимости с pattern verify,
+    но Telethon-клиент не поднимается и не используется.
+    """
+    import redis
+    from datetime import datetime, timedelta, timezone
+
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    r = redis.from_url(redis_url)
+    progress_key = f"parser:alive:progress:{user_id}"
+    stop_key = f"parser:alive:stop:{user_id}"
+    r.delete(stop_key)
+
+    folder = params.get("folder", "")
+    limit = int(params.get("limit", 200))
+    max_days = int(params.get("max_days_inactive", 30))
+    pause_min = float(params.get("pause_min", 0.3))   # web — можно быстрее, без флуда
+    pause_max = float(params.get("pause_max", 0.8))
+
+    if API_DIR not in sys.path:
+        sys.path.insert(0, API_DIR)
+    from sqlalchemy import select
+    from models.parsed_channel import ParsedChannel
+    from utils.db_pool import async_session as Session
+
+    async with Session() as db:
+        q = select(ParsedChannel).where(ParsedChannel.user_id == user_id)
+        if folder:
+            q = q.where(ParsedChannel.folder == folder)
+        q = q.limit(limit)
+        result = await db.execute(q)
+        channels = result.scalars().all()
+        channels_data = [(c.id, c.username) for c in channels if c.username]
+
+    total = len(channels_data)
+    if total == 0:
+        r.setex(progress_key, 300, "done|0|0|0|нет каналов для проверки")
+        return {"checked": 0, "alive": 0}
+
+    threshold = datetime.now(timezone.utc) - timedelta(days=max_days)
+    start_time = time.time()
+    await _log_event(user_id, "session_start", source="alive", account_id=account_id,
+                     details=f"folder={folder or 'ALL'} limit={limit} max_days={max_days} web=true")
+    logger.info(f"[alive] Старт web-проверки {total} каналов, порог {max_days} дн. (без API)")
+    r.setex(progress_key, 3600, f"running|0|0|{total}|старт")
+
+    checked = 0
+    alive = 0
+    try:
+        for ch_id, username in channels_data:
+            if r.get(stop_key):
+                logger.info("[alive] Stop signal")
+                break
+
+            last_post = await _get_last_post_via_web(username)
+            is_alive = bool(last_post and last_post > threshold)
+
+            # В БД пишем naive UTC (last_post_date в модели без TZ)
+            last_post_naive = last_post.replace(tzinfo=None) if last_post else None
+            await _update_channel_last_post(ch_id, last_post_naive)
+
+            checked += 1
+            if is_alive:
+                alive += 1
+                logger.info(f"  ✅ @{username} → жив ({last_post})")
+            else:
+                logger.info(f"  💀 @{username} → мёртвый (нет постов или старше {max_days} дн.)")
+
+            r.setex(progress_key, 3600,
+                    f"running|{checked}|{alive}|{total - checked}|{username}")
+
+            stopped = await _interruptible_sleep(random.uniform(pause_min, pause_max), r, stop_key)
+            if stopped:
+                break
+
+        duration = int(time.time() - start_time)
+        r.setex(progress_key, 300,
+                f"done|{checked}|{alive}|0|готово ({alive} живых из {checked})")
+        await _log_event(user_id, "session_done", source="alive", account_id=account_id,
+                         channels_found=checked, channels_saved=alive,
+                         duration_sec=duration,
+                         details=f"folder={folder or 'ALL'} max_days={max_days} web=true")
+        logger.info(f"[alive] Готово: {checked} проверено, {alive} живых, {duration}s (web-only, 0 API запросов)")
+
+    except Exception as e:
+        logger.error(f"[alive] Ошибка: {e}")
+        r.setex(progress_key, 300, f"error|{checked}|{alive}|0|{str(e)[:100]}")
+        await _log_event(user_id, "error", source="alive", account_id=account_id,
+                         details=str(e)[:500])
+        return {"error": str(e)[:200]}
+
+    return {"checked": checked, "alive": alive}
+
+
+@celery_app.task(
+    bind=True,
+    name="tasks.parser_similar_tasks.run_alive_check",
+    acks_late=False,
+    reject_on_worker_lost=False,
+)
+def run_alive_check(self, user_id: int, account_id: int, params: dict):
+    return run_async(_run_alive_check(user_id, account_id, params))
 
 import aiohttp
 from bs4 import BeautifulSoup
