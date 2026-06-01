@@ -1219,6 +1219,11 @@ async def _execute_plan_session(plan_id: int):
                                 acc.status = "frozen"
                                 break
                             elif "PEER_FLOOD" in err:
+                                # PEER_FLOOD = Telegram включил жёсткий anti-spam.
+                                # Не замораживать сейчас = почти гарантированный 24h+ ban
+                                # на следующем действии. Замораживаем, человек разрулит.
+                                logger.error(f"[plan][{phone}] PEER_FLOOD — аккаунт frozen")
+                                acc.status = "frozen"
                                 break
 
                 except Exception as e:

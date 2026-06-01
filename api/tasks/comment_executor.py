@@ -308,9 +308,13 @@ async def _execute_queue_item(item, db):
             item.error = f"FLOOD_WAIT_{wait}"
 
         elif "PEER_FLOOD" in err:
-            logger.warning(f"[executor] PEER_FLOOD — {account.phone}")
+            # PEER_FLOOD = Telegram уже включил жёсткий anti-spam на аккаунт.
+            # Если продолжать слать — гарантированный 24h+ ban. Замораживаем,
+            # пусть человек разберётся и разбанит при необходимости.
+            logger.error(f"[executor] PEER_FLOOD — {account.phone} → freezing account")
+            account.status = "frozen"
             item.status = "failed"
-            item.error = "PEER_FLOOD"
+            item.error = "PEER_FLOOD (account auto-frozen)"
 
         elif "AUTH_KEY_UNREGISTERED" in err or "UserDeactivatedBan" in type(e).__name__:
             logger.warning(f"[executor] Account frozen: {account.phone}")

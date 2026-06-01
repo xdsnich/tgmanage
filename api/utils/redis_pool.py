@@ -21,8 +21,10 @@ logger = logging.getLogger(__name__)
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 # Один пул на процесс. max_connections — потолок одновременных коннектов.
-# 50 = достаточно для 100 параллельных gevent-корутин.
+# 100 = с запасом под worker concurrency 40-60 thread × несколько redis-операций.
+# Подкручивается через REDIS_POOL_MAX в env.
 _pool: redis.ConnectionPool | None = None
+_REDIS_POOL_MAX = int(os.getenv("REDIS_POOL_MAX", "100"))
 
 
 def get_redis() -> redis.Redis:
@@ -31,12 +33,12 @@ def get_redis() -> redis.Redis:
     if _pool is None:
         _pool = redis.ConnectionPool.from_url(
             REDIS_URL,
-            max_connections=50,
+            max_connections=_REDIS_POOL_MAX,
             socket_timeout=5,
             socket_connect_timeout=5,
             health_check_interval=30,
         )
-        logger.info(f"[redis_pool] Pool создан: {REDIS_URL} (max=50)")
+        logger.info(f"[redis_pool] Pool создан: {REDIS_URL} (max={_REDIS_POOL_MAX})")
     return redis.Redis(connection_pool=_pool)
 
 

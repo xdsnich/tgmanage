@@ -3,12 +3,17 @@
 Не больше 6 подключений — норма для реального пользователя.
 """
 
+import os
 import logging
 from datetime import date
 from utils.redis_pool import get_redis as _get_redis
 
 logger = logging.getLogger(__name__)
-MAX_DAILY_CONNECTIONS = 6
+# Сколько подключений к одному TG-аккаунту допустимо в сутки.
+# 6 — нижняя граница для прогрева 4-6 сессий + комментинг.
+# Поднимать только если знаешь что делаешь — Telegram связывает аккаунты
+# по «device fingerprint + IP + connect frequency».
+MAX_DAILY_CONNECTIONS = int(os.getenv("MAX_DAILY_CONNECTIONS", "6"))
 
 
 def check_connection_limit(account_id: int) -> bool:
