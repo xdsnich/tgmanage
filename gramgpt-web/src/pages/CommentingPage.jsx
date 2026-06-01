@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { commentingAPI, accountsAPI, parserAPI, subscribeAPI, warmupAPI } from '../services/api'
+import { commentingAPI, accountsAPI, parserAPI, subscribeAPI, warmupAPI, serviceCredentialsAPI } from '../services/api'
 import { Card, Button, Input, Modal, Badge, Spinner, Empty, StatCard } from '../components/ui'
 import { useAutoRefresh } from '../hooks/useAutoRefresh'
 
@@ -100,11 +100,15 @@ export default function CommentingPage() {
   // Create form
   const [form, setForm] = useState({
     name: '', account_ids: [], trigger_mode: 'all', trigger_percent: 50,
-    trigger_keywords: '', llm_provider: 'claude', tone: 'positive',
+    trigger_keywords: '', llm_provider: 'claude', llm_credential_id: null,
+    tone: 'positive',
     custom_prompt: '', comment_length: 'medium',
     max_comments: 100, max_hours: 24,
     delay_join: 10, delay_comment: 250, delay_between: 60,
   })
+
+  // LLM keys, доступные пользователю (для селектора в форме кампании)
+  const [llmCreds, setLlmCreds] = useState([])
 
   const [channelText, setChannelText]     = useState('')
   const [channelFolders, setChannelFolders] = useState([])
@@ -128,14 +132,16 @@ export default function CommentingPage() {
   const load = async () => {
     setLoading(true)
     try {
-      const [c, a, st] = await Promise.all([
+      const [c, a, st, llm] = await Promise.all([
         commentingAPI.list(),
         accountsAPI.list(),
         subscribeAPI.list().catch(() => ({ data: [] })),
+        serviceCredentialsAPI.list().catch(() => ({ data: [] })),
       ])
       setCampaigns(c.data)
       setAccounts(a.data.filter(acc => acc.status === 'active'))
       setSubscribeTasks(st.data || [])
+      setLlmCreds((llm.data || []).filter(k => k.is_active))
     } catch { }
     setLoading(false)
   }
@@ -216,7 +222,8 @@ export default function CommentingPage() {
       await commentingAPI.create(payload)
       setCreateModal(false); showToast('Кампания создана'); await load()
       setForm({ name: '', account_ids: [], trigger_mode: 'all', trigger_percent: 50,
-        trigger_keywords: '', llm_provider: 'claude', tone: 'positive', custom_prompt: '',
+        trigger_keywords: '', llm_provider: 'claude', llm_credential_id: null,
+        tone: 'positive', custom_prompt: '',
         comment_length: 'medium', max_comments: 100, max_hours: 24,
         delay_join: 10, delay_comment: 250, delay_between: 60 })
     } catch (err) { showToast(err.response?.data?.detail || 'Ошибка', 'error') }
@@ -509,7 +516,7 @@ export default function CommentingPage() {
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
             <div>
               <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>LLM</label>
-              <select value={form.llm_provider} onChange={e => setForm(f => ({ ...f, llm_provider: e.target.value }))} style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 14, outline: 'none' }}>
+              <select value={form.llm_provider} onChange={e => setForm(f => ({ ...f, llm_provider: e.target.value, llm_credential_id: null }))} style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 14, outline: 'none' }}>
                 <option value="claude">Claude (Anthropic)</option>
                 <option value="openai">GPT-4o (OpenAI)</option>
                 <option value="gemini">Gemini (Google)</option>
@@ -524,6 +531,40 @@ export default function CommentingPage() {
                 <option value="long">Развёрнутый (2-4 предложения)</option>
               </select>
             </div>
+          </div>
+
+          {/* Селектор конкретного LLM-ключа для текущего провайдера */}
+          <div>
+            <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>
+              API ключ
+            </label>
+            {(() => {
+              const matching = llmCreds.filter(k => k.provider === form.llm_provider)
+              if (matching.length === 0) {
+                return (
+                  <div style={{ padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, fontSize: 12, color: 'var(--text-3)' }}>
+                    Нет добавленных ключей для <b>{form.llm_provider}</b>. Будет использоваться env (если есть). Добавь ключи в «🔑 API ключи» → «🤖 LLM сервисы».
+                  </div>
+                )
+              }
+              return (
+                <>
+                  <select value={form.llm_credential_id || ''}
+                    onChange={e => setForm(f => ({ ...f, llm_credential_id: e.target.value ? parseInt(e.target.value) : null }))}
+                    style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 14, outline: 'none' }}>
+                    <option value="">По умолчанию (default-ключ {form.llm_provider})</option>
+                    {matching.map(k => (
+                      <option key={k.id} value={k.id}>
+                        {k.is_default ? '⭐ ' : ''}{k.label || `#${k.id}`} · {k.api_key_masked}
+                      </option>
+                    ))}
+                  </select>
+                  <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4 }}>
+                    Если «по умолчанию» — берётся ключ помеченный ⭐ default. Можно явно выбрать любой активный.
+                  </div>
+                </>
+              )
+            })()}
           </div>
 
           <div>

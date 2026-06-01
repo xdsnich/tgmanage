@@ -216,7 +216,10 @@ async def _execute_queue_item(item, db):
     prompt = build_comment_prompt(item.post_text, style_profile, personality)
 
     provider = _val(campaign.llm_provider)
-    api_key = await get_api_key(db, campaign.user_id, provider)
+    api_key = await get_api_key(
+        db, campaign.user_id, provider,
+        credential_id=getattr(campaign, "llm_credential_id", None),
+    )
     comment_text = generate_comment(provider, prompt, item.post_text, api_key=api_key)
 
     if not comment_text:

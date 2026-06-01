@@ -71,10 +71,13 @@ class Campaign(Base):
     trigger_keywords:Mapped[list]             = mapped_column(JSON, default=list)
 
     # ── LLM ──────────────────────────────────────────────
-    llm_provider:    Mapped[str]              = mapped_column(String(32), default="claude")
-    tone:            Mapped[str]              = mapped_column(String(32), default="positive")
-    custom_prompt:   Mapped[str]              = mapped_column(Text, default="")
-    comment_length:  Mapped[str]              = mapped_column(String(32), default="medium")
+    llm_provider:       Mapped[str]              = mapped_column(String(32), default="claude")
+    # Конкретный API-ключ из ServiceCredential (опционально). Если None — берётся default
+    # ключ провайдера из service_credentials, иначе fallback на env.
+    llm_credential_id:  Mapped[Optional[int]]    = mapped_column(Integer, nullable=True, index=True)
+    tone:               Mapped[str]              = mapped_column(String(32), default="positive")
+    custom_prompt:      Mapped[str]              = mapped_column(Text, default="")
+    comment_length:     Mapped[str]              = mapped_column(String(32), default="medium")
 
     # ── Лимиты ───────────────────────────────────────────
     max_comments:    Mapped[int]              = mapped_column(Integer, default=100)

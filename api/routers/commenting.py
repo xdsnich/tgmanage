@@ -51,6 +51,7 @@ class CampaignCreate(BaseModel):
     trigger_percent: int = 50
     trigger_keywords: list[str] = []
     llm_provider: str = "claude"
+    llm_credential_id: Optional[int] = None     # конкретный ключ; None = default провайдера
     tone: str = "positive"
     custom_prompt: str = ""
     comment_length: str = "medium"
@@ -68,6 +69,7 @@ class CampaignUpdate(BaseModel):
     trigger_percent: Optional[int] = None
     trigger_keywords: Optional[list[str]] = None
     llm_provider: Optional[str] = None
+    llm_credential_id: Optional[int] = None
     tone: Optional[str] = None
     custom_prompt: Optional[str] = None
     comment_length: Optional[str] = None
@@ -123,6 +125,7 @@ def _campaign_to_dict(c: Campaign, channels: list = None) -> dict:
         "trigger_percent": c.trigger_percent,
         "trigger_keywords": c.trigger_keywords or [],
         "llm_provider": _val(c.llm_provider),
+        "llm_credential_id": c.llm_credential_id,
         "tone": _val(c.tone),
         "custom_prompt": c.custom_prompt,
         "comment_length": c.comment_length,
@@ -202,6 +205,7 @@ async def create_campaign(
         trigger_percent=body.trigger_percent,
         trigger_keywords=body.trigger_keywords,
         llm_provider=body.llm_provider,
+        llm_credential_id=body.llm_credential_id,
         tone=body.tone,
         custom_prompt=body.custom_prompt,
         comment_length=body.comment_length,

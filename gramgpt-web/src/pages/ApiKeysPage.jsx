@@ -1,8 +1,12 @@
 import { useEffect, useState } from 'react'
-import { apiAppsAPI } from '../services/api'
+import { apiAppsAPI, serviceCredentialsAPI } from '../services/api'
 import { Card, Button, Input, Modal, Badge, Spinner, Empty, StatusBadge } from '../components/ui'
 
 export default function ApiKeysPage() {
+  // Tab: 'telegram' (api_apps) | 'services' (claude/openai/gemini/groq/tgstat)
+  const [keyTab, setKeyTab] = useState('telegram')
+
+  // ── Telegram (api_apps) ────────────────────────────────────
   const [apps, setApps] = useState([])
   const [stats, setStats] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -15,6 +19,20 @@ export default function ApiKeysPage() {
   const [saving, setSaving] = useState(false)
 
   const [form, setForm] = useState({ api_id: '', api_hash: '', title: '', max_accounts: 100, notes: '' })
+
+  // ── Service credentials (LLM/TGStat) ───────────────────────
+  const [creds, setCreds] = useState([])
+  const [credProviders, setCredProviders] = useState([])
+  const [credStats, setCredStats] = useState(null)
+  const [credLoading, setCredLoading] = useState(true)
+  const [credAddModal, setCredAddModal] = useState(false)
+  const [credEditModal, setCredEditModal] = useState(false)
+  const [credEditing, setCredEditing] = useState(null)
+  const [credSaving, setCredSaving] = useState(false)
+  const [credTestingId, setCredTestingId] = useState(null)
+  const [credForm, setCredForm] = useState({
+    provider: 'claude', api_key: '', label: '', is_default: false, notes: '',
+  })
 
   const load = async () => {
     setLoading(true)
@@ -31,7 +49,110 @@ export default function ApiKeysPage() {
     setLoading(false)
   }
 
+  const loadCreds = async () => {
+    setCredLoading(true)
+    try {
+      const [credsRes, provRes, statsRes] = await Promise.all([
+        serviceCredentialsAPI.list(),
+        serviceCredentialsAPI.providers(),
+        serviceCredentialsAPI.stats(),
+      ])
+      setCreds(credsRes.data)
+      setCredProviders(provRes.data)
+      setCredStats(statsRes.data)
+    } catch (err) {
+      console.error(err)
+    }
+    setCredLoading(false)
+  }
+
   useEffect(() => { load() }, [])
+  useEffect(() => { if (keyTab === 'services') loadCreds() }, [keyTab])
+
+  const handleCredAdd = async () => {
+    if (!credForm.api_key.trim()) { alert('Введи API ключ'); return }
+    setCredSaving(true)
+    try {
+      await serviceCredentialsAPI.create({
+        provider: credForm.provider,
+        api_key: credForm.api_key.trim(),
+        label: credForm.label.trim(),
+        is_default: credForm.is_default,
+        notes: credForm.notes,
+      })
+      setCredAddModal(false)
+      setCredForm({ provider: 'claude', api_key: '', label: '', is_default: false, notes: '' })
+      await loadCreds()
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Ошибка добавления')
+    }
+    setCredSaving(false)
+  }
+
+  const handleCredOpenEdit = (cred) => {
+    setCredEditing(cred)
+    setCredForm({
+      provider: cred.provider,
+      api_key: '',  // не показываем существующий — только если меняют
+      label: cred.label || '',
+      is_default: cred.is_default,
+      notes: cred.notes || '',
+    })
+    setCredEditModal(true)
+  }
+
+  const handleCredEdit = async () => {
+    if (!credEditing) return
+    setCredSaving(true)
+    try {
+      const payload = {
+        label: credForm.label.trim(),
+        is_default: credForm.is_default,
+        notes: credForm.notes,
+      }
+      if (credForm.api_key.trim()) payload.api_key = credForm.api_key.trim()
+      await serviceCredentialsAPI.update(credEditing.id, payload)
+      setCredEditModal(false)
+      setCredEditing(null)
+      await loadCreds()
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Ошибка')
+    }
+    setCredSaving(false)
+  }
+
+  const handleCredToggle = async (cred) => {
+    try {
+      await serviceCredentialsAPI.update(cred.id, { is_active: !cred.is_active })
+      await loadCreds()
+    } catch (err) { alert(err.response?.data?.detail || 'Ошибка') }
+  }
+
+  const handleCredSetDefault = async (cred) => {
+    try {
+      await serviceCredentialsAPI.update(cred.id, { is_default: true })
+      await loadCreds()
+    } catch (err) { alert(err.response?.data?.detail || 'Ошибка') }
+  }
+
+  const handleCredDelete = async (cred) => {
+    if (!window.confirm(`Удалить ключ «${cred.label || cred.provider_name}»?`)) return
+    try {
+      await serviceCredentialsAPI.delete(cred.id)
+      await loadCreds()
+    } catch (err) { alert(err.response?.data?.detail || 'Ошибка') }
+  }
+
+  const handleCredTest = async (cred) => {
+    setCredTestingId(cred.id)
+    try {
+      const { data } = await serviceCredentialsAPI.test(cred.id)
+      alert(data.message)
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Ошибка проверки')
+    }
+    setCredTestingId(null)
+  }
 
   const handleAdd = async () => {
     if (!form.api_id || !form.api_hash) {
@@ -119,20 +240,59 @@ export default function ApiKeysPage() {
 
   const usedPercent = (used, max) => max ? Math.round(used / max * 100) : 0
 
+  const iconBtn = {
+    background: 'none', border: '1px solid var(--border)', borderRadius: 8,
+    padding: '6px 10px', cursor: 'pointer', fontSize: 12,
+    color: 'var(--text-2)', transition: 'all 0.15s',
+  }
+
   return (
     <div style={{ padding: '28px 32px', animation: 'fadeUp 0.4s cubic-bezier(0.16,1,0.3,1)' }}>
       {/* Header */}
-      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 28 }}>
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 20 }}>
         <div>
           <div style={{ fontSize: 11, color: '#ff6b35', fontWeight: 600, letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 8 }}>🔑 API КЛЮЧИ</div>
-          <h1 style={{ fontSize: 26, fontWeight: 800, letterSpacing: '-0.04em' }}>Мульти-API управление</h1>
+          <h1 style={{ fontSize: 26, fontWeight: 800, letterSpacing: '-0.04em' }}>
+            {keyTab === 'telegram' ? 'Telegram API' : 'LLM сервисы'}
+          </h1>
           <p style={{ fontSize: 13, color: 'var(--text-3)', marginTop: 4 }}>
-            Распределяй аккаунты по разным API-приложениям для защиты от бана
+            {keyTab === 'telegram'
+              ? 'api_id / api_hash для распределения аккаунтов по разным приложениям'
+              : 'Ключи Claude / OpenAI / Gemini / Groq / TGStat для нейрокомментинга и парсинга'}
           </p>
         </div>
-        <Button variant="primary" onClick={() => setAddModal(true)}>+ Добавить API</Button>
+        {keyTab === 'telegram' ? (
+          <Button variant="primary" onClick={() => setAddModal(true)}>+ Добавить Telegram API</Button>
+        ) : (
+          <Button variant="primary" onClick={() => setCredAddModal(true)}>+ Добавить LLM ключ</Button>
+        )}
       </div>
 
+      {/* Tab bar */}
+      <div style={{ display: 'flex', gap: 4, marginBottom: 24, background: 'var(--bg-2)', padding: 4, borderRadius: 12, border: '1px solid var(--border)', width: 'fit-content' }}>
+        {[
+          { key: 'telegram', label: '📱 Telegram API', count: apps.length },
+          { key: 'services', label: '🤖 LLM сервисы', count: creds.length },
+        ].map(t => (
+          <button key={t.key} onClick={() => setKeyTab(t.key)} style={{
+            padding: '8px 18px', borderRadius: 9, fontSize: 12, fontWeight: keyTab === t.key ? 700 : 500,
+            border: 'none', cursor: 'pointer', transition: 'all 0.15s',
+            background: keyTab === t.key ? 'var(--bg-card)' : 'transparent',
+            color: keyTab === t.key ? 'var(--text)' : 'var(--text-3)',
+            boxShadow: keyTab === t.key ? '0 1px 3px rgba(0,0,0,0.2)' : 'none',
+            display: 'flex', alignItems: 'center', gap: 6,
+          }}>
+            <span>{t.label}</span>
+            <span style={{
+              fontSize: 10, fontWeight: 600, padding: '2px 7px', borderRadius: 6,
+              background: keyTab === t.key ? 'rgba(124,77,255,0.18)' : 'rgba(255,255,255,0.05)',
+              color: keyTab === t.key ? 'var(--violet)' : 'var(--text-3)',
+            }}>{t.count}</span>
+          </button>
+        ))}
+      </div>
+
+      {keyTab === 'telegram' && <>
       {/* Stats cards */}
       {stats && (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 24 }}>
@@ -300,6 +460,95 @@ export default function ApiKeysPage() {
           Они были импортированы до добавления API-приложений. Новые аккаунты будут автоматически распределяться по добавленным ключам.
         </div>
       )}
+      </>}
+
+      {keyTab === 'services' && <>
+        {/* Stats cards для LLM */}
+        {credStats && (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, marginBottom: 24 }}>
+            {[
+              { label: 'Всего ключей', value: credStats.total, color: '#7c4dff' },
+              { label: 'Провайдеров настроено', value: credStats.configured_providers.length, color: '#3dd68c' },
+              { label: 'Не подключено', value: credStats.missing_providers.length, color: credStats.missing_providers.length > 0 ? '#e3a13f' : '#888' },
+            ].map(({ label, value, color }) => (
+              <div key={label} style={{
+                background: 'var(--bg-2)', border: '1px solid var(--border)',
+                borderRadius: 'var(--radius)', padding: '18px 20px',
+              }}>
+                <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 6, letterSpacing: '0.04em' }}>{label}</div>
+                <div style={{ fontSize: 28, fontWeight: 800, color, letterSpacing: '-0.03em' }}>{value}</div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {credLoading ? (
+          <div style={{ display: 'flex', justifyContent: 'center', padding: 64 }}><Spinner size={28} /></div>
+        ) : creds.length === 0 ? (
+          <Empty
+            icon="🤖"
+            title="Нет LLM ключей"
+            subtitle="Добавь ключи Claude / Gemini / OpenAI / Groq / TGStat — они используются для нейрокомментинга, диалогов и парсинга"
+            action={<Button variant="primary" onClick={() => setCredAddModal(true)}>+ Добавить первый ключ</Button>}
+          />
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            {creds.map(cred => (
+              <div key={cred.id} style={{
+                background: 'var(--bg-2)', border: '1px solid var(--border)',
+                borderRadius: 'var(--radius)', padding: '18px 22px',
+                opacity: cred.is_active ? 1 : 0.5, transition: 'all 0.2s',
+              }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 12, minWidth: 0, flex: 1 }}>
+                    <div style={{
+                      width: 36, height: 36, borderRadius: 10, flexShrink: 0,
+                      background: `${cred.provider_color}22`,
+                      border: `1px solid ${cred.provider_color}55`,
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      fontSize: 18,
+                    }}>{cred.provider_icon}</div>
+                    <div style={{ minWidth: 0, flex: 1 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <span style={{ fontWeight: 700, fontSize: 14, letterSpacing: '-0.02em' }}>
+                          {cred.provider_name}
+                        </span>
+                        {cred.is_default && <Badge color="violet">DEFAULT</Badge>}
+                        {!cred.is_active && <Badge color="default">выкл</Badge>}
+                      </div>
+                      <div style={{ fontSize: 11, color: 'var(--text-3)', fontFamily: 'var(--font-mono)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {cred.api_key_masked} {cred.label && <span style={{ color: 'var(--text-2)', fontFamily: 'var(--font-sans)' }}>· {cred.label}</span>}
+                      </div>
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+                    <button onClick={() => handleCredTest(cred)} disabled={credTestingId === cred.id}
+                      title="Проверить" style={iconBtn}>{credTestingId === cred.id ? '⏳' : '🧪'}</button>
+                    {!cred.is_default && cred.is_active && (
+                      <button onClick={() => handleCredSetDefault(cred)} title="Сделать default" style={iconBtn}>⭐</button>
+                    )}
+                    <button onClick={() => handleCredToggle(cred)} title={cred.is_active ? 'Выключить' : 'Включить'} style={iconBtn}>
+                      {cred.is_active ? '⏸' : '▶'}
+                    </button>
+                    <button onClick={() => handleCredOpenEdit(cred)} title="Редактировать" style={iconBtn}>✏️</button>
+                    <button onClick={() => handleCredDelete(cred)} title="Удалить" style={{ ...iconBtn, color: 'var(--red)' }}>🗑</button>
+                  </div>
+                </div>
+                {cred.notes && (
+                  <div style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 6, fontStyle: 'italic' }}>{cred.notes}</div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {credStats?.missing_providers?.length > 0 && (
+          <div style={{ marginTop: 16, padding: '14px 18px', background: 'rgba(227,161,63,0.06)', border: '1px solid rgba(227,161,63,0.15)', borderRadius: 'var(--radius)', fontSize: 12, color: 'var(--yellow)' }}>
+            <div style={{ fontWeight: 700, marginBottom: 4 }}>Не подключены:</div>
+            <div>{credStats.missing_providers.map(p => credProviders.find(x => x.key === p)?.name || p).join(', ')}</div>
+          </div>
+        )}
+      </>}
 
       {/* ══ Detail Modal — список аккаунтов на ключе ══ */}
       {detailModal && (
@@ -460,6 +709,78 @@ export default function ApiKeysPage() {
               <Button variant="primary" onClick={handleSaveEdit} disabled={saving} style={{ flex: 1 }}>
                 {saving ? 'Сохраняю...' : 'Сохранить'}
               </Button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {/* ══ LLM credential — Add Modal ══ */}
+      {credAddModal && (
+        <Modal open={true} title="Добавить LLM ключ" onClose={() => setCredAddModal(false)} width={500}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <div>
+              <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Провайдер</label>
+              <select value={credForm.provider} onChange={e => setCredForm(f => ({ ...f, provider: e.target.value }))}
+                style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 14, outline: 'none' }}>
+                {credProviders.map(p => (
+                  <option key={p.key} value={p.key}>{p.icon} {p.name}</option>
+                ))}
+              </select>
+            </div>
+            <Input label="API ключ" type="password" value={credForm.api_key}
+              onChange={e => setCredForm(f => ({ ...f, api_key: e.target.value }))}
+              placeholder="sk-..., AIza..., и т. д." />
+            <Input label="Метка (необязательно)" value={credForm.label}
+              onChange={e => setCredForm(f => ({ ...f, label: e.target.value }))}
+              placeholder="Например: основной, резерв" />
+            <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', padding: '8px 10px', background: 'var(--bg-3)', borderRadius: 8, border: '1px solid var(--border)', fontSize: 12 }}>
+              <input type="checkbox" checked={credForm.is_default}
+                onChange={e => setCredForm(f => ({ ...f, is_default: e.target.checked }))}
+                style={{ width: 16, height: 16, accentColor: 'var(--violet)' }} />
+              Сделать ключом по умолчанию для этого провайдера
+            </label>
+            <div>
+              <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Заметки</label>
+              <textarea value={credForm.notes} rows={2}
+                onChange={e => setCredForm(f => ({ ...f, notes: e.target.value }))}
+                style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 13, outline: 'none', resize: 'vertical', fontFamily: 'var(--font-sans)' }} />
+            </div>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <Button variant="ghost" onClick={() => setCredAddModal(false)}>Отмена</Button>
+              <Button variant="primary" loading={credSaving} onClick={handleCredAdd}>Добавить</Button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {/* ══ LLM credential — Edit Modal ══ */}
+      {credEditModal && credEditing && (
+        <Modal open={true} title={`Редактировать · ${credEditing.provider_name}`}
+          onClose={() => { setCredEditModal(false); setCredEditing(null) }} width={500}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <div style={{ padding: '8px 12px', background: 'var(--bg-3)', borderRadius: 8, fontSize: 11, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
+              Текущий: {credEditing.api_key_masked}
+            </div>
+            <Input label="Новый API ключ (оставь пустым чтобы не менять)" type="password" value={credForm.api_key}
+              onChange={e => setCredForm(f => ({ ...f, api_key: e.target.value }))}
+              placeholder="•••" />
+            <Input label="Метка" value={credForm.label}
+              onChange={e => setCredForm(f => ({ ...f, label: e.target.value }))} />
+            <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', padding: '8px 10px', background: 'var(--bg-3)', borderRadius: 8, border: '1px solid var(--border)', fontSize: 12 }}>
+              <input type="checkbox" checked={credForm.is_default}
+                onChange={e => setCredForm(f => ({ ...f, is_default: e.target.checked }))}
+                style={{ width: 16, height: 16, accentColor: 'var(--violet)' }} />
+              Default для {credEditing.provider_name}
+            </label>
+            <div>
+              <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Заметки</label>
+              <textarea value={credForm.notes} rows={2}
+                onChange={e => setCredForm(f => ({ ...f, notes: e.target.value }))}
+                style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 13, outline: 'none', resize: 'vertical', fontFamily: 'var(--font-sans)' }} />
+            </div>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <Button variant="ghost" onClick={() => { setCredEditModal(false); setCredEditing(null) }}>Отмена</Button>
+              <Button variant="primary" loading={credSaving} onClick={handleCredEdit}>Сохранить</Button>
             </div>
           </div>
         </Modal>

@@ -707,7 +707,10 @@ async def _execute_plan_session(plan_id: int):
 
                                     # Берём API ключ из БД (или fallback на env)
                                     from services.service_credentials import get_api_key
-                                    api_key = await get_api_key(db, campaign.user_id, provider) if campaign else None
+                                    api_key = await get_api_key(
+                                        db, campaign.user_id, provider,
+                                        credential_id=getattr(campaign, "llm_credential_id", None),
+                                    ) if campaign else None
 
                                     comment_text = generate_comment(provider, prompt, post_text, api_key=api_key)
                                     if not comment_text:
