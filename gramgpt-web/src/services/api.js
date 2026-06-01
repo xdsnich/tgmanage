@@ -398,6 +398,9 @@ export const commentingAPI = {
   list: () =>
     api.get('/commenting/campaigns'),
 
+  scheduleAfterWarmup: (data) =>
+    api.post('/commenting/campaigns/schedule-after-warmup', data),
+
   get: (id) =>
     api.get(`/commenting/campaigns/${id}`),
 

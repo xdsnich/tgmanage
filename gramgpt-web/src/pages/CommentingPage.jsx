@@ -19,10 +19,10 @@ const TRIGGERS = [
 ]
 
 const STATUS_COLORS = {
-  draft: 'default', active: 'green', paused: 'yellow', stopped: 'red', finished: 'blue',
+  draft: 'default', scheduled: 'violet', active: 'green', paused: 'yellow', stopped: 'red', finished: 'blue',
 }
 const STATUS_LABELS = {
-  draft: 'Черновик', active: 'Активна', paused: 'Пауза', stopped: 'Остановлена', finished: 'Завершена',
+  draft: 'Черновик', scheduled: '📅 Запланирована', active: 'Активна', paused: 'Пауза', stopped: 'Остановлена', finished: 'Завершена',
 }
 
 // ── Plan helpers ──────────────────────────────────────────────

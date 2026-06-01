@@ -126,6 +126,8 @@ def _campaign_to_dict(c: Campaign, channels: list = None) -> dict:
         "trigger_keywords": c.trigger_keywords or [],
         "llm_provider": _val(c.llm_provider),
         "llm_credential_id": c.llm_credential_id,
+        "warmup_batch_id": c.warmup_batch_id,
+        "scheduled_start_at": (c.scheduled_start_at.isoformat() + "Z") if c.scheduled_start_at else None,
         "tone": _val(c.tone),
         "custom_prompt": c.custom_prompt,
         "comment_length": c.comment_length,
@@ -254,15 +256,13 @@ async def delete_campaign(
 
 # ── Start / Stop / Pause ─────────────────────────────────────
 
-@router.post("/campaigns/{campaign_id}/start")
-async def start_campaign(
-    campaign_id: int,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Запустить кампанию + сгенерировать планы для всех аккаунтов"""
-    c = await _get_campaign(db, campaign_id, current_user.id)
-
+async def _do_start_campaign(db: AsyncSession, c: Campaign) -> dict:
+    """
+    Общая логика запуска кампании: генерация channel_assignments + campaign_plans.
+    Вызывается из /start endpoint И из dispatch_plans auto-start блока.
+    Кидает HTTPException — вызывающий должен сам решать что делать (endpoint
+    отдаст 400, dispatch — пропустит и оставит scheduled).
+    """
     ch_result = await db.execute(
         select(TargetChannel).where(TargetChannel.campaign_id == c.id, TargetChannel.is_active == True)
     )
@@ -444,6 +444,20 @@ async def start_campaign(
         "message": f"Кампания запущена: {total_days} дней, {plans_created} планов, {total_planned_comments} комментов распределено",
     }
 
+
+@router.post("/campaigns/{campaign_id}/start")
+async def start_campaign(
+    campaign_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Запустить кампанию + сгенерировать планы для всех аккаунтов"""
+    c = await _get_campaign(db, campaign_id, current_user.id)
+    result = await _do_start_campaign(db, c)
+    await db.commit()
+    return result
+
+
 @router.post("/campaigns/{campaign_id}/pause")
 async def pause_campaign(
     campaign_id: int,
@@ -616,6 +630,134 @@ async def import_from_warmup(
             f"Импортировано {added} новых каналов из прогрева. "
             f"Аккаунтов: {len(warmup_accs)}. "
             f"При старте они будут commentable с 1-го дня (уже подписаны)."
+        ),
+    }
+
+
+# ── SCHEDULE: создать кампанию и запланировать на момент окончания прогрева ──
+
+class ScheduleAfterWarmupRequest(BaseModel):
+    batch_id: str
+    # все поля кампании (как в CampaignCreate, но без account_ids — они придут из batch)
+    name: str
+    trigger_mode: str = "all"
+    trigger_percent: int = 50
+    trigger_keywords: list[str] = []
+    llm_provider: str = "claude"
+    llm_credential_id: Optional[int] = None
+    tone: str = "positive"
+    custom_prompt: str = ""
+    comment_length: str = "medium"
+    max_comments: int = 100
+    max_hours: int = 24
+    delay_join: int = 10
+    delay_comment: int = 250
+    delay_between: int = 60
+
+
+@router.post("/campaigns/schedule-after-warmup")
+async def schedule_after_warmup(
+    body: ScheduleAfterWarmupRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Создаёт кампанию со status='scheduled' и привязывает её к batch'у прогрева.
+
+    Что делает за один запрос:
+      1. Создаёт Campaign со всеми настройками + warmup_batch_id=<batch>.
+      2. Подтягивает каналы из прогрева (как import_from_warmup).
+      3. Подтягивает аккаунты прогрева в account_ids.
+      4. Считает ожидаемое scheduled_start_at = max(WarmupTask.started_at + total_days дней)
+         по всем задачам batch'а — это fallback, если прогрев не дойдёт до finished.
+      5. Ставит status='scheduled'.
+
+    Дальше dispatch_plans автоматически переведёт кампанию в active когда
+    либо все WarmupTask батча в статусе 'finished', либо scheduled_start_at прошло.
+    """
+    from models.warmup import WarmupTask
+    from datetime import timedelta
+
+    tasks = (await db.execute(
+        select(WarmupTask).where(
+            WarmupTask.batch_id == body.batch_id,
+            WarmupTask.user_id == current_user.id,
+        )
+    )).scalars().all()
+
+    if not tasks:
+        raise HTTPException(status_code=404, detail="Batch прогрева не найден")
+
+    # Собираем mapping account → подписанные каналы
+    account_channels = {}
+    all_channels = set()
+    for t in tasks:
+        subs = list((t.subscribed_channels or {}).keys())
+        if subs:
+            account_channels[t.account_id] = subs
+            all_channels.update(subs)
+
+    if not account_channels:
+        raise HTTPException(
+            status_code=400,
+            detail="В прогреве ещё нет подписок — нечего планировать. Дождись пока прогрев успеет подписать хоть один аккаунт.",
+        )
+
+    # Ожидаемое окончание прогрева (fallback на случай если задачи не дойдут до finished)
+    expected_finish = None
+    for t in tasks:
+        if t.started_at:
+            finish_est = t.started_at + timedelta(days=t.total_days or 7)
+            if expected_finish is None or finish_est > expected_finish:
+                expected_finish = finish_est
+
+    # Создаём кампанию
+    c = Campaign(
+        user_id=current_user.id,
+        name=body.name,
+        account_ids=sorted(account_channels.keys()),
+        trigger_mode=body.trigger_mode,
+        trigger_percent=body.trigger_percent,
+        trigger_keywords=body.trigger_keywords,
+        llm_provider=body.llm_provider,
+        llm_credential_id=body.llm_credential_id,
+        tone=body.tone,
+        custom_prompt=body.custom_prompt,
+        comment_length=body.comment_length,
+        max_comments=body.max_comments,
+        max_hours=body.max_hours,
+        delay_join=body.delay_join,
+        delay_comment=body.delay_comment,
+        delay_between=body.delay_between,
+        warmup_batch_id=body.batch_id,
+        scheduled_start_at=expected_finish,
+        status=CampaignStatus.scheduled,
+    )
+    db.add(c)
+    await db.flush()
+
+    # Каналы (без дублей)
+    for username in sorted(all_channels):
+        db.add(TargetChannel(
+            campaign_id=c.id,
+            username=username,
+            link=f"https://t.me/{username}",
+            title=username,
+        ))
+
+    await db.commit()
+
+    return {
+        "campaign_id": c.id,
+        "status": "scheduled",
+        "scheduled_start_at": expected_finish.isoformat() + "Z" if expected_finish else None,
+        "channels_imported": len(all_channels),
+        "accounts": len(account_channels),
+        "warmup_batch_id": body.batch_id,
+        "message": (
+            f"Кампания «{body.name}» запланирована. "
+            f"Стартует автоматически по окончании прогрева "
+            f"(ожидаемо: {expected_finish.strftime('%d.%m.%Y %H:%M') if expected_finish else 'когда все задачи завершатся'} UTC)."
         ),
     }
 

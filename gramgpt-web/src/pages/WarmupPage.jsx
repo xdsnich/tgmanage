@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef } from 'react'
-import { warmupAPI, accountsAPI } from '../services/api'
+import { warmupAPI, accountsAPI, commentingAPI, serviceCredentialsAPI } from '../services/api'
 import { Card, Button, Input, Modal, Badge, Spinner, Empty } from '../components/ui'
 import { useAutoRefresh } from '../hooks/useAutoRefresh'
 
@@ -32,6 +32,59 @@ export default function WarmupPage() {
   // Сворачивание батчей (компаний прогрева)
   const [expandedBatches, setExpandedBatches] = useState({})
   const toggleBatch = (bid) => setExpandedBatches(s => ({ ...s, [bid]: !s[bid] }))
+
+  // Schedule-campaign modal
+  const [scheduleModal, setScheduleModal] = useState(false)
+  const [scheduleBatch, setScheduleBatch] = useState(null) // вся группа { batch_id, batch_name, tasks }
+  const [scheduleLlmCreds, setScheduleLlmCreds] = useState([])
+  const [scheduleSaving, setScheduleSaving] = useState(false)
+  const [scheduleResult, setScheduleResult] = useState(null)
+  const [scheduleForm, setScheduleForm] = useState({
+    name: '',
+    trigger_mode: 'all',
+    trigger_percent: 50,
+    trigger_keywords: '',
+    llm_provider: 'claude',
+    llm_credential_id: null,
+    tone: 'positive',
+    custom_prompt: '',
+    comment_length: 'medium',
+    max_comments: 100,
+    max_hours: 24,
+    delay_join: 10,
+    delay_comment: 250,
+    delay_between: 60,
+  })
+
+  const openScheduleModal = async (group) => {
+    setScheduleBatch(group)
+    setScheduleResult(null)
+    setScheduleForm(f => ({ ...f, name: `Кампания: ${group.batch_name}` }))
+    try {
+      const { data } = await serviceCredentialsAPI.list()
+      setScheduleLlmCreds((data || []).filter(k => k.is_active))
+    } catch { setScheduleLlmCreds([]) }
+    setScheduleModal(true)
+  }
+
+  const submitSchedule = async () => {
+    if (!scheduleBatch) return
+    if (!scheduleForm.name.trim()) { alert('Название кампании не может быть пустым'); return }
+    setScheduleSaving(true)
+    try {
+      const payload = {
+        batch_id: scheduleBatch.batch_id,
+        ...scheduleForm,
+        trigger_keywords: scheduleForm.trigger_keywords
+          ? scheduleForm.trigger_keywords.split(',').map(s => s.trim()).filter(Boolean) : [],
+      }
+      const { data } = await commentingAPI.scheduleAfterWarmup(payload)
+      setScheduleResult(data)
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Ошибка планирования кампании')
+    }
+    setScheduleSaving(false)
+  }
 
   // Группируем задачи по batch_id, сохраняя порядок (новые сверху)
   const batchGroups = (() => {
@@ -344,6 +397,11 @@ export default function WarmupPage() {
                         {g.tasks.some(t => t.status === 'paused') && <Button variant="ghost" size="sm" onClick={() => handleBatchAction(g.tasks, 'resume')}>▶ Продолжить всех</Button>}
                         {g.tasks.some(t => t.status === 'idle') && <Button variant="primary" size="sm" onClick={() => handleBatchAction(g.tasks, 'start')}>▶ Старт всех</Button>}
                         {running > 0 && <Button variant="danger" size="sm" onClick={() => { if (window.confirm(`Завершить весь прогрев "${g.batch_name}" (${running} акк.)?`)) handleBatchAction(g.tasks, 'stop') }}>⏹ Стоп всех</Button>}
+                        {(running > 0 || g.tasks.some(t => t.status === 'paused')) && subTotal > 0 && (
+                          <Button variant="outline" size="sm" onClick={() => openScheduleModal(g)} title="Запланировать кампанию комментинга на момент окончания прогрева">
+                            📅 Запланировать кампанию
+                          </Button>
+                        )}
                         {running === 0 && <Button variant="ghost" size="sm" onClick={() => handleDeleteBatch(g)} title="Удалить весь прогрев">🗑 Удалить</Button>}
                       </div>
                     </div>
@@ -659,6 +717,134 @@ export default function WarmupPage() {
                   </div>
                 </div>
               ))}
+            </div>
+          )}
+        </Modal>
+      )}
+
+      {/* ══ Schedule campaign after warmup ══ */}
+      {scheduleModal && scheduleBatch && (
+        <Modal open={true} onClose={() => setScheduleModal(false)}
+          title={`📅 Запланировать кампанию · ${scheduleBatch.batch_name}`} width={580}>
+          {scheduleResult ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+              <div style={{ padding: '14px 16px', background: 'rgba(61,214,140,0.08)', border: '1px solid rgba(61,214,140,0.25)', borderRadius: 10, fontSize: 13, color: 'var(--text)' }}>
+                ✅ <b>{scheduleResult.message}</b>
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--text-3)', lineHeight: 1.6 }}>
+                Импортировано каналов: <b>{scheduleResult.channels_imported}</b><br />
+                Аккаунтов: <b>{scheduleResult.accounts}</b><br />
+                Старт автоматически когда:
+                <ul style={{ margin: '6px 0 0 18px', padding: 0 }}>
+                  <li>все прогревы этого batch'а закончатся, ИЛИ</li>
+                  <li>наступит {scheduleResult.scheduled_start_at ? new Date(scheduleResult.scheduled_start_at).toLocaleString('ru') : '—'}</li>
+                </ul>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                <Button variant="primary" onClick={() => setScheduleModal(false)}>OK</Button>
+              </div>
+            </div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+              <div style={{ padding: '10px 12px', background: 'rgba(124,77,255,0.06)', border: '1px solid rgba(124,77,255,0.15)', borderRadius: 8, fontSize: 12, color: 'var(--text-2)', lineHeight: 1.6 }}>
+                Каналы и аккаунты подтянутся из прогрева <b>«{scheduleBatch.batch_name}»</b> ({scheduleBatch.tasks.length} акк.) автоматически.
+                Кампания стартует в момент завершения прогрева (или по fallback-времени).
+              </div>
+
+              <Input label="Название кампании" value={scheduleForm.name}
+                onChange={e => setScheduleForm(f => ({ ...f, name: e.target.value }))} />
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                <div>
+                  <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>LLM</label>
+                  <select value={scheduleForm.llm_provider}
+                    onChange={e => setScheduleForm(f => ({ ...f, llm_provider: e.target.value, llm_credential_id: null }))}
+                    style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 14, outline: 'none' }}>
+                    <option value="claude">Claude (Anthropic)</option>
+                    <option value="openai">GPT-4o (OpenAI)</option>
+                    <option value="gemini">Gemini (Google)</option>
+                    <option value="groq">Llama 3.3 70B (Groq)</option>
+                  </select>
+                </div>
+                <div>
+                  <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Длина</label>
+                  <select value={scheduleForm.comment_length}
+                    onChange={e => setScheduleForm(f => ({ ...f, comment_length: e.target.value }))}
+                    style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 14, outline: 'none' }}>
+                    <option value="short">Короткий</option>
+                    <option value="medium">Средний</option>
+                    <option value="long">Развёрнутый</option>
+                  </select>
+                </div>
+              </div>
+
+              {(() => {
+                const matching = scheduleLlmCreds.filter(k => k.provider === scheduleForm.llm_provider)
+                if (matching.length === 0) {
+                  return (
+                    <div style={{ padding: '8px 12px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, fontSize: 11, color: 'var(--text-3)' }}>
+                      Нет ключей для <b>{scheduleForm.llm_provider}</b> в БД — будет использоваться env.
+                    </div>
+                  )
+                }
+                return (
+                  <div>
+                    <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>API ключ</label>
+                    <select value={scheduleForm.llm_credential_id || ''}
+                      onChange={e => setScheduleForm(f => ({ ...f, llm_credential_id: e.target.value ? parseInt(e.target.value) : null }))}
+                      style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 13, outline: 'none' }}>
+                      <option value="">По умолчанию (default-ключ {scheduleForm.llm_provider})</option>
+                      {matching.map(k => (
+                        <option key={k.id} value={k.id}>
+                          {k.is_default ? '⭐ ' : ''}{k.label || `#${k.id}`} · {k.api_key_masked}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )
+              })()}
+
+              <div>
+                <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Тон</label>
+                <select value={scheduleForm.tone}
+                  onChange={e => setScheduleForm(f => ({ ...f, tone: e.target.value }))}
+                  style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 14, outline: 'none' }}>
+                  <option value="positive">Позитивный</option>
+                  <option value="neutral">Нейтральный</option>
+                  <option value="critical">Критический</option>
+                  <option value="curious">Любопытный</option>
+                </select>
+              </div>
+
+              <div>
+                <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Доп. промпт (опционально)</label>
+                <textarea value={scheduleForm.custom_prompt} rows={2}
+                  onChange={e => setScheduleForm(f => ({ ...f, custom_prompt: e.target.value }))}
+                  style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 13, outline: 'none', resize: 'vertical', fontFamily: 'var(--font-sans)' }} />
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+                <Input label="Макс. комментов" type="number" value={scheduleForm.max_comments}
+                  onChange={e => setScheduleForm(f => ({ ...f, max_comments: parseInt(e.target.value) || 0 }))} />
+                <Input label="Макс. часов работы" type="number" value={scheduleForm.max_hours}
+                  onChange={e => setScheduleForm(f => ({ ...f, max_hours: parseInt(e.target.value) || 0 }))} />
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
+                <Input label="Delay join (с)" type="number" value={scheduleForm.delay_join}
+                  onChange={e => setScheduleForm(f => ({ ...f, delay_join: parseInt(e.target.value) || 0 }))} />
+                <Input label="Delay comment (с)" type="number" value={scheduleForm.delay_comment}
+                  onChange={e => setScheduleForm(f => ({ ...f, delay_comment: parseInt(e.target.value) || 0 }))} />
+                <Input label="Between (с)" type="number" value={scheduleForm.delay_between}
+                  onChange={e => setScheduleForm(f => ({ ...f, delay_between: parseInt(e.target.value) || 0 }))} />
+              </div>
+
+              <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+                <Button variant="ghost" onClick={() => setScheduleModal(false)}>Отмена</Button>
+                <Button variant="primary" loading={scheduleSaving} onClick={submitSchedule}>
+                  📅 Запланировать
+                </Button>
+              </div>
             </div>
           )}
         </Modal>

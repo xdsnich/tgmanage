@@ -24,11 +24,12 @@ if TYPE_CHECKING:
 # ── Enums ────────────────────────────────────────────────────
 
 class CampaignStatus(str, enum.Enum):
-    draft    = "draft"       # Черновик — не запущена
-    active   = "active"      # Работает
-    paused   = "paused"      # На паузе
-    stopped  = "stopped"     # Остановлена
-    finished = "finished"    # Завершена (лимит/время)
+    draft     = "draft"       # Черновик — не запущена
+    scheduled = "scheduled"   # Запланирована — стартует после окончания привязанного прогрева
+    active    = "active"      # Работает
+    paused    = "paused"      # На паузе
+    stopped   = "stopped"     # Остановлена
+    finished  = "finished"    # Завершена (лимит/время)
 
 
 class TriggerMode(str, enum.Enum):
@@ -100,6 +101,14 @@ class Campaign(Base):
     # подписались за прогрев становятся commentable с 1-го дня (не нужно
     # повторно вступать и не пишем сразу после подписки).
     warmup_batch_id: Mapped[Optional[str]]      = mapped_column(String(64), nullable=True, index=True)
+
+    # ── Отложенный старт (миграция 029) ───────────────────
+    # Если scheduled_start_at задан + status='scheduled' — dispatch_plans
+    # автоматически переведёт кампанию в active либо когда наступит это время,
+    # либо когда все warmup-задачи привязанного batch'а в статусе 'finished'
+    # (что наступит раньше). Это даёт пользователю «запланировать кампанию
+    # сразу после окончания прогрева» без ручного нажатия "Старт".
+    scheduled_start_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
 
     # ── Relationships ────────────────────────────────────
     target_channels: Mapped[list[TargetChannel]] = relationship("TargetChannel", back_populates="campaign", cascade="all, delete-orphan")

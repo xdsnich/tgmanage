@@ -63,7 +63,7 @@ async def _dispatch_plans():
     if API_DIR not in sys.path:
         sys.path.insert(0, API_DIR)
 
-    from sqlalchemy import select, delete as sa_delete
+    from sqlalchemy import select, delete as sa_delete, func as sql_func
     from models.campaign_plan import CampaignPlan
     from models.campaign import Campaign, CampaignStatus
     from models.warmup import WarmupTask
@@ -106,6 +106,57 @@ async def _dispatch_plans():
 
             if cleaned > 0:
                 await db.commit()
+
+            # ═══ AUTO-START: scheduled кампании после прогрева ═══
+            # Условие: либо все WarmupTask батча в finished, либо scheduled_start_at прошло.
+            # Реально стартуем — переводим в active, ставим started_at, генерим план на сегодня.
+            scheduled_camps = (await db.execute(
+                select(Campaign).where(Campaign.status == CampaignStatus.scheduled)
+            )).scalars().all()
+
+            for sc in scheduled_camps:
+                should_start = False
+                reason = ""
+
+                # 1. Все WarmupTask батча закончились?
+                if sc.warmup_batch_id:
+                    wt_stats = await db.execute(
+                        select(
+                            WarmupTask.status,
+                            sql_func.count(WarmupTask.id).label("cnt"),
+                        )
+                        .where(WarmupTask.batch_id == sc.warmup_batch_id)
+                        .group_by(WarmupTask.status)
+                    )
+                    rows = wt_stats.all()
+                    total = sum(r.cnt for r in rows)
+                    finished = sum(r.cnt for r in rows if r.status == "finished")
+                    if total > 0 and finished == total:
+                        should_start = True
+                        reason = f"все {total} прогревов batch={sc.warmup_batch_id} завершены"
+
+                # 2. Fallback по времени
+                if not should_start and sc.scheduled_start_at:
+                    if sc.scheduled_start_at <= now:
+                        should_start = True
+                        reason = f"scheduled_start_at={sc.scheduled_start_at.isoformat()} наступило"
+
+                if not should_start:
+                    continue
+
+                # Полный запуск: тот же путь что и ручной POST /campaigns/{id}/start.
+                # Генерирует CampaignChannelAssignment + CampaignPlan на все дни,
+                # ставит status=active + started_at. На следующей итерации
+                # dispatch_plans (через 60с) кампания уже подхватит свои планы.
+                try:
+                    from routers.commenting import _do_start_campaign
+                    res = await _do_start_campaign(db, sc)
+                    logger.info(f"[plan_dispatch] AUTO-START кампании #{sc.id} '{sc.name}': {reason} → {res.get('message','OK')}")
+                except Exception as e:
+                    # Если генерация плана упала (нет каналов, нет акков, и т.п.) —
+                    # оставляем scheduled, попробуем на следующей итерации.
+                    logger.error(f"[plan_dispatch] AUTO-START #{sc.id} '{sc.name}' FAILED: {e}")
+                    continue
 
             # ═══ COMMENTING планы: только для active кампаний ═══
             comm_result = await db.execute(
