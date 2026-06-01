@@ -129,70 +129,85 @@ async def root():
     }
 
 # ═══════════════════════════════════════════════════════════
-# ЗАПУСК (масштабируемая конфигурация)
+# ЗАПУСК — конфигурация для 400+ аккаунтов
 # ═══════════════════════════════════════════════════════════
 #
-# Терминал 1 — API:
+# Предусловия (один раз перед стартом):
+#   • .env содержит MAX_SLOTS_PER_USER=20, MAX_DAILY_CONNECTIONS=10, REDIS_POOL_MAX=100
+#   • PostgreSQL рестартнут после ALTER SYSTEM (max_connections=300, shared_buffers=1GB)
+#     Restart-Service postgresql-x64-18      ← PowerShell от админа
+#   • Прокси-пул: минимум 50 уникальных IP на 400 акков (5-10 акков на прокси)
+#
+# ── Терминал 1: API ────────────────────────────────────────
 #   cd api && python -m uvicorn main:app --reload --port 8000
 #
-# Терминал 2 — Celery воркер. РЕКОМЕНДУЕТСЯ через wrapper (мгновенный Ctrl+C):
-#   cd api && python start_worker.py
+# ── Терминал 2: Celery Worker (один на всё) ────────────────
+#   cd api && python start_worker.py --concurrency 60
 #
-#   start_worker.py запускает celery в отдельной группе процессов и на Ctrl+C
-#   делает taskkill /F /T — воркер умирает за <1 секунду. На Windows прямой
-#   `celery worker -P threads` ВИСНЕТ на "Warm shutdown" (потоки залипают в
-#   C-level чтении Redis, Python не может прервать их сигналом).
+#   60 thread'ов = 20 (MAX_SLOTS_PER_USER) × 3 запас. Реально TG-сессий
+#   одновременно будет 20 (упирается в user_slot), остальные thread'ы
+#   обслуживают «лёгкие» вызовы (skip/lock-check) без подключения к Telegram.
 #
-#   Опции: python start_worker.py --concurrency 60 --queues plans,warmup
+#   Ctrl+C → wrapper делает taskkill /F /T — воркер умирает за <1 сек.
 #
-#   ── Прямой запуск (если не нужен wrapper, но Ctrl+C будет медленным) ──
-#   celery -A celery_app worker `
-#     -Q plans,warmup,parsers,ai_dialogs,high_priority,bulk_actions,subscribe `
-#     -P threads -c 40 --without-gossip --without-mingle --without-heartbeat `
-#     --loglevel=info
-#
-#   -P threads — каждый таск в своём треде с собственным asyncio loop.
-#                Для I/O-bound (Telethon, asyncpg, httpx) GIL отпускается → параллелизм.
-#   ПОЧЕМУ НЕ -P gevent: greenlet'ы делят OS-тред, asyncio видит чужой running loop.
-#
-#   ВЫКЛЮЧЕНИЕ:
-#   - python start_worker.py → Ctrl+C мгновенно (рекомендуется)
-#   - python kill_workers.py --hard → taskkill /F (с другого терминала, если завис)
-#
-# Терминал 3 — Celery Beat (планировщик, раз в 60с шлёт dispatch_plans/warmups/ai):
+# ── Терминал 3: Celery Beat (планировщик) ──────────────────
 #   cd api && python -m celery -A celery_app beat --loglevel=info
 #
-#   Beat НЕ выполняет таски сам — только отправляет в очередь воркеру по расписанию.
-#   Расписание задано в celery_app.py → beat_schedule.
-#   ⚠ НЕ запускай run_periodic.py одновременно с beat — будут дубли тасков!
+#   Каждые 60 сек кладёт dispatch_plans/process_ai_dialogs в очередь.
+#   Beat НЕ выполняет таски — только отправляет.
+#   ⚠ Запускать ОДИН экземпляр beat, иначе будут дубли тасков.
 #
-# Терминал 4 — Фронт:
+# ── Терминал 4: Фронтенд ───────────────────────────────────
 #   cd gramgpt-web && npm run dev
 #
-# Терминал 5 (опционально) — Flower UI для мониторинга очередей:
+# ── Терминал 5 (опц.): Мониторинг ──────────────────────────
 #   cd api && python -m celery -A celery_app flower --port=5555
-#   Открывает http://localhost:5555 — видно активные таски, очереди, fail rate.
+#   → http://localhost:5555 (видно активные задачи, очереди, fail rate)
+#
 #
 # ═══════════════════════════════════════════════════════════
-# ПРОДВИНУТЫЙ СЕТАП (>100 юзеров) — разделение по процессам
+# РАЗДЕЛЁННЫЙ СЕТАП — если 400 акков жмёт один воркер
 # ═══════════════════════════════════════════════════════════
-# Парсер-crawler может занять 10 минут — изолируем чтобы не блокировал планы.
-# Каждый процесс независим, можно перезапустить без остановки других.
+# Запускать ВМЕСТО единого воркера из терминала 2.
+# Полезно когда: парсеры/прогрев крутятся одновременно с активными кампаниями,
+# и не хочется чтобы долгий парсинг блокировал thread'ы у комментинга.
 #
-# Воркер 1 — ПЛАНЫ (hot path, максимум throughput):
-#   celery -A celery_app worker -Q plans -P threads -c 40 -n plans@%h --loglevel=info
+# ── Терминал 2a: ПЛАНЫ (комментинг + прогрев, hot path) ────
+#   cd api && python start_worker.py --queues plans --concurrency 60
 #
-# Воркер 2 — ПРОГРЕВ:
-#   celery -A celery_app worker -Q warmup -P threads -c 20 -n warmup@%h --loglevel=info
+# ── Терминал 2b: ПАРСЕРЫ (долгие задачи) ───────────────────
+#   cd api && python start_worker.py --queues parsers --concurrency 8
 #
-# Воркер 3 — ПАРСЕРЫ (долгие задачи, низкая concurrency):
-#   celery -A celery_app worker -Q parsers -P threads -c 8 -n parsers@%h --loglevel=info
+# ── Терминал 2c: AI и всё остальное ────────────────────────
+#   cd api && python start_worker.py --queues ai_dialogs,high_priority,bulk_actions,subscribe,warmup --concurrency 20
 #
-# Воркер 4 — Прочее (AI-диалоги, комменты, импорт, подписки, account/proxy ops):
-#   celery -A celery_app worker -Q ai_dialogs,high_priority,bulk_actions,subscribe -P threads -c 20 -n misc@%h --loglevel=info
+#   Итого 60+8+20=88 thread'ов суммарно. Если ОЗУ напряжена — можно ужать
+#   parsers до 4 и misc до 10.
 #
-# ───── Старая конфигурация (-P solo) — для отладки одного аккаунта ─────
-# celery -A celery_app worker -Q plans,warmup,parsers,ai_dialogs,high_priority,bulk_actions,subscribe --loglevel=info -P solo
 #
-# ───── Закрытые каналы (event listener) ─────
-# python run_listener.py
+# ═══════════════════════════════════════════════════════════
+# ОСТАНОВКА
+# ═══════════════════════════════════════════════════════════
+#   • Ctrl+C в окне воркера → таску дают доработать, потом kill (~1 сек)
+#   • Если завис — из другого терминала: cd api && python kill_workers.py --hard
+#   • Beat остановить отдельно: Ctrl+C в его окне
+#
+#
+# ═══════════════════════════════════════════════════════════
+# ЧТО ОЗНАЧАЮТ ПАРАМЕТРЫ
+# ═══════════════════════════════════════════════════════════
+# --concurrency 60      кол-во thread'ов в воркере = сколько задач параллельно
+#                       (но РЕАЛЬНЫХ TG-подключений будет MAX_SLOTS_PER_USER × users)
+# -P threads            каждая задача в своём треде с собственным asyncio loop
+#                       НЕ менять на gevent (asyncio падает с "running loop already")
+# --queues X,Y,Z        какие очереди слушает этот воркер. Без флага — слушает все.
+#
+# MAX_SLOTS_PER_USER    одновременных TG-сессий на одного юзера платформы (.env)
+# MAX_DAILY_CONNECTIONS подключений к одному TG-аккаунту в сутки (.env)
+# REDIS_POOL_MAX        потолок redis-коннектов в пуле (.env, дефолт 100)
+#
+#
+# ═══════════════════════════════════════════════════════════
+# Закрытые каналы (event listener) — отдельно если нужно
+# ═══════════════════════════════════════════════════════════
+#   cd api && python run_listener.py
