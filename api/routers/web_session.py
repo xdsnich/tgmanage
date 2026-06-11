@@ -170,49 +170,167 @@ class WebStorageParseRequest(BaseModel):
 
 # ── Endpoints ────────────────────────────────────────────────
 
+def _extract_balanced_braces(text: str, start: int) -> "str | None":
+    """Возвращает substring от { до парной } учитывая вложенность, начиная с index `start`.
+    Если не нашёл { или баланс не сошёлся — None.
+    """
+    i = text.find("{", start)
+    if i < 0:
+        return None
+    depth = 0
+    j = i
+    while j < len(text):
+        c = text[j]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[i:j + 1]
+        j += 1
+    return None  # незавершённый JSON (обрезан)
+
+
+def _extract_topkey_strings(blob: str) -> dict:
+    """
+    Достаёт ключи верхнего уровня вида `dcN_auth_key  "hexstring"` из DevTools-формата
+    (key TAB value NEWLINE), формата `JSON.stringify(localStorage)` и обычного текста.
+    Возвращает {"dc1_auth_key": "...", "dc2_auth_key": "...", "user_auth": {...}, ...}.
+
+    Это нужно потому что в DevTools юзер видит auth_key И внутри account1 JSON,
+    И как отдельные top-level ключи localStorage. Парсер должен уметь смотреть в оба места.
+    """
+    import json
+    import re
+
+    out: dict = {}
+
+    # JSON.stringify(localStorage)
+    try:
+        d = json.loads(blob)
+        if isinstance(d, dict):
+            for k, v in d.items():
+                if isinstance(v, str):
+                    # значения в JSON.stringify(localStorage) — это строки которые сами могут быть JSON
+                    try:
+                        out[k] = json.loads(v)
+                    except Exception:
+                        out[k] = v
+                else:
+                    out[k] = v
+            return out
+    except Exception:
+        pass
+
+    # DevTools Application tab → "key TAB value NEWLINE"
+    # Также формат "key value" с любым whitespace
+    for line in blob.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Разделить на key + value по первому tab или 2+ пробелам
+        m = re.match(r'^(\S+)\s+(.+)$', line)
+        if not m:
+            continue
+        key = m.group(1).strip()
+        val_raw = m.group(2).strip()
+        # Попробовать распарсить значение как JSON, иначе оставить строкой
+        try:
+            out[key] = json.loads(val_raw)
+        except Exception:
+            # Убрать обрамляющие кавычки если они есть
+            if val_raw.startswith('"') and val_raw.endswith('"'):
+                out[key] = val_raw[1:-1]
+            else:
+                out[key] = val_raw
+    return out
+
+
 @router.post("/web-storage-parse")
 async def parse_web_storage(
     body: WebStorageParseRequest,
     current_user: User = Depends(get_current_user),
 ):
-    """Парсит блоб localStorage Telegram Web K → возвращает превью аккаунтов."""
+    """
+    Парсит блоб localStorage Telegram Web K → возвращает превью аккаунтов.
+
+    Поддерживаемые форматы:
+      1. JSON.stringify(localStorage) — целый объект как JSON
+      2. DevTools Application tab — key TAB value NEWLINE (можно копировать "Copy All")
+      3. Смешанный текст — где-то в нём account1 {...}, account2 {...}, dc2_auth_key "..."
+
+    Если внутри account-блока auth_key обрезан/отсутствует — добираем из top-level
+    ключа dc{N}_auth_key как fallback.
+    """
     import json
     import re
 
     blob = body.storage_blob.strip()
-    accounts = []
 
-    parsed_dict = None
-    try:
-        parsed_dict = json.loads(blob)
-    except Exception:
-        pass
+    # Достаём все top-level ключи — для fallback на dcN_auth_key
+    top_keys = _extract_topkey_strings(blob)
 
-    if isinstance(parsed_dict, dict):
-        for key, val in parsed_dict.items():
-            if not key.startswith("account"):
-                continue
-            if isinstance(val, str):
-                try:
-                    val = json.loads(val)
-                except Exception:
-                    continue
-            accounts.append((key, val))
+    accounts: "list[tuple[str, dict]]" = []
 
+    # Если top_keys содержат account1/account2/... сразу — берём их
+    for k, v in top_keys.items():
+        if k.startswith("account") and isinstance(v, dict) and v.get("dcId"):
+            accounts.append((k, v))
+
+    # Дополнительно ищем accountN с помощью balanced-brace scan по сырому тексту.
+    # Это покрывает случай когда top_keys не сработал (битый JSON, перенос строк внутри значения).
+    seen_labels = {label for label, _ in accounts}
+    for m in re.finditer(r'\baccount(\d+)\b', blob):
+        label = f"account{m.group(1)}"
+        if label in seen_labels:
+            continue
+        # Извлекаем JSON начиная сразу после метки (учитывая баланс скобок)
+        json_blob = _extract_balanced_braces(blob, m.end())
+        if not json_blob:
+            continue
+        try:
+            data = json.loads(json_blob)
+            if isinstance(data, dict) and data.get("dcId"):
+                accounts.append((label, data))
+                seen_labels.add(label)
+        except Exception:
+            # JSON битый или обрезан avatarUri — попробуем выдернуть основные поля regex'ом
+            partial = {}
+            mm = re.search(r'"dcId"\s*:\s*(\d+)', json_blob)
+            if mm:
+                partial["dcId"] = int(mm.group(1))
+            for dc_n in (1, 2, 3, 4, 5):
+                mk = re.search(rf'"dc{dc_n}_auth_key"\s*:\s*"([0-9a-fA-F]+)"', json_blob)
+                if mk:
+                    partial[f"dc{dc_n}_auth_key"] = mk.group(1)
+            mu = re.search(r'"userId"\s*:\s*"?(\d+)"?', json_blob)
+            if mu:
+                partial["userId"] = mu.group(1)
+            mp = re.search(r'"phone"\s*:\s*"?(\d+)"?', json_blob)
+            if mp:
+                partial["phone"] = mp.group(1)
+            if partial.get("dcId"):
+                accounts.append((label, partial))
+                seen_labels.add(label)
+
+    # Если совсем ничего не нашлось — может быть юзер вставил только dcN_auth_key без account-блоков.
+    # Тогда строим виртуальный account1 из top_keys (если есть user_auth с dcID).
     if not accounts:
-        pattern = re.compile(r'account(\d+)\s*({[^}]*"dcId"[^}]*})', re.DOTALL)
-        for m in pattern.finditer(blob):
-            label = f"account{m.group(1)}"
-            try:
-                val = json.loads(m.group(2))
-                accounts.append((label, val))
-            except Exception:
-                continue
+        ua = top_keys.get("user_auth")
+        if isinstance(ua, dict) and ua.get("dcID"):
+            dc_id = int(ua["dcID"])
+            ak = top_keys.get(f"dc{dc_id}_auth_key")
+            if ak:
+                accounts.append(("account1", {
+                    "dcId": dc_id,
+                    f"dc{dc_id}_auth_key": ak,
+                    "userId": ua.get("id"),
+                }))
 
     if not accounts:
         raise HTTPException(
             status_code=400,
-            detail="Не найдено ни одного аккаунта. Убедись что вставил данные из localStorage Telegram Web K."
+            detail="Не нашёл аккаунтов. Самый надёжный способ: открой DevTools → Console на web.telegram.org/k и выполни  JSON.stringify(localStorage)  — скопируй результат целиком и вставь сюда."
         )
 
     result = []
@@ -222,8 +340,15 @@ async def parse_web_storage(
             continue
         auth_key_field = f"dc{dc_id}_auth_key"
         auth_key = data.get(auth_key_field)
+        # Fallback: если внутри account auth_key отсутствует/обрезан, добираем из top-level localStorage
+        if not auth_key:
+            auth_key = top_keys.get(auth_key_field)
+            if isinstance(auth_key, str):
+                auth_key = auth_key.strip('"')
         if not auth_key:
             continue
+        # Убираем возможные пробелы и кавычки
+        auth_key = str(auth_key).strip().strip('"')
         result.append(WebAccountPreview(
             label=label,
             dc_id=int(dc_id),
@@ -235,7 +360,7 @@ async def parse_web_storage(
     if not result:
         raise HTTPException(
             status_code=400,
-            detail="Найдены блоки accountN, но в них нет dc{N}_auth_key. Проверь, что аккаунт реально авторизован в Web."
+            detail="Найдены блоки accountN, но не получилось вытащить dc{N}_auth_key. Проверь что Telegram Web авторизован и попробуй ещё раз через  JSON.stringify(localStorage)  в DevTools Console."
         )
 
     return {"accounts": result, "count": len(result)}

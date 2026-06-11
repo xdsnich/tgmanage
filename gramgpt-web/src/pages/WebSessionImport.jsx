@@ -119,16 +119,32 @@ export default function WebSessionImport({ onSuccess, onClose }) {
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
         <div style={{
-          padding: '12px 14px', background: 'rgba(124,77,255,0.06)',
-          border: '1px solid rgba(124,77,255,0.18)', borderRadius: 10,
+          padding: '12px 14px', background: 'rgba(61,214,140,0.08)',
+          border: '1px solid rgba(61,214,140,0.25)', borderRadius: 10,
           fontSize: 12, color: 'var(--text-2)', lineHeight: 1.7,
         }}>
-          <div style={{ fontWeight: 700, marginBottom: 6, fontSize: 13 }}>📖 Как достать данные из браузера:</div>
-          <div>1. Открой <code>web.telegram.org/k/</code> в Dolphin Anty (через тот прокси, который собираешься использовать в GramGPT)</div>
-          <div>2. Авторизуйся в нужных аккаунтах (можно несколько одновременно — переключение через меню профиля)</div>
-          <div>3. Нажми <code>F12</code> → вкладка <strong>Application</strong> → слева <strong>Storage → Local Storage → https://web.telegram.org</strong></div>
-          <div>4. В правой панели выдели всё (<code>Ctrl+A</code>) → копируй (<code>Ctrl+C</code>)</div>
-          <div>5. Вставь сюда ↓ (содержимое целиком, не парься о форматировании)</div>
+          <div style={{ fontWeight: 700, marginBottom: 6, fontSize: 13, color: 'var(--green)' }}>⚡ Самый надёжный способ (одной командой):</div>
+          <div>1. Открой <code>web.telegram.org/k/</code> и авторизуйся в нужном аккаунте (можно несколько через меню профиля).</div>
+          <div>2. Нажми <code>F12</code> → вкладка <strong>Console</strong>.</div>
+          <div>3. Вставь команду и нажми Enter:</div>
+          <pre style={{
+            background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 6,
+            padding: '8px 10px', fontSize: 11, color: 'var(--blue)', margin: '6px 0',
+            fontFamily: 'var(--font-mono)', overflowX: 'auto',
+          }}>{`copy(JSON.stringify(localStorage))`}</pre>
+          <div>4. Готово — localStorage уже в буфере. Вставь ниже (Ctrl+V).</div>
+          <div style={{ marginTop: 6, fontSize: 11, color: 'var(--text-3)' }}>
+            Эта команда копирует ВСЁ одним JSON-объектом — без обрезаний больших base64-аватарок, без табов.
+          </div>
+        </div>
+
+        <div style={{
+          padding: '10px 14px', background: 'rgba(124,77,255,0.06)',
+          border: '1px solid rgba(124,77,255,0.18)', borderRadius: 10,
+          fontSize: 12, color: 'var(--text-2)', lineHeight: 1.6,
+        }}>
+          <div style={{ fontWeight: 700, marginBottom: 4, fontSize: 12 }}>Альтернатива (если консоль недоступна):</div>
+          <div>F12 → <strong>Application → Local Storage → https://web.telegram.org</strong> → выдели всё (Ctrl+A) → копируй → вставь сюда. Парсер понимает оба формата.</div>
         </div>
 
         <div>
