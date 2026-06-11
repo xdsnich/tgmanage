@@ -139,6 +139,22 @@ export default function WebSessionImport({ onSuccess, onClose }) {
         </div>
 
         <div style={{
+          padding: '10px 12px', background: 'rgba(227,161,63,0.08)',
+          border: '1px solid rgba(227,161,63,0.25)', borderRadius: 10,
+          fontSize: 11, color: 'var(--text-2)', lineHeight: 1.6,
+        }}>
+          <div style={{ fontWeight: 700, marginBottom: 4, fontSize: 12, color: 'var(--yellow)' }}>⚠️ Chrome блокирует вставку в Console (self-XSS защита)?</div>
+          <div>
+            Если видишь предупреждение «Don't paste code into the DevTools Console», тогда сначала <strong>напечатай руками</strong> в Console
+            (не вставляй) фразу <code style={{ background: 'var(--bg-3)', padding: '1px 5px', borderRadius: 4 }}>allow pasting</code> и нажми Enter.
+            Дальше вставка работает нормально.
+          </div>
+          <div style={{ marginTop: 4 }}>
+            Или просто <strong>напечатай саму команду руками</strong> — она короткая: <code style={{ background: 'var(--bg-3)', padding: '1px 5px', borderRadius: 4 }}>copy(JSON.stringify(localStorage))</code>
+          </div>
+        </div>
+
+        <div style={{
           padding: '10px 14px', background: 'rgba(124,77,255,0.06)',
           border: '1px solid rgba(124,77,255,0.18)', borderRadius: 10,
           fontSize: 12, color: 'var(--text-2)', lineHeight: 1.6,
