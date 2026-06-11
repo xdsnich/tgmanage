@@ -1134,22 +1134,55 @@ export default function AccountsPage() {
                 padding: '10px 14px', borderRadius: 10, fontSize: 13,
                 background: importResult.success ? 'var(--green-dim)' : 'var(--red-dim)',
                 color: importResult.success ? 'var(--green)' : 'var(--red)',
-              }}>{importResult.message}</div>
+                lineHeight: 1.6,
+              }}>
+                <div>{importResult.message}</div>
+                {importResult.failed && importResult.failed.length > 0 && (
+                  <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid rgba(255,255,255,0.08)' }}>
+                    {importResult.failed.map((f, i) => (
+                      <div key={i} style={{ fontSize: 12, marginTop: i ? 6 : 0 }}>
+                        <b>акк #{f.index}:</b> {f.error}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             )}
 
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-              <Button variant="ghost" onClick={() => { setImportModal(false); setTdataStep('upload'); setTdataDetected([]) }}>Отмена</Button>
+              <Button variant="ghost" onClick={() => { setImportModal(false); setTdataStep('upload'); setTdataDetected([]); setImportResult(null) }}>Закрыть</Button>
               <Button variant="primary" loading={importing} onClick={async () => {
                 setImporting(true); setImportResult(null)
                 try {
                   const accounts = tdataDetected.map(a => ({ index: a.index, proxy_string: a.proxy_string }))
                   const { data } = await accountsAPI.importTDataBatch(tdataSessionId, accounts)
-                  setImportResult({ success: true, message: `Импортировано ${data.success}/${data.total} аккаунтов` })
-                  await load()
-                  // Закрываем через 1.5с
-                  setTimeout(() => { setImportModal(false); setTdataStep('upload'); setTdataDetected([]); setImportResult(null) }, 1500)
+                  const failed = (data.results || []).filter(r => !r.success)
+                  if (data.success > 0) {
+                    setImportResult({
+                      success: true,
+                      message: `Импортировано ${data.success}/${data.total} аккаунтов`
+                                + (failed.length ? `. С ошибками: ${failed.length}.` : ''),
+                      failed,
+                    })
+                    await load()
+                    // Если все ок — авто-закрытие. Если были фейлы — оставляем
+                    // модалку открытой чтобы юзер прочитал ошибки.
+                    if (failed.length === 0) {
+                      setTimeout(() => {
+                        setImportModal(false); setTdataStep('upload')
+                        setTdataDetected([]); setImportResult(null)
+                      }, 1500)
+                    }
+                  } else {
+                    // Ни один не прошёл — показываем все ошибки построчно
+                    setImportResult({
+                      success: false,
+                      message: `Не импортирован ни один аккаунт (${data.total}). Причины:`,
+                      failed,
+                    })
+                  }
                 } catch (err) {
-                  setImportResult({ success: false, message: err.response?.data?.detail || 'Ошибка импорта' })
+                  setImportResult({ success: false, message: err.response?.data?.detail || 'Ошибка импорта', failed: [] })
                 }
                 setImporting(false)
               }}>

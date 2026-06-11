@@ -1305,25 +1305,62 @@ async def import_tdata_batch(
             )
 
             try:
+                print(f"📦 [{item.index}] client.connect() via "
+                      f"{proxy_dict.get('addr')}:{proxy_dict.get('port')} ({proxy_dict.get('proxy_type')}) ...")
                 await _aio.wait_for(client.connect(), timeout=45)
+                print(f"📦 [{item.index}] connected")
             except _aio.TimeoutError:
                 try: await client.disconnect()
                 except: pass
-                results.append({"index": item.index, "success": False,
-                                "error": "Таймаут подключения — проверь прокси"})
+                err = (
+                    "Таймаут подключения через прокси (45с). "
+                    f"Прокси {proxy_dict.get('addr')}:{proxy_dict.get('port')} не отвечает или не пускает на Telegram DC. "
+                    "Проверь его на странице «Прокси» или поставь другой."
+                )
+                print(f"📦 ❌ [{item.index}] {err}")
+                results.append({"index": item.index, "success": False, "error": err})
+                continue
+            except Exception as e:
+                try: await client.disconnect()
+                except: pass
+                err = f"Ошибка connect(): {type(e).__name__}: {str(e)[:150]}"
+                print(f"📦 ❌ [{item.index}] {err}")
+                results.append({"index": item.index, "success": False, "error": err})
                 continue
 
             if not await client.is_user_authorized():
                 await client.disconnect()
-                results.append({"index": item.index, "success": False, "error": "Сессия не авторизована"})
+                err = (
+                    "Telegram отверг сессию (is_user_authorized=False). "
+                    "Auth_key из TData мёртв на стороне Telegram: возможные причины — "
+                    "(1) TData получен через другой прокси/IP чем здесь, "
+                    "(2) сессия была убита Telegram'ом из-за множественных коннектов с разных IP, "
+                    "(3) аккаунт terminated на «Settings → Devices» в Telegram. "
+                    "Решение: SMS-логин через «+ Добавить» с тем же прокси."
+                )
+                print(f"📦 ❌ [{item.index}] {err}")
+                results.append({"index": item.index, "success": False, "error": err})
                 continue
 
-            me = await client.get_me()
+            try:
+                me = await client.get_me()
+            except Exception as e:
+                try: await client.disconnect()
+                except: pass
+                err = f"get_me() упал: {type(e).__name__}: {str(e)[:150]}"
+                print(f"📦 ❌ [{item.index}] {err}")
+                results.append({"index": item.index, "success": False, "error": err})
+                continue
+
             real_phone = f"+{me.phone}" if me.phone else ""
+            print(f"📦 [{item.index}] me: phone={real_phone}, "
+                  f"first_name={me.first_name}, id={me.id}")
 
             if not real_phone:
                 await client.disconnect()
-                results.append({"index": item.index, "success": False, "error": "Не удалось получить номер"})
+                err = "Не удалось получить номер из get_me() — сессия странная"
+                print(f"📦 ❌ [{item.index}] {err}")
+                results.append({"index": item.index, "success": False, "error": err})
                 continue
 
             # Загружаем bio
