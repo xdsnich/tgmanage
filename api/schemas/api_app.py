@@ -97,10 +97,11 @@ class ApiAppCreate(BaseModel):
     @field_validator("max_accounts")
     @classmethod
     def validate_max(cls, v):
-        if v < 1:
-            raise ValueError("max_accounts должен быть >= 1")
-        if v > 500:
-            raise ValueError("max_accounts не может быть > 500 (рекомендация Telegram)")
+        # 0 = безлимитный (рекомендация: разнести аккаунты по нескольким api_id,
+        # чтобы при флаге одного — не пострадали остальные. Но если знаешь
+        # что делаешь — можешь снять лимит совсем.)
+        if v < 0:
+            raise ValueError("max_accounts не может быть отрицательным (0 = безлимит)")
         return v
 
 

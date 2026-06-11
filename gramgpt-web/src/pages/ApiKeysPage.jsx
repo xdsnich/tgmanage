@@ -161,11 +161,16 @@ export default function ApiKeysPage() {
     }
     setSaving(true)
     try {
+      // parseInt пустой строки → NaN → fallback 100. Но если юзер сознательно
+      // ввёл 0 (безлимит), parseInt вернёт 0 (правильно). `|| 100` тут плохо
+      // потому что 0 falsy → стало бы 100. Используем Number.isFinite check.
+      const maxParsed = parseInt(form.max_accounts, 10)
+      const maxAccounts = Number.isFinite(maxParsed) ? maxParsed : 100
       await apiAppsAPI.create({
         api_id: parseInt(form.api_id),
         api_hash: form.api_hash.trim(),
         title: form.title.trim(),
-        max_accounts: parseInt(form.max_accounts) || 100,
+        max_accounts: maxAccounts,
         notes: form.notes,
       })
       setAddModal(false)
@@ -212,9 +217,12 @@ export default function ApiKeysPage() {
     if (!selected) return
     setSaving(true)
     try {
+      // parseInt("") = NaN — пропускаем поле (бэк не тронет существующее).
+      // parseInt("0") = 0 — корректно (безлимит).
+      const maxParsed = parseInt(selected.max_accounts, 10)
       await apiAppsAPI.update(selected.id, {
         title: selected.title,
-        max_accounts: parseInt(selected.max_accounts),
+        max_accounts: Number.isFinite(maxParsed) ? maxParsed : null,
         notes: selected.notes,
       })
       setEditModal(false)
@@ -394,11 +402,11 @@ export default function ApiKeysPage() {
                   </div>
                 </div>
 
-                {/* Progress bar */}
+                {/* Progress bar (или счётчик без лимита если max=0) */}
                 <div style={{ marginBottom: 8 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--text-3)', marginBottom: 6 }}>
-                    <span>Аккаунтов: {app.accounts_count} / {app.max_accounts}</span>
-                    <span style={{ color: barColor, fontWeight: 600 }}>{pct}%</span>
+                    <span>Аккаунтов: <b style={{ color: 'var(--text)' }}>{app.accounts_count}</b> / {app.max_accounts ? app.max_accounts : <span style={{ color: 'var(--violet)', fontWeight: 700 }} title="Безлимит">∞</span>}</span>
+                    <span style={{ color: barColor, fontWeight: 600 }}>{app.max_accounts ? `${pct}%` : 'без лимита'}</span>
                   </div>
                   <div style={{
                     height: 6, borderRadius: 3,
@@ -407,8 +415,9 @@ export default function ApiKeysPage() {
                   }}>
                     <div style={{
                       height: '100%', borderRadius: 3,
-                      width: `${Math.min(pct, 100)}%`,
-                      background: barColor,
+                      width: app.max_accounts ? `${Math.min(pct, 100)}%` : '100%',
+                      background: app.max_accounts ? barColor : 'linear-gradient(90deg, #7c4dff, #3d8bff)',
+                      opacity: app.max_accounts ? 1 : 0.3,
                       transition: 'width 0.6s cubic-bezier(0.16,1,0.3,1)',
                     }} />
                   </div>
@@ -565,7 +574,7 @@ export default function ApiKeysPage() {
               }}>
                 <span>api_id: {detailApp.api_id}</span>
                 <span>hash: {detailApp.api_hash.slice(0, 16)}...</span>
-                <span>лимит: {detailApp.accounts_count}/{detailApp.max_accounts}</span>
+                <span>лимит: {detailApp.accounts_count}/{detailApp.max_accounts ? detailApp.max_accounts : '∞'}</span>
               </div>
 
               {/* Accounts list */}
@@ -637,7 +646,11 @@ export default function ApiKeysPage() {
                 display: 'flex', justifyContent: 'space-between',
               }}>
                 <span>Всего: {detailApp.accounts_count} аккаунтов</span>
-                <span>Свободно: {detailApp.max_accounts - detailApp.accounts_count} слотов</span>
+                <span>
+                  {detailApp.max_accounts
+                    ? `Свободно: ${detailApp.max_accounts - detailApp.accounts_count} слотов`
+                    : 'Без лимита (∞)'}
+                </span>
               </div>
             </div>
           ) : null}
@@ -666,12 +679,18 @@ export default function ApiKeysPage() {
               value={form.title}
               onChange={e => setForm(f => ({ ...f, title: e.target.value }))}
             />
-            <Input
-              label="Макс. аккаунтов" type="number"
-              placeholder="100"
-              value={form.max_accounts}
-              onChange={e => setForm(f => ({ ...f, max_accounts: e.target.value }))}
-            />
+            <div>
+              <Input
+                label="Макс. аккаунтов" type="number"
+                placeholder="100"
+                value={form.max_accounts}
+                onChange={e => setForm(f => ({ ...f, max_accounts: e.target.value }))}
+              />
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4, lineHeight: 1.5 }}>
+                Введи <b>0</b> для безлимита. Рекомендация: 50–100 аккаунтов на ApiApp —
+                если Telegram пометит api_id (массовое подозрение) — другие апы не пострадают.
+              </div>
+            </div>
             <div style={{ display: 'flex', gap: 10, marginTop: 8 }}>
               <Button variant="ghost" onClick={() => setAddModal(false)} style={{ flex: 1 }}>Отмена</Button>
               <Button variant="primary" onClick={handleAdd} disabled={saving} style={{ flex: 1 }}>
@@ -694,11 +713,16 @@ export default function ApiKeysPage() {
               value={selected.title}
               onChange={e => setSelected(s => ({ ...s, title: e.target.value }))}
             />
-            <Input
-              label="Макс. аккаунтов" type="number"
-              value={selected.max_accounts}
-              onChange={e => setSelected(s => ({ ...s, max_accounts: e.target.value }))}
-            />
+            <div>
+              <Input
+                label="Макс. аккаунтов" type="number"
+                value={selected.max_accounts}
+                onChange={e => setSelected(s => ({ ...s, max_accounts: e.target.value }))}
+              />
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4, lineHeight: 1.5 }}>
+                <b>0</b> = безлимит. Сейчас на ключе: <b>{selected.accounts_count || 0}</b> акк.
+              </div>
+            </div>
             <Input
               label="Заметки"
               value={selected.notes || ''}

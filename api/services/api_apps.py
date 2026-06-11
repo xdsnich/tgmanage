@@ -68,7 +68,7 @@ async def pick_best_app(db: AsyncSession, user_id: int) -> Optional[ApiApp]:
         return None
 
     best_app = None
-    best_ratio = 2.0
+    best_score = float("inf")  # чем меньше score — тем лучше кандидат
 
     for app in apps:
         count_r = await db.execute(
@@ -77,12 +77,19 @@ async def pick_best_app(db: AsyncSession, user_id: int) -> Optional[ApiApp]:
         )
         count = count_r.scalar() or 0
 
-        if count >= app.max_accounts:
-            continue
+        # max_accounts == 0 → безлимитный апп. Сравниваем по абсолютному
+        # счётчику аккаунтов (предпочитаем менее загруженный).
+        if not app.max_accounts:
+            score = count  # 0 acc → 0, 100 acc → 100
+        else:
+            if count >= app.max_accounts:
+                continue  # full — пропускаем
+            # Score = ratio × 1000, чтобы лимитированные апы конкурировали
+            # с безлимитными по соотношению загрузки, а не абсолютному числу
+            score = (count / app.max_accounts) * 1000
 
-        ratio = count / app.max_accounts
-        if ratio < best_ratio:
-            best_ratio = ratio
+        if score < best_score:
+            best_score = score
             best_app = app
 
     return best_app

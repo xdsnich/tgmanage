@@ -49,7 +49,11 @@ class ApiApp(Base):
 
     @property
     def is_full(self) -> bool:
+        # max_accounts = 0 → безлимит (никогда не full)
+        if not self.max_accounts:
+            return False
         return self.accounts_count >= self.max_accounts
 
     def __repr__(self):
-        return f"<ApiApp #{self.id} '{self.title}' api_id={self.api_id} platform={self.platform} [{self.accounts_count}/{self.max_accounts}]>"
+        cap = "∞" if not self.max_accounts else str(self.max_accounts)
+        return f"<ApiApp #{self.id} '{self.title}' api_id={self.api_id} platform={self.platform} [{self.accounts_count}/{cap}]>"

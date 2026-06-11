@@ -201,8 +201,8 @@ async def update_api_app(
     if data.platform is not None:
         app.platform = data.platform
     if data.max_accounts is not None:
-        if data.max_accounts < 1 or data.max_accounts > 500:
-            raise HTTPException(status_code=400, detail="max_accounts должно быть от 1 до 500")
+        if data.max_accounts < 0:
+            raise HTTPException(status_code=400, detail="max_accounts не может быть отрицательным (0 = безлимит)")
         app.max_accounts = data.max_accounts
     if data.is_active is not None:
         app.is_active = data.is_active
