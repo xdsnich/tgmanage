@@ -75,72 +75,16 @@ def _safe_set_attr(obj, name: str, value):
 
 # ── Helpers ──────────────────────────────────────────────────
 
-def _get_sessions_dir() -> Path:
-    """Папка для .session файлов = <repo>/sessions.
-
-    Раньше брали путь через импорт легаси tg_manager1/config.py,
-    но этот файл переименован в config.py.legacy. Теперь — просто
-    относительный путь от текущего файла, как и в tg_auth.py.
-    Опционально перебивается env-переменной TG_SESSIONS_DIR.
-    """
-    env_dir = os.getenv("TG_SESSIONS_DIR", "").strip()
-    if env_dir:
-        p = Path(env_dir).expanduser().resolve()
-    else:
-        # api/routers/web_session.py → api/ → repo root → sessions/
-        p = Path(__file__).resolve().parent.parent.parent / "sessions"
+def _get_sessions_dir():
+    # Раньше брали через импорт корневого tg_manager1/config.py — но он
+    # переименован в config.py.legacy. Логика та же: <repo>/sessions.
+    p = Path(__file__).resolve().parent.parent.parent / "sessions"
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
-async def _cleanup_telethon(client, session_path: Path):
-    """
-    Закрывает Telethon-клиент И SQLite-сессию, потом удаляет .session файл.
-
-    На Windows это критично: голый `client.disconnect()` останавливает сеть,
-    но НЕ закрывает SQLite-handle (Telethon держит его в client.session).
-    Из-за этого `session_path.unlink()` падает с WinError 32 на следующий
-    запрос — файл всё ещё «занят процессом».
-
-    Порядок:
-      1. await client.disconnect()    — останавливаем сеть
-      2. client.session.close()       — закрываем SQLite handle (если есть)
-      3. session_path.unlink()        — удаляем файл (теперь можно)
-
-    Все исключения подавляются — функция используется в except-блоках.
-    """
-    try:
-        if client is not None:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-            sess = getattr(client, "session", None)
-            if sess is not None:
-                try:
-                    close = getattr(sess, "close", None)
-                    if close:
-                        # SQLite.close() — синхронный; некоторые версии async
-                        res = close()
-                        if hasattr(res, "__await__"):
-                            await res
-                except Exception:
-                    pass
-    finally:
-        try:
-            session_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-
-def _create_telethon_session_file(session_path: Path, dc_id: int, auth_key_hex: str) -> Path:
-    """Создаёт SQLite .session файл совместимый с Telethon из auth_key.
-
-    Возвращает фактический путь к созданному файлу (может отличаться от
-    переданного если старый файл был залочен — тогда используется суффикс).
-    """
-    import time
-
+def _create_telethon_session_file(session_path: Path, dc_id: int, auth_key_hex: str):
+    """Создаёт SQLite .session файл совместимый с Telethon из auth_key."""
     auth_key_bytes = bytes.fromhex(auth_key_hex.strip().replace(" ", ""))
     if len(auth_key_bytes) != 256:
         raise ValueError(f"auth_key должен быть 256 байт, получено {len(auth_key_bytes)}")
@@ -150,32 +94,9 @@ def _create_telethon_session_file(session_path: Path, dc_id: int, auth_key_hex: 
 
     server_address, port = DC_IPS[dc_id]
 
-    session_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Пытаемся удалить старый файл, если он есть. На Windows предыдущий
-    # упавший Telethon-клиент мог не успеть отдать handle SQLite → unlink
-    # бросает WinError 32. В этом случае:
-    #   1) подождём 0.5с × 3 попытки (вдруг handle вот-вот освободится)
-    #   2) если всё ещё залочен — генерируем имя с суффиксом времени,
-    #      чтобы новый импорт прошёл без вмешательства пользователя
     if session_path.exists():
-        for attempt in range(3):
-            try:
-                session_path.unlink()
-                break
-            except PermissionError:
-                time.sleep(0.5)
-        else:
-            # Файл всё ещё залочен — берём альтернативное имя
-            alt = session_path.with_name(
-                f"{session_path.stem}_{int(time.time())}{session_path.suffix}"
-            )
-            logger = __import__("logging").getLogger(__name__)
-            logger.warning(
-                f"[web_session] {session_path.name} залочен другим процессом, "
-                f"использую {alt.name}"
-            )
-            session_path = alt
+        session_path.unlink()
+    session_path.parent.mkdir(parents=True, exist_ok=True)
 
     conn = sqlite3.connect(str(session_path))
     cur = conn.cursor()
@@ -247,167 +168,49 @@ class WebStorageParseRequest(BaseModel):
 
 # ── Endpoints ────────────────────────────────────────────────
 
-def _extract_balanced_braces(text: str, start: int) -> "str | None":
-    """Возвращает substring от { до парной } учитывая вложенность, начиная с index `start`.
-    Если не нашёл { или баланс не сошёлся — None.
-    """
-    i = text.find("{", start)
-    if i < 0:
-        return None
-    depth = 0
-    j = i
-    while j < len(text):
-        c = text[j]
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                return text[i:j + 1]
-        j += 1
-    return None  # незавершённый JSON (обрезан)
-
-
-def _extract_topkey_strings(blob: str) -> dict:
-    """
-    Достаёт ключи верхнего уровня вида `dcN_auth_key  "hexstring"` из DevTools-формата
-    (key TAB value NEWLINE), формата `JSON.stringify(localStorage)` и обычного текста.
-    Возвращает {"dc1_auth_key": "...", "dc2_auth_key": "...", "user_auth": {...}, ...}.
-
-    Это нужно потому что в DevTools юзер видит auth_key И внутри account1 JSON,
-    И как отдельные top-level ключи localStorage. Парсер должен уметь смотреть в оба места.
-    """
-    import json
-    import re
-
-    out: dict = {}
-
-    # JSON.stringify(localStorage)
-    try:
-        d = json.loads(blob)
-        if isinstance(d, dict):
-            for k, v in d.items():
-                if isinstance(v, str):
-                    # значения в JSON.stringify(localStorage) — это строки которые сами могут быть JSON
-                    try:
-                        out[k] = json.loads(v)
-                    except Exception:
-                        out[k] = v
-                else:
-                    out[k] = v
-            return out
-    except Exception:
-        pass
-
-    # DevTools Application tab → "key TAB value NEWLINE"
-    # Также формат "key value" с любым whitespace
-    for line in blob.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        # Разделить на key + value по первому tab или 2+ пробелам
-        m = re.match(r'^(\S+)\s+(.+)$', line)
-        if not m:
-            continue
-        key = m.group(1).strip()
-        val_raw = m.group(2).strip()
-        # Попробовать распарсить значение как JSON, иначе оставить строкой
-        try:
-            out[key] = json.loads(val_raw)
-        except Exception:
-            # Убрать обрамляющие кавычки если они есть
-            if val_raw.startswith('"') and val_raw.endswith('"'):
-                out[key] = val_raw[1:-1]
-            else:
-                out[key] = val_raw
-    return out
-
-
 @router.post("/web-storage-parse")
 async def parse_web_storage(
     body: WebStorageParseRequest,
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Парсит блоб localStorage Telegram Web K → возвращает превью аккаунтов.
-
-    Поддерживаемые форматы:
-      1. JSON.stringify(localStorage) — целый объект как JSON
-      2. DevTools Application tab — key TAB value NEWLINE (можно копировать "Copy All")
-      3. Смешанный текст — где-то в нём account1 {...}, account2 {...}, dc2_auth_key "..."
-
-    Если внутри account-блока auth_key обрезан/отсутствует — добираем из top-level
-    ключа dc{N}_auth_key как fallback.
-    """
+    """Парсит блоб localStorage Telegram Web K → возвращает превью аккаунтов."""
     import json
     import re
 
     blob = body.storage_blob.strip()
+    accounts = []
 
-    # Достаём все top-level ключи — для fallback на dcN_auth_key
-    top_keys = _extract_topkey_strings(blob)
+    parsed_dict = None
+    try:
+        parsed_dict = json.loads(blob)
+    except Exception:
+        pass
 
-    accounts: "list[tuple[str, dict]]" = []
+    if isinstance(parsed_dict, dict):
+        for key, val in parsed_dict.items():
+            if not key.startswith("account"):
+                continue
+            if isinstance(val, str):
+                try:
+                    val = json.loads(val)
+                except Exception:
+                    continue
+            accounts.append((key, val))
 
-    # Если top_keys содержат account1/account2/... сразу — берём их
-    for k, v in top_keys.items():
-        if k.startswith("account") and isinstance(v, dict) and v.get("dcId"):
-            accounts.append((k, v))
-
-    # Дополнительно ищем accountN с помощью balanced-brace scan по сырому тексту.
-    # Это покрывает случай когда top_keys не сработал (битый JSON, перенос строк внутри значения).
-    seen_labels = {label for label, _ in accounts}
-    for m in re.finditer(r'\baccount(\d+)\b', blob):
-        label = f"account{m.group(1)}"
-        if label in seen_labels:
-            continue
-        # Извлекаем JSON начиная сразу после метки (учитывая баланс скобок)
-        json_blob = _extract_balanced_braces(blob, m.end())
-        if not json_blob:
-            continue
-        try:
-            data = json.loads(json_blob)
-            if isinstance(data, dict) and data.get("dcId"):
-                accounts.append((label, data))
-                seen_labels.add(label)
-        except Exception:
-            # JSON битый или обрезан avatarUri — попробуем выдернуть основные поля regex'ом
-            partial = {}
-            mm = re.search(r'"dcId"\s*:\s*(\d+)', json_blob)
-            if mm:
-                partial["dcId"] = int(mm.group(1))
-            for dc_n in (1, 2, 3, 4, 5):
-                mk = re.search(rf'"dc{dc_n}_auth_key"\s*:\s*"([0-9a-fA-F]+)"', json_blob)
-                if mk:
-                    partial[f"dc{dc_n}_auth_key"] = mk.group(1)
-            mu = re.search(r'"userId"\s*:\s*"?(\d+)"?', json_blob)
-            if mu:
-                partial["userId"] = mu.group(1)
-            mp = re.search(r'"phone"\s*:\s*"?(\d+)"?', json_blob)
-            if mp:
-                partial["phone"] = mp.group(1)
-            if partial.get("dcId"):
-                accounts.append((label, partial))
-                seen_labels.add(label)
-
-    # Если совсем ничего не нашлось — может быть юзер вставил только dcN_auth_key без account-блоков.
-    # Тогда строим виртуальный account1 из top_keys (если есть user_auth с dcID).
     if not accounts:
-        ua = top_keys.get("user_auth")
-        if isinstance(ua, dict) and ua.get("dcID"):
-            dc_id = int(ua["dcID"])
-            ak = top_keys.get(f"dc{dc_id}_auth_key")
-            if ak:
-                accounts.append(("account1", {
-                    "dcId": dc_id,
-                    f"dc{dc_id}_auth_key": ak,
-                    "userId": ua.get("id"),
-                }))
+        pattern = re.compile(r'account(\d+)\s*({[^}]*"dcId"[^}]*})', re.DOTALL)
+        for m in pattern.finditer(blob):
+            label = f"account{m.group(1)}"
+            try:
+                val = json.loads(m.group(2))
+                accounts.append((label, val))
+            except Exception:
+                continue
 
     if not accounts:
         raise HTTPException(
             status_code=400,
-            detail="Не нашёл аккаунтов. Самый надёжный способ: открой DevTools → Console на web.telegram.org/k и выполни  JSON.stringify(localStorage)  — скопируй результат целиком и вставь сюда."
+            detail="Не найдено ни одного аккаунта. Убедись что вставил данные из localStorage Telegram Web K."
         )
 
     result = []
@@ -417,15 +220,8 @@ async def parse_web_storage(
             continue
         auth_key_field = f"dc{dc_id}_auth_key"
         auth_key = data.get(auth_key_field)
-        # Fallback: если внутри account auth_key отсутствует/обрезан, добираем из top-level localStorage
-        if not auth_key:
-            auth_key = top_keys.get(auth_key_field)
-            if isinstance(auth_key, str):
-                auth_key = auth_key.strip('"')
         if not auth_key:
             continue
-        # Убираем возможные пробелы и кавычки
-        auth_key = str(auth_key).strip().strip('"')
         result.append(WebAccountPreview(
             label=label,
             dc_id=int(dc_id),
@@ -437,7 +233,7 @@ async def parse_web_storage(
     if not result:
         raise HTTPException(
             status_code=400,
-            detail="Найдены блоки accountN, но не получилось вытащить dc{N}_auth_key. Проверь что Telegram Web авторизован и попробуй ещё раз через  JSON.stringify(localStorage)  в DevTools Console."
+            detail="Найдены блоки accountN, но в них нет dc{N}_auth_key. Проверь, что аккаунт реально авторизован в Web."
         )
 
     return {"accounts": result, "count": len(result)}
@@ -514,7 +310,7 @@ async def import_web_session(
     session_path = Path(sessions_dir) / f"{tmp_phone}.session"
 
     try:
-        session_path = _create_telethon_session_file(session_path, body.dc_id, body.auth_key)
+        _create_telethon_session_file(session_path, body.dc_id, body.auth_key)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Ошибка формирования сессии: {e}")
 
@@ -548,61 +344,19 @@ async def import_web_session(
     )
 
     try:
-        ak_clean = body.auth_key.strip().replace(" ", "")
-        ak_len = len(ak_clean)
-        print(
-            f"🌐 IMPORT request:\n"
-            f"   dc_id              = {body.dc_id}\n"
-            f"   auth_key length    = {ak_len} hex chars ({ak_len // 2} bytes; ожидаем 512 hex / 256 bytes)\n"
-            f"   auth_key first 16  = {ak_clean[:16]}\n"
-            f"   auth_key last 16   = {ak_clean[-16:]}\n"
-            f"   api_id             = {api_id_use}\n"
-            f"   platform           = {platform_use}\n"
-            f"   device             = {fp['device']} / {fp['system']} (app {fp['app_version']})\n"
-            f"   proxy              = {proxy_dict.get('addr') if proxy_dict else 'NONE'}:{proxy_dict.get('port') if proxy_dict else '-'} "
-            f"({proxy_dict.get('proxy_type') if proxy_dict else '-'})"
-        )
         await asyncio.wait_for(client.connect(), timeout=45)
-        print(f"🌐 connected, checking is_user_authorized()...")
 
         if not await client.is_user_authorized():
-            print(
-                f"🌐 ❌ is_user_authorized() = False. Auth key отвергнут Telegram'ом.\n"
-                f"   Самая частая причина: auth_key был получен в Web под одним IP "
-                f"(твой обычный браузер), а импорт идёт через ДРУГОЙ IP (этот прокси). "
-                f"Telegram расценивает это как попытку угона и отзывает сессию.\n"
-                f"   Решения:\n"
-                f"   1) Зайди на web.telegram.org/k через ТОТ ЖЕ прокси, "
-                f"что используешь здесь (Dolphin Anty / SwitchyOmega), скопируй localStorage заново.\n"
-                f"   2) ИЛИ импорт без прокси, если в web заходил без прокси.\n"
-                f"   3) ИЛИ возможно ты вышел из web (Settings → Devices → Terminate session)."
-            )
-            await _cleanup_telethon(client, session_path)
+            await client.disconnect()
+            try: session_path.unlink(missing_ok=True)
+            except: pass
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    "Сессия отвергнута Telegram'ом. Самая частая причина: auth_key "
-                    "был получен в web.telegram.org/k под одним IP, а импорт идёт через "
-                    "другой IP (этот прокси). Telegram расценивает это как угон и "
-                    "отзывает сессию. Решение: открой Web через ТОТ ЖЕ прокси что выбран здесь "
-                    "(например в Dolphin Anty или с SwitchyOmega в Chrome), скопируй localStorage "
-                    "заново и импортируй."
-                )
+                detail="Auth key не валиден или сессия истекла. Возможно нужно перелогиниться в Web."
             )
 
         me = await client.get_me()
-        # Закрываем сеть + SQLite ДО переименования файла, иначе rename упадёт на Windows
-        try:
-            await client.disconnect()
-            sess = getattr(client, "session", None)
-            if sess is not None:
-                close = getattr(sess, "close", None)
-                if close:
-                    res = close()
-                    if hasattr(res, "__await__"):
-                        await res
-        except Exception:
-            pass
+        await client.disconnect()
 
         if not me.phone:
             try: session_path.unlink(missing_ok=True)
@@ -684,22 +438,16 @@ async def import_web_session(
     except HTTPException:
         raise
     except asyncio.TimeoutError:
-        await _cleanup_telethon(client, session_path)
-        raise HTTPException(
-            status_code=504,
-            detail=(
-                "Таймаут подключения через прокси. Скорее всего прокси не отвечает или "
-                "блокирует Telegram DC. Проверь его на странице «Прокси» (🔍 Проверить) "
-                "или выбери другой прокси."
-            ),
-        )
+        try: await client.disconnect()
+        except: pass
+        try: session_path.unlink(missing_ok=True)
+        except: pass
+        raise HTTPException(status_code=504, detail="Таймаут — проверь прокси")
     except Exception as e:
-        await _cleanup_telethon(client, session_path)
+        try: await client.disconnect()
+        except: pass
+        try: session_path.unlink(missing_ok=True)
+        except: pass
         err = str(e)
         print(f"🌐 ❌ Web import error: {type(e).__name__}: {err}")
-        if "Proxy" in err or "proxy" in err or "timed out" in err.lower():
-            raise HTTPException(
-                status_code=502,
-                detail=f"Прокси не пропускает к Telegram: {err[:200]}",
-            )
         raise HTTPException(status_code=500, detail=f"Ошибка: {err[:200]}")
