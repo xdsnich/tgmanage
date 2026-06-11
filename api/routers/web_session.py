@@ -198,16 +198,29 @@ async def parse_web_storage(
             accounts.append((key, val))
 
     if not accounts:
-        # Старый regex `({[^}]*"dcId"[^}]*})` ломался на больших account-блоках
-        # с avatarUri (десятки KB base64) и обычно ловил только последний акк
-        # из нескольких. Заменили на balanced-brace scan: находим каждый
-        # `account\d+` и читаем `{...}` с учётом баланса фигурных скобок.
-        def _extract_braces(text: str, start: int):
-            i = text.find("{", start)
-            if i < 0:
+        # DevTools Application-tab формат: парсим разными способами,
+        # покрывая разные форматы сессий (Web K разных версий и подмены
+        # антидетект-браузеров иногда дают неполный JSON: avatarUri с
+        # base64 обрезается clipboard'ом, лишние поля в начале и т.п.).
+        #
+        # Стратегия:
+        #   1) Найти все `accountN` метки.
+        #   2) Для каждой ограничить «секцию» до следующей метки accountM
+        #      (или конца) — чтобы balanced-brace не сожрал чужие данные.
+        #   3) Path A: внутри секции читаем balanced `{...}` и парсим JSON.
+        #   4) Path B (fallback): если JSON обрезан / не парсится —
+        #      достаём dcId / dc{N}_auth_key / userId / phone /
+        #      auth_key_fingerprint через regex прямо по секции. Эти
+        #      поля всегда лежат В НАЧАЛЕ JSON, до avatarUri, поэтому
+        #      даже сильно обрезанная сессия отдаёт всё нужное.
+        #   5) Дополнительный fallback: если внутри секции нет dc{N}_auth_key
+        #      для своего dcId — ищем top-level `dcN_auth_key "..."` строки.
+        def _extract_braces(text: str, start: int, end: int):
+            i = text.find("{", start, end)
+            if i < 0 or i >= end:
                 return None
             depth = 0
-            for j in range(i, len(text)):
+            for j in range(i, min(len(text), end)):
                 c = text[j]
                 if c == "{":
                     depth += 1
@@ -215,19 +228,73 @@ async def parse_web_storage(
                     depth -= 1
                     if depth == 0:
                         return text[i:j + 1]
-            return None  # JSON не завершён (обрезан)
+            return None  # JSON не завершён
 
-        for m in re.finditer(r'\baccount(\d+)\b', blob):
+        def _regex_partial(section: str) -> dict:
+            partial = {}
+            mm = re.search(r'"dcId"\s*:\s*(\d+)', section)
+            if mm:
+                partial["dcId"] = int(mm.group(1))
+            for dc_n in (1, 2, 3, 4, 5):
+                mk = re.search(rf'"dc{dc_n}_auth_key"\s*:\s*"([0-9a-fA-F]+)"', section)
+                if mk:
+                    partial[f"dc{dc_n}_auth_key"] = mk.group(1)
+            mu = re.search(r'"userId"\s*:\s*"?(\d+)"?', section)
+            if mu:
+                partial["userId"] = mu.group(1)
+            mp = re.search(r'"phone"\s*:\s*"?(\d+)"?', section)
+            if mp:
+                partial["phone"] = mp.group(1)
+            mfn = re.search(r'"firstName"\s*:\s*"([^"]*)"', section)
+            if mfn:
+                partial["firstName"] = mfn.group(1)
+            mfp = re.search(r'"auth_key_fingerprint"\s*:\s*"([0-9a-fA-F]+)"', section)
+            if mfp:
+                partial["auth_key_fingerprint"] = mfp.group(1)
+            return partial
+
+        # Top-level dcN_auth_key как pool на случай если у account-блока
+        # auth_key обрезан / отсутствует. Web K часто дублирует primary
+        # auth_key на верхнем уровне localStorage.
+        toplevel_keys = {}
+        for tk in re.finditer(r'^(dc\d_auth_key)\s+"([0-9a-fA-F]+)"\s*$', blob, re.MULTILINE):
+            toplevel_keys[tk.group(1)] = tk.group(2)
+
+        account_matches = list(re.finditer(r'\baccount(\d+)\b', blob))
+        for idx, m in enumerate(account_matches):
             label = f"account{m.group(1)}"
-            json_str = _extract_braces(blob, m.end())
-            if not json_str:
+            sec_start = m.end()
+            sec_end = account_matches[idx + 1].start() if idx + 1 < len(account_matches) else len(blob)
+
+            val = None
+            # Path A: balanced-brace JSON в рамках секции
+            json_str = _extract_braces(blob, sec_start, sec_end)
+            if json_str:
+                try:
+                    parsed = json.loads(json_str)
+                    if isinstance(parsed, dict) and parsed.get("dcId"):
+                        val = parsed
+                except Exception:
+                    pass
+
+            # Path B: обрезанный JSON → regex partial по секции
+            if val is None:
+                section = blob[sec_start:sec_end]
+                partial = _regex_partial(section)
+                if partial.get("dcId"):
+                    val = partial
+
+            if val is None:
                 continue
-            try:
-                val = json.loads(json_str)
-                if isinstance(val, dict) and val.get("dcId"):
-                    accounts.append((label, val))
-            except Exception:
-                continue
+
+            # Доберём auth_key из top-level pool если в самом блоке его нет
+            dc_id = val.get("dcId")
+            if dc_id:
+                ak_field = f"dc{dc_id}_auth_key"
+                if not val.get(ak_field) and toplevel_keys.get(ak_field):
+                    val[ak_field] = toplevel_keys[ak_field]
+
+            accounts.append((label, val))
 
     if not accounts:
         raise HTTPException(
