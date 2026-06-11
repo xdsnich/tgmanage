@@ -488,6 +488,151 @@ async def export_tdata(
 
 
 # ══════════════════════════════════════════════════════════════
+# BULK EXPORT — несколько аккаунтов → один ZIP с подпапками TData
+# ══════════════════════════════════════════════════════════════
+
+class BulkExportTDataRequest(BaseModel):
+    account_ids: list[int]
+
+
+@router.post("/bulk/export-tdata")
+async def bulk_export_tdata(
+    body: BulkExportTDataRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Экспорт TData для N аккаунтов сразу → один ZIP-архив.
+    Структура архива:
+        +380xxxxxxxxxx_tdata/tdata/...
+        +380yyyyyyyyyy_tdata/tdata/...
+        ...
+        _failed.txt     — список акков на которые не получилось экспортнуть
+                          (нет файла сессии, опентель упал, и т.п.)
+
+    Долгая операция: на 1 акк ~1-5 сек. Считай ~3 минуты на 100 акков.
+    Endpoint синхронный, проще; для очень больших батчей юзеру лучше
+    разбивать на пачки по 50-100.
+    """
+    from fastapi.responses import FileResponse
+    from pathlib import Path
+    import tempfile, shutil, zipfile
+    from datetime import datetime as _dt
+
+    if not body.account_ids:
+        raise HTTPException(status_code=400, detail="Не выбран ни один аккаунт")
+    if len(body.account_ids) > 500:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Слишком много за раз ({len(body.account_ids)} > 500). Разбей на пачки.",
+        )
+
+    # Грузим все акки одним SQL, проверяем владение
+    r = await db.execute(
+        select(TelegramAccount).options(joinedload(TelegramAccount.api_app))
+        .where(
+            TelegramAccount.id.in_(body.account_ids),
+            TelegramAccount.user_id == current_user.id,
+        )
+    )
+    accounts = r.scalars().all()
+    owned_ids = {a.id for a in accounts}
+    not_owned = [a for a in body.account_ids if a not in owned_ids]
+    if not_owned:
+        raise HTTPException(status_code=403, detail=f"Не ваши аккаунты: {not_owned}")
+
+    try:
+        from opentele.tl import TelegramClient as OpenteleClient
+        from opentele.api import UseCurrentSession
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="opentele не установлен. pip install opentele",
+        )
+
+    work_dir = tempfile.mkdtemp(prefix="gramgpt_bulk_tdata_")
+    zip_path = os.path.join(
+        work_dir, f"tdata_bulk_{_dt.utcnow().strftime('%Y%m%d_%H%M%S')}_{len(accounts)}acc.zip"
+    )
+
+    failed: list[str] = []
+    successful: list[str] = []
+
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for acc in accounts:
+                phone_clean = (acc.phone or f"acc{acc.id}").replace("+", "")
+                acc_label = f"{phone_clean}_tdata"
+
+                if not acc.session_file or not Path(acc.session_file).exists():
+                    failed.append(f"{acc.phone}: нет файла сессии ({acc.session_file})")
+                    print(f"📦 [bulk_export] {acc.phone}: skip — no session file")
+                    continue
+
+                acc_tmp = os.path.join(work_dir, acc_label)
+                td_dir = os.path.join(acc_tmp, "tdata")
+                try:
+                    session_path = acc.session_file.replace(".session", "")
+                    print(f"📦 [bulk_export] {acc.phone}: ToTDesktop ...")
+                    client = OpenteleClient(session_path)
+                    tdesk = await client.ToTDesktop(flag=UseCurrentSession)
+                    tdesk.SaveTData(td_dir)
+
+                    # Сразу пакуем эту папку в архив (чтобы экономить место на диске)
+                    for root, _dirs, files in os.walk(acc_tmp):
+                        for f in files:
+                            file_path = os.path.join(root, f)
+                            arcname = os.path.relpath(file_path, work_dir)
+                            zf.write(file_path, arcname)
+
+                    # Чистим распакованную копию — она уже в zip
+                    try: shutil.rmtree(acc_tmp)
+                    except Exception: pass
+
+                    successful.append(acc.phone)
+                    print(f"📦 [bulk_export] {acc.phone}: OK")
+                except Exception as e:
+                    failed.append(f"{acc.phone}: {type(e).__name__}: {str(e)[:200]}")
+                    print(f"📦 [bulk_export] {acc.phone}: FAIL — {e}")
+                    try: shutil.rmtree(acc_tmp)
+                    except Exception: pass
+
+            # _failed.txt — лог проблемных, чтобы юзер видел в архиве кто упал
+            if failed:
+                failed_path = os.path.join(work_dir, "_failed.txt")
+                with open(failed_path, "w", encoding="utf-8") as fp:
+                    fp.write(f"# Bulk TData export — {len(failed)} ошибок из {len(accounts)}\n\n")
+                    for line in failed:
+                        fp.write(line + "\n")
+                zf.write(failed_path, "_failed.txt")
+
+            if successful:
+                summary_path = os.path.join(work_dir, "_summary.txt")
+                with open(summary_path, "w", encoding="utf-8") as fp:
+                    fp.write(f"# Bulk TData export — {len(successful)} успешно\n\n")
+                    for ph in successful:
+                        fp.write(ph + "\n")
+                zf.write(summary_path, "_summary.txt")
+
+        if not successful:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Ни один аккаунт не экспортирован. Ошибки: " + " | ".join(failed[:5]),
+            )
+
+        filename = f"tdata_bulk_{len(successful)}acc.zip"
+        return FileResponse(zip_path, filename=filename, media_type="application/zip")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        try: shutil.rmtree(work_dir, ignore_errors=True)
+        except Exception: pass
+        raise HTTPException(status_code=500, detail=f"Ошибка bulk-экспорта: {str(e)[:200]}")
+
+
+# ══════════════════════════════════════════════════════════════
 # IMPORT TDATA (одиночный ZIP)
 # ══════════════════════════════════════════════════════════════
 

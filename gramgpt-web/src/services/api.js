@@ -140,6 +140,12 @@ export const accountsAPI = {
   exportTData: (id) =>
     api.get(`/accounts/${id}/export-tdata`, { responseType: 'blob', timeout: 60000 }),
 
+  // Bulk: один ZIP для N аккаунтов сразу. На 100 акков ~3 мин, поэтому timeout 30 мин.
+  bulkExportTData: (accountIds) =>
+    api.post('/accounts/bulk/export-tdata', { account_ids: accountIds }, {
+      responseType: 'blob', timeout: 1800000,
+    }),
+
   importTData: (file, proxyId = null) => {
     const form = new FormData()
     form.append('file', file)

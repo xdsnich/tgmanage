@@ -67,6 +67,47 @@ export default function AccountsPage() {
     }
   }
 
+  const [bulkExporting, setBulkExporting] = useState(false)
+  const handleBulkExportTData = async () => {
+    if (!selectedIds.size) return
+    if (selectedIds.size > 500) {
+      alert(`Слишком много за раз: ${selectedIds.size}. Лимит 500 — разбей на пачки.`)
+      return
+    }
+    const estMin = Math.max(1, Math.round(selectedIds.size * 3 / 60))
+    if (!window.confirm(
+      `Экспортировать TData для ${selectedIds.size} аккаунтов в один ZIP?\n\n` +
+      `Это займёт примерно ${estMin} мин. Окно не закрывай — иначе загрузка прервётся.`
+    )) return
+    setBulkExporting(true)
+    try {
+      const { data } = await accountsAPI.bulkExportTData([...selectedIds])
+      // Скачиваем blob как файл
+      const url = window.URL.createObjectURL(new Blob([data], { type: 'application/zip' }))
+      const a = document.createElement('a')
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T-]/g, '').slice(2)
+      a.href = url
+      a.download = `tdata_bulk_${selectedIds.size}acc_${stamp}.zip`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      window.URL.revokeObjectURL(url)
+    } catch (err) {
+      // axios c responseType:'blob' заворачивает JSON-ошибку в Blob; распаковываем
+      let msg = 'Ошибка экспорта TData'
+      try {
+        if (err.response?.data instanceof Blob) {
+          const text = await err.response.data.text()
+          try { msg = JSON.parse(text).detail || text } catch { msg = text }
+        } else if (err.response?.data?.detail) {
+          msg = err.response.data.detail
+        }
+      } catch { /* ignore */ }
+      alert(msg)
+    }
+    setBulkExporting(false)
+  }
+
   const [filterStatus, setFilterStatus] = useState('all')
   const [filterGeo, setFilterGeo] = useState('all')
   const [filterCategory, setFilterCategory] = useState('all')
@@ -1134,6 +1175,11 @@ export default function AccountsPage() {
           </Button>
           <Button variant="ghost" size="sm" onClick={handleBulkClearMedia} title="Удалить все фото у выбранных">
             🗑 Очистить фото
+          </Button>
+          <Button variant="outline" size="sm" loading={bulkExporting}
+            onClick={handleBulkExportTData}
+            title="Экспортировать TData всех выбранных аккаунтов в один ZIP-архив">
+            📦 Экспорт TData
           </Button>
           <Button variant="ghost" size="sm" onClick={clearSelection}>Снять выбор</Button>
         </div>
