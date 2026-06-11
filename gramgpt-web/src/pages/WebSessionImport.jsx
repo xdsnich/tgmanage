@@ -156,6 +156,22 @@ export default function WebSessionImport({ onSuccess, onClose }) {
         </div>
 
         <div style={{
+          padding: '10px 12px', background: 'rgba(248,81,73,0.07)',
+          border: '1px solid rgba(248,81,73,0.25)', borderRadius: 10,
+          fontSize: 11, color: 'var(--text-2)', lineHeight: 1.6,
+        }}>
+          <div style={{ fontWeight: 700, marginBottom: 4, fontSize: 12, color: 'var(--red)' }}>🔥 ВАЖНО: один IP в Web и в импорте</div>
+          <div>
+            Telegram отзывает свежий <code>auth_key</code> если он используется с двух разных IP подряд (защита от угона).
+            <br />
+            <strong>Заходи в <code>web.telegram.org/k</code> через тот же прокси</strong>, который потом выберешь здесь —
+            например, в Dolphin Anty с прицепленным прокси, или в Chrome с расширением SwitchyOmega.
+            <br />
+            Если этого не сделать — получишь ошибку «сессия отвергнута», даже если auth_key только что скопирован.
+          </div>
+        </div>
+
+        <div style={{
           padding: '10px 14px', background: 'rgba(124,77,255,0.06)',
           border: '1px solid rgba(124,77,255,0.18)', borderRadius: 10,
           fontSize: 12, color: 'var(--text-2)', lineHeight: 1.6,

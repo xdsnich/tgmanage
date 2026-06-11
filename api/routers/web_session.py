@@ -548,13 +548,33 @@ async def import_web_session(
     )
 
     try:
+        print(f"🌐 connecting to dc={body.dc_id} via proxy={proxy_dict.get('addr') if proxy_dict else 'NONE'}:{proxy_dict.get('port') if proxy_dict else '-'}")
         await asyncio.wait_for(client.connect(), timeout=45)
+        print(f"🌐 connected, checking is_user_authorized()...")
 
         if not await client.is_user_authorized():
+            print(
+                f"🌐 ❌ is_user_authorized() = False. Auth key отвергнут Telegram'ом.\n"
+                f"   Самая частая причина: auth_key был получен в Web под одним IP "
+                f"(твой обычный браузер), а импорт идёт через ДРУГОЙ IP (этот прокси). "
+                f"Telegram расценивает это как попытку угона и отзывает сессию.\n"
+                f"   Решения:\n"
+                f"   1) Зайди на web.telegram.org/k через ТОТ ЖЕ прокси, "
+                f"что используешь здесь (Dolphin Anty / SwitchyOmega), скопируй localStorage заново.\n"
+                f"   2) ИЛИ импорт без прокси, если в web заходил без прокси.\n"
+                f"   3) ИЛИ возможно ты вышел из web (Settings → Devices → Terminate session)."
+            )
             await _cleanup_telethon(client, session_path)
             raise HTTPException(
                 status_code=400,
-                detail="Auth key не валиден или сессия истекла. Возможно нужно перелогиниться в Web."
+                detail=(
+                    "Сессия отвергнута Telegram'ом. Самая частая причина: auth_key "
+                    "был получен в web.telegram.org/k под одним IP, а импорт идёт через "
+                    "другой IP (этот прокси). Telegram расценивает это как угон и "
+                    "отзывает сессию. Решение: открой Web через ТОТ ЖЕ прокси что выбран здесь "
+                    "(например в Dolphin Anty или с SwitchyOmega в Chrome), скопируй localStorage "
+                    "заново и импортируй."
+                )
             )
 
         me = await client.get_me()
