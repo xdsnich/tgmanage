@@ -74,9 +74,13 @@ export default function AccountsPage() {
       alert(`Слишком много за раз: ${selectedIds.size}. Лимит 500 — разбей на пачки.`)
       return
     }
-    const estMin = Math.max(1, Math.round(selectedIds.size * 3 / 60))
+    // 5-10 сек пауза между акк + ~3 сек на сам ToTDesktop = ~10 сек на акк
+    const estMin = Math.max(1, Math.round(selectedIds.size * 10 / 60))
     if (!window.confirm(
       `Экспортировать TData для ${selectedIds.size} аккаунтов в один ZIP?\n\n` +
+      `Каждый экспорт коннектится к Telegram через прокси аккаунта — обязательно ` +
+      `чтобы у всех выбранных был прокси (иначе вернётся 400). Между акками ` +
+      `5-10 сек пауза — anti-flood защита.\n\n` +
       `Это займёт примерно ${estMin} мин. Окно не закрывай — иначе загрузка прервётся.`
     )) return
     setBulkExporting(true)

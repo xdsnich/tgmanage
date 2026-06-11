@@ -480,15 +480,38 @@ async def export_tdata(
     except ImportError:
         raise HTTPException(status_code=500, detail="opentele не установлен. pip install opentele")
 
+    # КРИТИЧНО: opentele.ToTDesktop коннектится к Telegram MTProto чтобы
+    # получить актуальные данные сессии. Без прокси этот коннект идёт с
+    # IP нашего сервера. Если IP сервера != IP под которым аккаунт залогинен,
+    # Telegram может расценить это как угон и убить сессию. Поэтому требуем
+    # прокси аккаунта и проксируем через него.
+    proxy_dict = None
+    if acc.proxy_id:
+        proxy_r = await db.execute(select(Proxy).where(Proxy.id == acc.proxy_id))
+        proxy_row = proxy_r.scalar_one_or_none()
+        if proxy_row:
+            from utils.telegram import _build_proxy
+            proxy_dict = _build_proxy(proxy_row)
+    if not proxy_dict:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "У аккаунта нет валидного прокси. Экспорт TData без прокси опасен — "
+                "Telegram может отозвать сессию увидев коннект с непривычного IP. "
+                "Назначь прокси аккаунту и попробуй снова."
+            ),
+        )
+
     tmp_dir = tempfile.mkdtemp(prefix="gramgpt_tdata_export_")
     tdata_dir = os.path.join(tmp_dir, "tdata")
     zip_path = os.path.join(tmp_dir, f"{acc.phone.replace('+', '')}_tdata.zip")
 
     try:
         session_path = acc.session_file.replace(".session", "")
-        print(f"📦 Экспорт TData: {acc.phone}, session={session_path}")
+        print(f"📦 Экспорт TData: {acc.phone}, session={session_path}, "
+              f"proxy={proxy_dict.get('addr')}:{proxy_dict.get('port')}")
 
-        client = OpenteleClient(session_path)
+        client = OpenteleClient(session_path, proxy=proxy_dict)
         tdesk = await client.ToTDesktop(flag=UseCurrentSession)
         tdesk.SaveTData(tdata_dir)
 
@@ -575,6 +598,40 @@ async def bulk_export_tdata(
             detail="opentele не установлен. pip install opentele",
         )
 
+    # КРИТИЧНО: каждый аккаунт должен иметь прокси.
+    # ToTDesktop конектится к Telegram MTProto. Без прокси все коннекты идут
+    # с IP нашего сервера — Telegram расценит N коннектов с одного IP за минуту
+    # как массовый угон и убьёт ВСЕ сессии. Поэтому:
+    # 1) Требуем прокси у каждого выбранного акка
+    # 2) Между аккаунтами 5-10 сек пауза (как живой пользователь)
+    # 3) Используем прокси каждого акка, не общий
+    from utils.telegram import _build_proxy
+    proxy_by_acc = {}
+    no_proxy_accs = []
+    for acc in accounts:
+        if not acc.proxy_id:
+            no_proxy_accs.append(acc.phone)
+            continue
+        pr = (await db.execute(select(Proxy).where(Proxy.id == acc.proxy_id))).scalar_one_or_none()
+        proxy_dict = _build_proxy(pr) if pr else None
+        if proxy_dict:
+            proxy_by_acc[acc.id] = proxy_dict
+        else:
+            no_proxy_accs.append(acc.phone)
+    if no_proxy_accs:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"У {len(no_proxy_accs)} акк. нет валидного прокси: "
+                f"{', '.join(no_proxy_accs[:5])}{'...' if len(no_proxy_accs) > 5 else ''}. "
+                f"Bulk-экспорт TData коннектится к Telegram через прокси аккаунта — "
+                f"без него Telegram отзовёт сессию. Назначь прокси на эти акки и попробуй снова."
+            ),
+        )
+
+    import asyncio
+    import random
+
     work_dir = tempfile.mkdtemp(prefix="gramgpt_bulk_tdata_")
     zip_path = os.path.join(
         work_dir, f"tdata_bulk_{_dt.utcnow().strftime('%Y%m%d_%H%M%S')}_{len(accounts)}acc.zip"
@@ -585,9 +642,16 @@ async def bulk_export_tdata(
 
     try:
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for acc in accounts:
+            for idx, acc in enumerate(accounts):
                 phone_clean = (acc.phone or f"acc{acc.id}").replace("+", "")
                 acc_label = f"{phone_clean}_tdata"
+
+                # Anti-flood: не дёргаем Telegram чаще чем раз в 5-10 сек.
+                # Каждый ToTDesktop = это коннект к MTProto с инициализацией
+                # сессии. Если делать без пауз — Telegram пометит как «бот»
+                # и может отозвать сессию через несколько коннектов.
+                if idx > 0:
+                    await asyncio.sleep(random.uniform(5.0, 10.0))
 
                 if not acc.session_file or not Path(acc.session_file).exists():
                     failed.append(f"{acc.phone}: нет файла сессии ({acc.session_file})")
@@ -598,8 +662,10 @@ async def bulk_export_tdata(
                 td_dir = os.path.join(acc_tmp, "tdata")
                 try:
                     session_path = acc.session_file.replace(".session", "")
-                    print(f"📦 [bulk_export] {acc.phone}: ToTDesktop ...")
-                    client = OpenteleClient(session_path)
+                    px = proxy_by_acc[acc.id]
+                    print(f"📦 [bulk_export] {acc.phone}: ToTDesktop via "
+                          f"{px.get('addr')}:{px.get('port')} ...")
+                    client = OpenteleClient(session_path, proxy=px)
                     tdesk = await client.ToTDesktop(flag=UseCurrentSession)
                     tdesk.SaveTData(td_dir)
 
