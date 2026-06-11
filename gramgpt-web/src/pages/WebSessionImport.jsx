@@ -195,7 +195,7 @@ export default function WebSessionImport({ onSuccess, onClose }) {
 
   // ═══════════════ PREVIEW & IMPORT STEP ═══════════════
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14, minWidth: 0 }}>
       <button onClick={() => { setStep('paste'); setPreviews([]); setAssignments({}) }} style={{
         background: 'none', border: 'none', color: 'var(--text-3)', cursor: 'pointer',
         fontSize: 12, padding: 0, textAlign: 'left',
@@ -217,11 +217,11 @@ export default function WebSessionImport({ onSuccess, onClose }) {
         <div style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase' }}>
           ⚡ Применить ко всем
         </div>
-        <div style={{ display: 'flex', gap: 8 }}>
+        <div style={{ display: 'flex', gap: 8, minWidth: 0 }}>
           <select
             value={bulkProxyId || ''}
             onChange={e => setBulkProxyId(e.target.value ? parseInt(e.target.value) : null)}
-            style={{ flex: 1, padding: '8px 10px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 12, outline: 'none' }}>
+            style={{ flex: '1 1 0', minWidth: 0, padding: '8px 10px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 12, outline: 'none', boxSizing: 'border-box' }}>
             <option value="">— прокси для всех —</option>
             {proxies.map(p => (
               <option key={p.id} value={p.id}>
@@ -232,7 +232,7 @@ export default function WebSessionImport({ onSuccess, onClose }) {
           <select
             value={bulkApiAppId || ''}
             onChange={e => setBulkApiAppId(e.target.value ? parseInt(e.target.value) : null)}
-            style={{ flex: 1, padding: '8px 10px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 12, outline: 'none' }}>
+            style={{ flex: '1 1 0', minWidth: 0, padding: '8px 10px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 12, outline: 'none', boxSizing: 'border-box' }}>
             <option value="">— api_id (по умолчанию Web K 2496) —</option>
             {apiApps.map(a => (
               <option key={a.id} value={a.id}>
@@ -265,15 +265,15 @@ export default function WebSessionImport({ onSuccess, onClose }) {
               border: `1px solid ${a.status === 'success' ? 'rgba(61,214,140,0.3)' : a.status === 'error' ? 'rgba(248,81,73,0.3)' : 'var(--border)'}`,
               borderRadius: 10,
             }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8, minWidth: 0 }}>
                 <span style={{ fontSize: 18 }}>{statusIcon}</span>
-                <div style={{ flex: 1 }}>
+                <div style={{ flex: '1 1 0', minWidth: 0 }}>
                   <div style={{ fontWeight: 600, fontSize: 13 }}>
                     {p.label} <Badge>DC {p.dc_id}</Badge>
                     {p.user_id && <span style={{ marginLeft: 8, color: 'var(--text-3)', fontSize: 11 }}>user_id: {p.user_id}</span>}
                   </div>
-                  <div style={{ fontSize: 10, color: 'var(--text-3)', fontFamily: 'var(--font-mono)', marginTop: 2 }}>
-                    fingerprint: {p.fingerprint || '—'} · auth_key: {p.auth_key.slice(0, 16)}...
+                  <div style={{ fontSize: 10, color: 'var(--text-3)', fontFamily: 'var(--font-mono)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    fingerprint: {p.fingerprint || '—'} · auth_key: {p.auth_key.slice(0, 16)}…
                   </div>
                 </div>
                 {a.status === 'success' && (
@@ -282,11 +282,11 @@ export default function WebSessionImport({ onSuccess, onClose }) {
               </div>
 
               {a.status !== 'success' && (
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: 6 }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr) auto', gap: 6 }}>
                   <select
                     value={a.proxyId || ''}
                     onChange={e => updateAssignment(p.label, { proxyId: e.target.value ? parseInt(e.target.value) : null })}
-                    style={{ padding: '7px 10px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text)', fontSize: 11, outline: 'none' }}>
+                    style={{ width: '100%', minWidth: 0, padding: '7px 10px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text)', fontSize: 11, outline: 'none', boxSizing: 'border-box' }}>
                     <option value="">— прокси —</option>
                     {proxies.map(pr => (
                       <option key={pr.id} value={pr.id}>{pr.host}:{pr.port}</option>
@@ -295,7 +295,7 @@ export default function WebSessionImport({ onSuccess, onClose }) {
                   <select
                     value={a.apiAppId || ''}
                     onChange={e => updateAssignment(p.label, { apiAppId: e.target.value ? parseInt(e.target.value) : null })}
-                    style={{ padding: '7px 10px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text)', fontSize: 11, outline: 'none' }}>
+                    style={{ width: '100%', minWidth: 0, padding: '7px 10px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text)', fontSize: 11, outline: 'none', boxSizing: 'border-box' }}>
                     <option value="">Web K (2496)</option>
                     {apiApps.map(ap => (
                       <option key={ap.id} value={ap.id}>{PLATFORM_ICONS[ap.platform]} {ap.title}</option>

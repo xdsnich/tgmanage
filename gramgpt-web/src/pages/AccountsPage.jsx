@@ -842,7 +842,7 @@ export default function AccountsPage() {
       </Modal>
 
       {/* Import modal */}
-      <Modal open={importModal} onClose={() => setImportModal(false)} title="Импорт аккаунтов" width={520}>
+      <Modal open={importModal} onClose={() => setImportModal(false)} title="Импорт аккаунтов" width={importType === 'web' ? 780 : 520}>
         {!importType ? (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
             <div style={{ padding: '12px 14px', background: 'rgba(124,77,255,0.06)', border: '1px solid rgba(124,77,255,0.15)', borderRadius: 10, fontSize: 12, color: 'var(--text-2)', lineHeight: 1.6 }}>
