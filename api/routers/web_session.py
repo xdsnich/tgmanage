@@ -198,12 +198,34 @@ async def parse_web_storage(
             accounts.append((key, val))
 
     if not accounts:
-        pattern = re.compile(r'account(\d+)\s*({[^}]*"dcId"[^}]*})', re.DOTALL)
-        for m in pattern.finditer(blob):
+        # Старый regex `({[^}]*"dcId"[^}]*})` ломался на больших account-блоках
+        # с avatarUri (десятки KB base64) и обычно ловил только последний акк
+        # из нескольких. Заменили на balanced-brace scan: находим каждый
+        # `account\d+` и читаем `{...}` с учётом баланса фигурных скобок.
+        def _extract_braces(text: str, start: int):
+            i = text.find("{", start)
+            if i < 0:
+                return None
+            depth = 0
+            for j in range(i, len(text)):
+                c = text[j]
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return text[i:j + 1]
+            return None  # JSON не завершён (обрезан)
+
+        for m in re.finditer(r'\baccount(\d+)\b', blob):
             label = f"account{m.group(1)}"
+            json_str = _extract_braces(blob, m.end())
+            if not json_str:
+                continue
             try:
-                val = json.loads(m.group(2))
-                accounts.append((label, val))
+                val = json.loads(json_str)
+                if isinstance(val, dict) and val.get("dcId"):
+                    accounts.append((label, val))
             except Exception:
                 continue
 
