@@ -548,7 +548,20 @@ async def import_web_session(
     )
 
     try:
-        print(f"🌐 connecting to dc={body.dc_id} via proxy={proxy_dict.get('addr') if proxy_dict else 'NONE'}:{proxy_dict.get('port') if proxy_dict else '-'}")
+        ak_clean = body.auth_key.strip().replace(" ", "")
+        ak_len = len(ak_clean)
+        print(
+            f"🌐 IMPORT request:\n"
+            f"   dc_id              = {body.dc_id}\n"
+            f"   auth_key length    = {ak_len} hex chars ({ak_len // 2} bytes; ожидаем 512 hex / 256 bytes)\n"
+            f"   auth_key first 16  = {ak_clean[:16]}\n"
+            f"   auth_key last 16   = {ak_clean[-16:]}\n"
+            f"   api_id             = {api_id_use}\n"
+            f"   platform           = {platform_use}\n"
+            f"   device             = {fp['device']} / {fp['system']} (app {fp['app_version']})\n"
+            f"   proxy              = {proxy_dict.get('addr') if proxy_dict else 'NONE'}:{proxy_dict.get('port') if proxy_dict else '-'} "
+            f"({proxy_dict.get('proxy_type') if proxy_dict else '-'})"
+        )
         await asyncio.wait_for(client.connect(), timeout=45)
         print(f"🌐 connected, checking is_user_authorized()...")
 
