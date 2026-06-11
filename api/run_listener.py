@@ -38,14 +38,14 @@ async def main():
     from models.campaign import Campaign, TargetChannel, CampaignStatus, CommentLog
     from models.account import TelegramAccount
     from models.proxy import Proxy
-    from utils.telegram import make_telethon_client, _build_proxy, get_cli_config
+    from utils.telegram import make_telethon_client, _build_proxy
     from services.channel_monitor import is_channel_public
     from telethon import events
 
     engine = create_async_engine(DATABASE_URL, pool_size=2, max_overflow=0)
     Session = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
-
-    cli_config = get_cli_config()
+    # cli_config больше не нужен — переменная не использовалась, а легаси-функция
+    # get_cli_config() удалена вместе с tg_manager1/config.py (теперь .legacy).
 
     # ── Собираем данные: какие закрытые каналы слушать ────────
     logger.info("Загружаю активные кампании...")

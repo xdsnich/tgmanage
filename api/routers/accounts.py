@@ -22,7 +22,32 @@ import os
 import time
 import uuid
 import hashlib
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
+
+
+def _get_cli_config_shim():
+    """Shim под старый легаси-API (tg_manager1/config.py, теперь .legacy).
+    Раньше в utils.telegram.get_cli_config() возвращал модуль с атрибутами
+    API_ID / API_HASH / SESSIONS_DIR. Теперь — env + Path до <repo>/sessions.
+    """
+    try:
+        api_id = int(os.getenv("TG_API_ID", "0"))
+    except (ValueError, TypeError):
+        api_id = 0
+    env_dir = os.getenv("TG_SESSIONS_DIR", "").strip()
+    if env_dir:
+        sd = Path(env_dir).expanduser().resolve()
+    else:
+        # api/routers/accounts.py → api/ → repo root → sessions/
+        sd = Path(__file__).resolve().parent.parent.parent / "sessions"
+    sd.mkdir(parents=True, exist_ok=True)
+    return SimpleNamespace(
+        API_ID=api_id,
+        API_HASH=(os.getenv("TG_API_HASH", "") or "").strip(),
+        SESSIONS_DIR=sd,
+    )
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
@@ -665,8 +690,10 @@ async def import_tdata(
     api_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     if api_dir not in sys.path:
         sys.path.insert(0, api_dir)
-    from utils.telegram import get_cli_config, _build_proxy, _get_device_for_platform
-    cli_config = get_cli_config()
+    # get_cli_config удалён вместе с легаси tg_manager1/config.py.
+    # Используем локальный shim — тот же интерфейс (API_ID/API_HASH/SESSIONS_DIR).
+    from utils.telegram import _build_proxy, _get_device_for_platform
+    cli_config = _get_cli_config_shim()
 
     # Загружаем api_app
     use_api_id, use_api_hash, use_platform, use_api_app_id = await _load_api_app_for_import(
@@ -1084,8 +1111,8 @@ async def import_tdata_batch(
     api_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     if api_dir not in sys.path:
         sys.path.insert(0, api_dir)
-    from utils.telegram import get_cli_config, _build_proxy
-    cli_config = get_cli_config()
+    from utils.telegram import _build_proxy
+    cli_config = _get_cli_config_shim()
 
     # Загружаем api_app для всего batch
     use_api_id, use_api_hash, use_platform, use_api_app_id = await _load_api_app_for_import(
