@@ -865,14 +865,11 @@ async def import_tdata(
         real_phone = f"+{me.phone}" if me.phone else ""
         print(f"📦 Авторизован: {me.first_name} ({real_phone})")
 
-        # Загружаем bio пока коннект жив
+        # Не дёргаем GetFullUserRequest для bio: каждый лишний API-вызов
+        # на свежей сессии повышает шанс «новый вход» push на других
+        # устройствах аккаунта → юзер случайно жмёт «это не я» → terminate
+        # всех сессий. bio подтянется при первой обычной работе акка.
         bio = ""
-        try:
-            from telethon.tl.functions.users import GetFullUserRequest
-            full = await client(GetFullUserRequest(me))
-            bio = full.full_user.about or ""
-        except Exception:
-            pass
 
         await client.disconnect()
 
@@ -1363,14 +1360,12 @@ async def import_tdata_batch(
                 results.append({"index": item.index, "success": False, "error": err})
                 continue
 
-            # Загружаем bio
+            # Раньше тут был GetFullUserRequest для копирования bio. Убрали:
+            # каждый лишний API-вызов на свежесозданной сессии повышает шанс
+            # что Telegram сочтёт логин подозрительным и пришлёт «новый вход»
+            # push на другие устройства аккаунта. bio не критичен, его юзер
+            # может подтянуть позже через «Обновить» на детали аккаунта.
             bio = ""
-            try:
-                from telethon.tl.functions.users import GetFullUserRequest
-                full = await client(GetFullUserRequest(me))
-                bio = full.full_user.about or ""
-            except Exception:
-                pass
 
             await client.disconnect()
 
