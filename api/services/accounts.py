@@ -23,11 +23,21 @@ logger = logging.getLogger(__name__)
 
 async def get_accounts(db: AsyncSession, user_id: int) -> list[TelegramAccount]:
     result = await db.execute(
-        select(TelegramAccount).options(joinedload(TelegramAccount.api_app))
+        select(TelegramAccount)
+        .options(joinedload(TelegramAccount.api_app), joinedload(TelegramAccount.proxy))
         .where(TelegramAccount.user_id == user_id)
         .order_by(TelegramAccount.added_at.desc())
     )
-    return result.scalars().all()
+    accounts = result.scalars().all()
+    # Прокидываем гео прокси в самые «плоские» поля, чтобы AccountOut
+    # подобрал их без property-плясок (Pydantic from_attributes так умеет)
+    for a in accounts:
+        p = a.proxy
+        a.proxy_country      = p.country if p else None
+        a.proxy_country_code = p.country_code if p else None
+        a.proxy_city         = p.city if p else None
+        a.proxy_host         = f"{p.host}:{p.port}" if p else None
+    return accounts
 
 
 async def get_account(db: AsyncSession, account_id: int, user_id: int) -> TelegramAccount:

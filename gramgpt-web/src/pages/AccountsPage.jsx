@@ -2,7 +2,7 @@ import { useEffect, useState, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { accountsAPI, importAPI, proxiesAPI, channelsAPI, diagnosticsAPI, apiAppsAPI, accountMediaAPI } from '../services/api'
 import WebSessionImport from './WebSessionImport'
-import { proxyLabel } from '../utils/proxy'
+import { proxyLabel, countryFlag } from '../utils/proxy'
 import { Card, Button, Input, Modal, TrustBar, StatusBadge, Empty, Spinner, Badge } from '../components/ui'
 
 const ROLES = ['default', 'продавец', 'прогреватель', 'читатель', 'консультант']
@@ -407,7 +407,26 @@ export default function AccountsPage() {
                   {acc.username && <div style={{ fontSize: 10, color: 'var(--text-3)' }}>@{acc.username}</div>}
                 </div>
               </div>
-              <div style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: 'var(--text-2)' }}>{acc.phone}</div>
+              <div>
+                <div style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: 'var(--text-2)' }}>{acc.phone}</div>
+                {/* Прокси под номером: флаг + страна/город или серый — */}
+                <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2, display: 'flex', alignItems: 'center', gap: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {!acc.proxy_id ? (
+                    <span style={{ color: 'var(--red)', opacity: 0.7 }}>⛔ без прокси</span>
+                  ) : acc.proxy_country_code || acc.proxy_country ? (
+                    <>
+                      <span>{countryFlag(acc.proxy_country_code) || '🌐'}</span>
+                      <span>
+                        {[acc.proxy_country, acc.proxy_city].filter(Boolean).join(', ') || acc.proxy_host || '?'}
+                      </span>
+                    </>
+                  ) : (
+                    <span title="Прокси без гео-данных — нажми «Проверить» на странице Прокси">
+                      🌐 {acc.proxy_host || `#${acc.proxy_id}`}
+                    </span>
+                  )}
+                </div>
+              </div>
               <div>{acc.geo ? <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 10, background: 'rgba(59,130,246,0.1)', color: 'rgba(59,130,246,0.8)', border: '1px solid rgba(59,130,246,0.2)' }}>{acc.geo}</span> : <span style={{ fontSize: 10, color: 'var(--text-3)' }}>—</span>}</div>
               <div>{acc.category ? <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 10, background: 'rgba(124,77,255,0.1)', color: 'rgba(124,77,255,0.8)', border: '1px solid rgba(124,77,255,0.2)' }}>{acc.category}</span> : <span style={{ fontSize: 10, color: 'var(--text-3)' }}>—</span>}</div>
               <StatusBadge status={acc.status} />

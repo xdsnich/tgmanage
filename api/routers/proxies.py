@@ -98,10 +98,30 @@ async def list_proxies(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    result = await db.execute(
+    from sqlalchemy import func
+    from models.account import TelegramAccount
+
+    proxies = (await db.execute(
         select(Proxy).where(Proxy.user_id == current_user.id)
-    )
-    return result.scalars().all()
+    )).scalars().all()
+
+    # Один SQL для всех счётчиков, чтобы не плодить N+1 запросов на 100+ прокси
+    counts_rows = (await db.execute(
+        select(TelegramAccount.proxy_id, func.count(TelegramAccount.id))
+        .where(
+            TelegramAccount.user_id == current_user.id,
+            TelegramAccount.proxy_id.in_([p.id for p in proxies]) if proxies else False,
+        )
+        .group_by(TelegramAccount.proxy_id)
+    )).all() if proxies else []
+    counts = {row[0]: row[1] for row in counts_rows}
+
+    out = []
+    for p in proxies:
+        po = ProxyOut.model_validate(p)
+        po.accounts_count = counts.get(p.id, 0)
+        out.append(po)
+    return out
 
 
 @router.post("/", response_model=ProxyOut, status_code=201)

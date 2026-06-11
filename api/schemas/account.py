@@ -46,6 +46,11 @@ class AccountOut(BaseModel):
     notes:           str
     channels:        list
     proxy_id:        Optional[int]
+    # Гео-информация привязанного прокси (заполняется в сервисе при загрузке)
+    proxy_country:      Optional[str] = None
+    proxy_country_code: Optional[str] = None
+    proxy_city:         Optional[str] = None
+    proxy_host:         Optional[str] = None
     geo:             str = ""
     category:        str = ""
     added_at:        datetime

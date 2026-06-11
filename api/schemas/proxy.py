@@ -37,6 +37,7 @@ class ProxyOut(BaseModel):
     city:         str = ""
     expires_at:   Optional[datetime] = None
     created_at:   datetime
+    accounts_count: int = 0   # сколько аккаунтов сейчас использует этот прокси
 
     model_config = {"from_attributes": True}
 

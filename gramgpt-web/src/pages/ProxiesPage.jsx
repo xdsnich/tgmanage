@@ -207,15 +207,15 @@ export default function ProxiesPage() {
           action={<Button variant="primary" onClick={() => setBulkModal(true)}>📋 Загрузить список</Button>} />
       ) : (
         <div style={{ background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 'var(--radius)', overflow: 'hidden' }}>
-          <div style={{ display: 'grid', gridTemplateColumns: '2fr 80px 1fr 130px 90px 90px 160px', padding: '10px 20px', borderBottom: '1px solid var(--border)', fontSize: 10, color: 'var(--text-3)', letterSpacing: '0.1em', fontWeight: 700, textTransform: 'uppercase' }}>
-            <span>Адрес</span><span>Протокол</span><span>Логин</span><span>Страна</span><span>Срок</span><span>Статус</span><span style={{ textAlign: 'right' }}>Действия</span>
+          <div style={{ display: 'grid', gridTemplateColumns: '2fr 80px 1fr 130px 70px 90px 90px 160px', padding: '10px 20px', borderBottom: '1px solid var(--border)', fontSize: 10, color: 'var(--text-3)', letterSpacing: '0.1em', fontWeight: 700, textTransform: 'uppercase' }}>
+            <span>Адрес</span><span>Протокол</span><span>Логин</span><span>Страна</span><span title="Аккаунтов на этом прокси">Акк-в</span><span>Срок</span><span>Статус</span><span style={{ textAlign: 'right' }}>Действия</span>
           </div>
           {proxies.map((p, i) => {
             const loc = p.city && p.country ? `${p.city}, ${p.country}` : p.country || '—'
             const exp = expiryInfo(p.expires_at)
             return (
               <div key={p.id} style={{
-                display: 'grid', gridTemplateColumns: '2fr 80px 1fr 130px 90px 90px 160px',
+                display: 'grid', gridTemplateColumns: '2fr 80px 1fr 130px 70px 90px 90px 160px',
                 padding: '13px 20px', alignItems: 'center',
                 borderBottom: i < proxies.length - 1 ? '1px solid var(--border)' : 'none',
                 transition: 'background 0.1s',
@@ -236,6 +236,11 @@ export default function ProxiesPage() {
                     </span>
                   )}
                   {loc !== '—' ? loc : <span style={{ color: 'var(--text-3)' }}>—</span>}
+                </div>
+
+                {/* Аккаунтов на прокси */}
+                <div style={{ fontSize: 13, fontWeight: 700, color: (p.accounts_count || 0) > 0 ? 'var(--violet)' : 'var(--text-3)', textAlign: 'center' }}>
+                  {p.accounts_count || 0}
                 </div>
 
                 {/* Срок действия */}
