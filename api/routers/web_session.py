@@ -93,8 +93,54 @@ def _get_sessions_dir() -> Path:
     return p
 
 
-def _create_telethon_session_file(session_path: Path, dc_id: int, auth_key_hex: str):
-    """Создаёт SQLite .session файл совместимый с Telethon из auth_key."""
+async def _cleanup_telethon(client, session_path: Path):
+    """
+    Закрывает Telethon-клиент И SQLite-сессию, потом удаляет .session файл.
+
+    На Windows это критично: голый `client.disconnect()` останавливает сеть,
+    но НЕ закрывает SQLite-handle (Telethon держит его в client.session).
+    Из-за этого `session_path.unlink()` падает с WinError 32 на следующий
+    запрос — файл всё ещё «занят процессом».
+
+    Порядок:
+      1. await client.disconnect()    — останавливаем сеть
+      2. client.session.close()       — закрываем SQLite handle (если есть)
+      3. session_path.unlink()        — удаляем файл (теперь можно)
+
+    Все исключения подавляются — функция используется в except-блоках.
+    """
+    try:
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            sess = getattr(client, "session", None)
+            if sess is not None:
+                try:
+                    close = getattr(sess, "close", None)
+                    if close:
+                        # SQLite.close() — синхронный; некоторые версии async
+                        res = close()
+                        if hasattr(res, "__await__"):
+                            await res
+                except Exception:
+                    pass
+    finally:
+        try:
+            session_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _create_telethon_session_file(session_path: Path, dc_id: int, auth_key_hex: str) -> Path:
+    """Создаёт SQLite .session файл совместимый с Telethon из auth_key.
+
+    Возвращает фактический путь к созданному файлу (может отличаться от
+    переданного если старый файл был залочен — тогда используется суффикс).
+    """
+    import time
+
     auth_key_bytes = bytes.fromhex(auth_key_hex.strip().replace(" ", ""))
     if len(auth_key_bytes) != 256:
         raise ValueError(f"auth_key должен быть 256 байт, получено {len(auth_key_bytes)}")
@@ -104,9 +150,32 @@ def _create_telethon_session_file(session_path: Path, dc_id: int, auth_key_hex: 
 
     server_address, port = DC_IPS[dc_id]
 
-    if session_path.exists():
-        session_path.unlink()
     session_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Пытаемся удалить старый файл, если он есть. На Windows предыдущий
+    # упавший Telethon-клиент мог не успеть отдать handle SQLite → unlink
+    # бросает WinError 32. В этом случае:
+    #   1) подождём 0.5с × 3 попытки (вдруг handle вот-вот освободится)
+    #   2) если всё ещё залочен — генерируем имя с суффиксом времени,
+    #      чтобы новый импорт прошёл без вмешательства пользователя
+    if session_path.exists():
+        for attempt in range(3):
+            try:
+                session_path.unlink()
+                break
+            except PermissionError:
+                time.sleep(0.5)
+        else:
+            # Файл всё ещё залочен — берём альтернативное имя
+            alt = session_path.with_name(
+                f"{session_path.stem}_{int(time.time())}{session_path.suffix}"
+            )
+            logger = __import__("logging").getLogger(__name__)
+            logger.warning(
+                f"[web_session] {session_path.name} залочен другим процессом, "
+                f"использую {alt.name}"
+            )
+            session_path = alt
 
     conn = sqlite3.connect(str(session_path))
     cur = conn.cursor()
@@ -445,7 +514,7 @@ async def import_web_session(
     session_path = Path(sessions_dir) / f"{tmp_phone}.session"
 
     try:
-        _create_telethon_session_file(session_path, body.dc_id, body.auth_key)
+        session_path = _create_telethon_session_file(session_path, body.dc_id, body.auth_key)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Ошибка формирования сессии: {e}")
 
@@ -482,16 +551,25 @@ async def import_web_session(
         await asyncio.wait_for(client.connect(), timeout=45)
 
         if not await client.is_user_authorized():
-            await client.disconnect()
-            try: session_path.unlink(missing_ok=True)
-            except: pass
+            await _cleanup_telethon(client, session_path)
             raise HTTPException(
                 status_code=400,
                 detail="Auth key не валиден или сессия истекла. Возможно нужно перелогиниться в Web."
             )
 
         me = await client.get_me()
-        await client.disconnect()
+        # Закрываем сеть + SQLite ДО переименования файла, иначе rename упадёт на Windows
+        try:
+            await client.disconnect()
+            sess = getattr(client, "session", None)
+            if sess is not None:
+                close = getattr(sess, "close", None)
+                if close:
+                    res = close()
+                    if hasattr(res, "__await__"):
+                        await res
+        except Exception:
+            pass
 
         if not me.phone:
             try: session_path.unlink(missing_ok=True)
@@ -573,16 +651,22 @@ async def import_web_session(
     except HTTPException:
         raise
     except asyncio.TimeoutError:
-        try: await client.disconnect()
-        except: pass
-        try: session_path.unlink(missing_ok=True)
-        except: pass
-        raise HTTPException(status_code=504, detail="Таймаут — проверь прокси")
+        await _cleanup_telethon(client, session_path)
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                "Таймаут подключения через прокси. Скорее всего прокси не отвечает или "
+                "блокирует Telegram DC. Проверь его на странице «Прокси» (🔍 Проверить) "
+                "или выбери другой прокси."
+            ),
+        )
     except Exception as e:
-        try: await client.disconnect()
-        except: pass
-        try: session_path.unlink(missing_ok=True)
-        except: pass
+        await _cleanup_telethon(client, session_path)
         err = str(e)
         print(f"🌐 ❌ Web import error: {type(e).__name__}: {err}")
+        if "Proxy" in err or "proxy" in err or "timed out" in err.lower():
+            raise HTTPException(
+                status_code=502,
+                detail=f"Прокси не пропускает к Telegram: {err[:200]}",
+            )
         raise HTTPException(status_code=500, detail=f"Ошибка: {err[:200]}")
