@@ -3,6 +3,50 @@ import { proxiesAPI } from '../services/api'
 import { Button, Modal, Input, Empty, Spinner, Badge } from '../components/ui'
 import { useAutoRefresh } from '../hooks/useAutoRefresh'
 
+/**
+ * Парсит одну строку прокси в {host, port, login, password, protocol}.
+ * Поддерживает форматы:
+ *   - host:port
+ *   - host:port:user:pass
+ *   - host:port:user:pass:protocol
+ *   - protocol://user:pass@host:port
+ *   - protocol://host:port
+ * Возвращает null если строка не похожа на прокси (не вмешиваемся в форму).
+ */
+function parseProxyLine(raw) {
+  const s = (raw || '').trim()
+  if (!s) return null
+
+  // URL-формат: socks5://user:pass@host:port  или  http://host:port
+  const urlMatch = s.match(/^(socks5|socks4|http|https):\/\/(?:([^:@\s]+):([^@\s]+)@)?([^:\s]+):(\d+)\/?$/i)
+  if (urlMatch) {
+    const [, proto, login, password, host, port] = urlMatch
+    return {
+      host, port,
+      login: login || '',
+      password: password || '',
+      protocol: proto.toLowerCase() === 'socks4' ? 'socks5' : proto.toLowerCase(),
+    }
+  }
+
+  // Colon-формат: host:port[:user[:pass[:protocol]]]
+  const parts = s.split(':').map(p => p.trim()).filter(Boolean)
+  if (parts.length < 2) return null
+  if (!/^\d+$/.test(parts[1])) return null   // вторая часть должна быть портом
+
+  const [host, port, login = '', password = '', maybeProto = ''] = parts
+  const proto = ['socks5', 'http', 'https', 'socks4'].includes(maybeProto.toLowerCase())
+    ? (maybeProto.toLowerCase() === 'socks4' ? 'socks5' : maybeProto.toLowerCase())
+    : null
+
+  return {
+    host, port,
+    login, password,
+    ...(proto ? { protocol: proto } : {}),
+  }
+}
+
+
 function expiryInfo(expires_at) {
   if (!expires_at) return { label: '∞', color: 'var(--text-3)', warn: false, expired: false }
   const now = new Date()
@@ -235,6 +279,39 @@ export default function ProxiesPage() {
       {/* ── Add Modal ── */}
       <Modal open={addModal} onClose={() => setAddModal(false)} title="Добавить прокси">
         <form onSubmit={handleAdd} style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          {/* ── Быстрая вставка одной строкой ── */}
+          <div>
+            <label style={{ fontSize: 11, color: 'var(--violet)', fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>
+              🔥 Быстрая вставка (одной строкой)
+            </label>
+            <input
+              type="text"
+              placeholder="130.49.48.99:62744:d9VMTTsk:DzQSjAhD  или  socks5://user:pass@1.2.3.4:1080"
+              onChange={e => {
+                const parsed = parseProxyLine(e.target.value)
+                if (parsed) setForm(prev => ({ ...prev, ...parsed }))
+              }}
+              style={{
+                width: '100%', padding: '10px 14px',
+                background: 'rgba(124,77,255,0.08)',
+                border: '1px solid rgba(124,77,255,0.35)',
+                borderRadius: 'var(--radius-sm)', color: 'var(--text)',
+                fontSize: 13, outline: 'none',
+                fontFamily: 'var(--font-mono)',
+                boxSizing: 'border-box',
+              }}
+            />
+            <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4 }}>
+              Поддерживается <code>host:port:user:pass</code>, <code>host:port:user:pass:protocol</code>, <code>host:port</code>, <code>socks5://user:pass@host:port</code>. Поля ниже заполнятся автоматически.
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: 'var(--text-3)', fontSize: 10, letterSpacing: '0.1em' }}>
+            <div style={{ flex: 1, height: 1, background: 'var(--border)' }} />
+            ИЛИ ЗАПОЛНИТЕ ВРУЧНУЮ
+            <div style={{ flex: 1, height: 1, background: 'var(--border)' }} />
+          </div>
+
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 100px', gap: 10 }}>
             <Input label="Host" value={form.host} onChange={e => setForm(d => ({ ...d, host: e.target.value }))} placeholder="1.2.3.4" required />
             <Input label="Port" value={form.port} onChange={e => setForm(d => ({ ...d, port: e.target.value }))} placeholder="1080" type="number" required />
