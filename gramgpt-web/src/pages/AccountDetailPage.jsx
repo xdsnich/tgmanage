@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { accountsAPI, securityAPI, channelsAPI, actionsAPI, tgAuthAPI, proxiesAPI, apiAppsAPI, accountMediaAPI } from '../services/api'
+import { proxyLabel } from '../utils/proxy'
 import { Card, Button, Input, Modal, TrustBar, StatusBadge, Badge, Spinner, Empty } from '../components/ui'
 
 const ROLES = ['default', 'продавец', 'прогреватель', 'читатель', 'консультант']
@@ -930,7 +931,7 @@ export default function AccountDetailPage() {
                 <select value={authProxyId || ''} onChange={e => setAuthProxyId(e.target.value ? parseInt(e.target.value) : null)} style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 13, outline: 'none' }}>
                   <option value="">Без прокси (прямое подключение)</option>
                   {proxies.filter(p => p.is_valid !== false).map(p => (
-                    <option key={p.id} value={p.id}>{p.host}:{p.port} [{p.protocol}] {p.is_valid ? '✓' : '?'}</option>
+                    <option key={p.id} value={p.id}>{proxyLabel(p)}</option>
                   ))}
                 </select>
                 <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 4 }}>Авторизация и все действия аккаунта будут через этот прокси</div>
@@ -999,9 +1000,7 @@ export default function AccountDetailPage() {
             <select value={selectedProxyId || ''} onChange={e => setSelectedProxyId(e.target.value ? parseInt(e.target.value) : null)} style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 14, outline: 'none' }}>
               <option value="">❌ Без прокси (прямое подключение)</option>
               {proxies.map(p => (
-                <option key={p.id} value={p.id}>
-                  {p.host}:{p.port} ({p.protocol}) {p.is_valid === true ? '✅' : p.is_valid === false ? '❌' : '❓'}
-                </option>
+                <option key={p.id} value={p.id}>{proxyLabel(p)}</option>
               ))}
             </select>
           </div>

@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { proxiesAPI, apiAppsAPI } from '../services/api'
 import { Button, Spinner, Badge } from '../components/ui'
 import api from '../services/api'
+import { proxyLabel } from '../utils/proxy'
 
 const PLATFORM_ICONS = { android: '📱', ios: '🍎', desktop: '🖥', macos: '💻' }
 
@@ -224,9 +225,7 @@ export default function WebSessionImport({ onSuccess, onClose }) {
             style={{ flex: '1 1 0', minWidth: 0, padding: '8px 10px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 12, outline: 'none', boxSizing: 'border-box' }}>
             <option value="">— прокси для всех —</option>
             {proxies.map(p => (
-              <option key={p.id} value={p.id}>
-                {p.host}:{p.port} ({p.protocol}) {p.is_valid === true ? '✅' : ''}
-              </option>
+              <option key={p.id} value={p.id}>{proxyLabel(p)}</option>
             ))}
           </select>
           <select
@@ -289,7 +288,7 @@ export default function WebSessionImport({ onSuccess, onClose }) {
                     style={{ width: '100%', minWidth: 0, padding: '7px 10px', background: 'var(--bg-2)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text)', fontSize: 11, outline: 'none', boxSizing: 'border-box' }}>
                     <option value="">— прокси —</option>
                     {proxies.map(pr => (
-                      <option key={pr.id} value={pr.id}>{pr.host}:{pr.port}</option>
+                      <option key={pr.id} value={pr.id}>{proxyLabel(pr, { showValid: false })}</option>
                     ))}
                   </select>
                   <select

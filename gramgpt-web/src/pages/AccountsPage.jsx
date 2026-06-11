@@ -2,6 +2,7 @@ import { useEffect, useState, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { accountsAPI, importAPI, proxiesAPI, channelsAPI, diagnosticsAPI, apiAppsAPI, accountMediaAPI } from '../services/api'
 import WebSessionImport from './WebSessionImport'
+import { proxyLabel } from '../utils/proxy'
 import { Card, Button, Input, Modal, TrustBar, StatusBadge, Empty, Spinner, Badge } from '../components/ui'
 
 const ROLES = ['default', 'продавец', 'прогреватель', 'читатель', 'консультант']
@@ -483,9 +484,7 @@ export default function AccountsPage() {
               style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', color: 'var(--text)', fontSize: 14, outline: 'none' }}>
               <option value="">Без прокси (назначу позже)</option>
               {addProxies.filter(p => p.is_valid !== false).map(p => (
-                <option key={p.id} value={p.id}>
-                  {p.host}:{p.port} [{p.protocol}]{p.country ? ` · ${p.country}` : ''}{p.is_valid ? ' ✓' : ''}
-                </option>
+                <option key={p.id} value={p.id}>{proxyLabel(p)}</option>
               ))}
             </select>
             <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4 }}>
@@ -966,7 +965,7 @@ export default function AccountsPage() {
                   onFocus={async () => { if (!importProxies.length) { try { const { data } = await proxiesAPI.list(); setImportProxies(data) } catch { } } }}
                   style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 14, outline: 'none' }}>
                   <option value="">Без прокси</option>
-                  {importProxies.map(p => <option key={p.id} value={p.id}>{p.host}:{p.port} ({p.protocol})</option>)}
+                  {importProxies.map(p => <option key={p.id} value={p.id}>{proxyLabel(p, { showValid: false })}</option>)}
                 </select>
               </div>
             )}
@@ -1058,7 +1057,7 @@ export default function AccountsPage() {
                 onFocus={async () => { if (!importProxies.length) { try { const { data } = await proxiesAPI.list(); setImportProxies(data) } catch { } } }}
                 style={{ flex: 1, padding: '8px 12px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 12, outline: 'none' }}>
                 <option value="">Выбрать из существующих прокси</option>
-                {importProxies.map(p => <option key={p.id} value={`${p.host}:${p.port}:${p.login || ''}:${p.password || ''}`}>{p.host}:{p.port} ({p.protocol})</option>)}
+                {importProxies.map(p => <option key={p.id} value={`${p.host}:${p.port}:${p.login || ''}:${p.password || ''}`}>{proxyLabel(p, { showValid: false })}</option>)}
               </select>
               <Button variant="outline" size="sm" onClick={() => {
                 const v = document.getElementById('bulk-proxy-select')?.value || ''
