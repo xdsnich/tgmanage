@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { accountsAPI, importAPI, proxiesAPI, channelsAPI, diagnosticsAPI, apiAppsAPI, accountMediaAPI } from '../services/api'
+import WebSessionImport from './WebSessionImport'
 import { Card, Button, Input, Modal, TrustBar, StatusBadge, Empty, Spinner, Badge } from '../components/ui'
 
 const ROLES = ['default', 'продавец', 'прогреватель', 'читатель', 'консультант']
@@ -851,6 +852,7 @@ export default function AccountsPage() {
               { type: 'session', icon: '📄', title: '.session файл', desc: 'Один файл Telethon/Pyrogram сессии' },
               { type: 'session-batch', icon: '📁', title: 'Пакет .session', desc: 'Несколько .session файлов сразу' },
               { type: 'tdata', icon: '📦', title: 'TData архив (ZIP)', desc: 'Архив папки Telegram Desktop' },
+              { type: 'web', icon: '🌐', title: 'Telegram Web (localStorage)', desc: 'Скопированная строка из DevTools (web.telegram.org/k)' },
               { type: 'json', icon: '📥', title: 'Из JSON (CLI)', desc: 'Импорт из data/accounts.json' },
             ].map(({ type, icon, title, desc }) => (
               <div key={type} onClick={() => {
@@ -871,6 +873,34 @@ export default function AccountsPage() {
               </div>
             ))}
           </div>
+        ) : importType === 'web' ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            <button onClick={() => setImportType(null)} style={{
+              background: 'none', border: 'none', color: 'var(--text-3)', cursor: 'pointer',
+              fontSize: 12, padding: 0, textAlign: 'left',
+            }}>← Назад к выбору</button>
+
+            <div style={{ padding: '12px 14px', background: 'rgba(124,77,255,0.08)', border: '1px solid rgba(124,77,255,0.2)', borderRadius: 10, fontSize: 12, color: 'var(--text-2)', lineHeight: 1.7 }}>
+              <div style={{ fontWeight: 700, marginBottom: 6, fontSize: 13 }}>📍 Где найти строку в DevTools</div>
+              <ol style={{ margin: '0 0 0 18px', padding: 0 }}>
+                <li>Открой <code style={{ background: 'var(--bg-3)', padding: '1px 5px', borderRadius: 4 }}>web.telegram.org/k</code> и залогинься в Telegram</li>
+                <li>Нажми <b>F12</b> (или Ctrl+Shift+I) — откроется DevTools</li>
+                <li>Вкладка <b>Application</b> (Chrome/Edge) или <b>Storage</b> (Firefox)</li>
+                <li>Слева: <b>Local Storage</b> → <code style={{ background: 'var(--bg-3)', padding: '1px 5px', borderRadius: 4 }}>https://web.telegram.org</code></li>
+                <li>Найди ключи вида <code style={{ background: 'var(--bg-3)', padding: '1px 5px', borderRadius: 4 }}>account1</code>, <code style={{ background: 'var(--bg-3)', padding: '1px 5px', borderRadius: 4 }}>account2</code>... и значение из колонки <b>Value</b></li>
+                <li>Скопируй <b>весь блок</b> либо несколько <code>accountN</code> вместе (JSON) и вставь ниже</li>
+              </ol>
+              <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-3)' }}>
+                Можно вставить либо одну запись (<code>{`{"dcId":2,"dc2_auth_key":"..."}`}</code>), либо весь localStorage целиком —
+                парсер найдёт все аккаунты автоматически.
+              </div>
+            </div>
+
+            <WebSessionImport
+              onSuccess={async () => { await load(); setImportModal(false); setImportType(null) }}
+              onClose={() => { setImportType(null) }}
+            />
+          </div>
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
             <button onClick={() => { setImportType(null); setImportResult(null); setImportFiles([]) }} style={{
@@ -879,7 +909,7 @@ export default function AccountsPage() {
             }}>← Назад к выбору</button>
 
             {importType === 'tdata' && (
-              <div style={{ padding: '10px 14px', background: 'rgba(124,77,255,0.06)', border: '1px solid rgba(124,77,255,0.15)', borderRadius: 10, fontSize: 12, color: 'var(--text-2)', lineHeight: 1.6 }}>
+              <div style={{ padding: '10px 14px', background: 'rgba(124,77,255,0.06)', border: '1px solid rgba(124,77,255,0.15)', borderRadius: 10, fontSize: 12, color: 'var(--text-2)', lineHeight: 1.7 }}>
                 Загрузите ZIP архив содержащий папку TData из Telegram Desktop.<br />
                 Поддерживаются: opentele, telethon-tdata.
               </div>
