@@ -19,15 +19,26 @@ export function countryFlag(code) {
 
 /**
  * Подпись для прокси в селекторе:
- *   🇺🇸 US · 1.2.3.4:1080 (socks5) ✅
- * Если страны нет — флаг и код опускаются, остаётся как было.
+ *   🇺🇸 US · 1.2.3.4:1080 (socks5) ✅ · 👤 5
+ *   ── флаг + код страны (если есть)
+ *   ── host:port (protocol)
+ *   ── ✅ / ❌ если showValid (по умолчанию)
+ *   ── 👤 N — сколько аккаунтов уже сидит на этом прокси
+ *
+ * Опции:
+ *   showValid: показывать ли ✅/❌ значок (default true)
+ *   showCount: показывать ли счётчик 👤 (default true; нужен accounts_count в объекте прокси)
  */
-export function proxyLabel(p, { showValid = true } = {}) {
+export function proxyLabel(p, { showValid = true, showCount = true } = {}) {
   if (!p) return ''
   const flag = countryFlag(p.country_code)
   const head = flag ? `${flag} ${p.country_code.toUpperCase()} · ` : ''
   const validMark = showValid
     ? (p.is_valid === true ? ' ✅' : p.is_valid === false ? ' ❌' : '')
     : ''
-  return `${head}${p.host}:${p.port} (${p.protocol})${validMark}`
+  // 👤 N — даже если N = 0, юзеру полезно видеть «никто ещё не использует»
+  const countMark = showCount && typeof p.accounts_count === 'number'
+    ? ` · 👤 ${p.accounts_count}`
+    : ''
+  return `${head}${p.host}:${p.port} (${p.protocol})${validMark}${countMark}`
 }
