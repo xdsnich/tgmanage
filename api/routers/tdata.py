@@ -29,21 +29,42 @@ router = APIRouter(prefix="/import", tags=["import"])
 
 # ── Helpers ──────────────────────────────────────────────────
 
+class _CliConfigShim:
+    """
+    Shim для совместимости со старым кодом который ждал объект с
+    атрибутами API_ID / API_HASH / SESSIONS_DIR. Раньше это был
+    легаси tg_manager1/config.py (теперь .legacy). Теперь — env + Path.
+    """
+    @property
+    def API_ID(self):
+        try:
+            return int(os.getenv("TG_API_ID", "0"))
+        except (ValueError, TypeError):
+            return 0
+
+    @property
+    def API_HASH(self):
+        return (os.getenv("TG_API_HASH", "") or "").strip()
+
+    @property
+    def SESSIONS_DIR(self):
+        env_dir = os.getenv("TG_SESSIONS_DIR", "").strip()
+        if env_dir:
+            p = Path(env_dir).expanduser().resolve()
+        else:
+            p = Path(__file__).resolve().parent.parent.parent / "sessions"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+
 def _get_cli_config():
-    """Загружает корневой config.py с API_ID/API_HASH"""
-    import importlib.util
-    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-    config_path = os.path.join(root_dir, "config.py")
-    spec = importlib.util.spec_from_file_location("cli_config", config_path)
-    cli_config = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(cli_config)
-    return cli_config
+    """Совместимость со старым API — env-shim вместо легаси config.py."""
+    return _CliConfigShim()
 
 
-def _get_sessions_dir():
-    """Путь к папке sessions"""
-    cli_config = _get_cli_config()
-    return cli_config.SESSIONS_DIR
+def _get_sessions_dir() -> Path:
+    """Путь к папке sessions (env TG_SESSIONS_DIR или <repo>/sessions)."""
+    return _CliConfigShim().SESSIONS_DIR
 
 
 # ── Session file import ──────────────────────────────────────

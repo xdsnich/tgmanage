@@ -45,16 +45,19 @@ def run_async(coro):
 
 
 def _get_cli_config():
-    """Безопасно импортирует корневой config.py (с API_ID/API_HASH)"""
-    import importlib.util
-
+    """Shim под старый API: легаси config.py заменён на env-переменные."""
+    from types import SimpleNamespace
     root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-    config_path = os.path.join(root_dir, "config.py")
-
-    spec = importlib.util.spec_from_file_location("cli_config", config_path)
-    cli_config = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(cli_config)
-    return cli_config
+    try:
+        api_id = int(os.getenv("TG_API_ID", "0"))
+    except (ValueError, TypeError):
+        api_id = 0
+    sessions_dir = os.getenv("TG_SESSIONS_DIR", "").strip() or os.path.join(root_dir, "sessions")
+    return SimpleNamespace(
+        API_ID=api_id,
+        API_HASH=(os.getenv("TG_API_HASH", "") or "").strip(),
+        SESSIONS_DIR=sessions_dir,
+    )
 
 
 # ── Rate Limiter (защита от 429) ─────────────────────────────

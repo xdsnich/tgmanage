@@ -101,15 +101,14 @@ async def get_api_credentials(db: AsyncSession, account: TelegramAccount) -> tup
         if app and app.is_active:
             return app.api_id, app.api_hash
 
-    # Fallback — глобальные ключи
-    import importlib.util
+    # Fallback — глобальные ключи из env (раньше брались из tg_manager1/config.py).
     import os
-    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-    config_path = os.path.join(root_dir, "config.py")
-    spec = importlib.util.spec_from_file_location("cli_config", config_path)
-    cli_config = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(cli_config)
-    return cli_config.API_ID, cli_config.API_HASH
+    try:
+        api_id = int(os.getenv("TG_API_ID", "0"))
+    except (ValueError, TypeError):
+        api_id = 0
+    api_hash = (os.getenv("TG_API_HASH", "") or "").strip()
+    return api_id, api_hash
 
 
 async def check_can_delete(db: AsyncSession, app_id: int, user_id: int) -> dict:

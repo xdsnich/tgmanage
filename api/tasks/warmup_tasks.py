@@ -37,11 +37,18 @@ def run_async(coro):
 
 
 def _get_cli_config():
-    config_path = os.path.join(ROOT_DIR, "config.py")
-    spec = importlib.util.spec_from_file_location("cli_config", config_path)
-    cli_config = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(cli_config)
-    return cli_config
+    """Shim под старый API: легаси config.py заменён на env-переменные."""
+    from types import SimpleNamespace
+    try:
+        api_id = int(os.getenv("TG_API_ID", "0"))
+    except (ValueError, TypeError):
+        api_id = 0
+    sessions_dir = os.getenv("TG_SESSIONS_DIR", "").strip() or os.path.join(ROOT_DIR, "sessions")
+    return SimpleNamespace(
+        API_ID=api_id,
+        API_HASH=(os.getenv("TG_API_HASH", "") or "").strip(),
+        SESSIONS_DIR=sessions_dir,
+    )
 
 
 REACTIONS = ["👍", "❤️", "🔥", "👏", "😂", "😮", "😢", "🎉", "🤔", "👎"]

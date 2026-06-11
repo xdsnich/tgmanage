@@ -75,14 +75,22 @@ def _safe_set_attr(obj, name: str, value):
 
 # ── Helpers ──────────────────────────────────────────────────
 
-def _get_sessions_dir():
-    import importlib.util
-    root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-    config_path = os.path.join(root_dir, "config.py")
-    spec = importlib.util.spec_from_file_location("cli_config", config_path)
-    cli_config = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(cli_config)
-    return cli_config.SESSIONS_DIR
+def _get_sessions_dir() -> Path:
+    """Папка для .session файлов = <repo>/sessions.
+
+    Раньше брали путь через импорт легаси tg_manager1/config.py,
+    но этот файл переименован в config.py.legacy. Теперь — просто
+    относительный путь от текущего файла, как и в tg_auth.py.
+    Опционально перебивается env-переменной TG_SESSIONS_DIR.
+    """
+    env_dir = os.getenv("TG_SESSIONS_DIR", "").strip()
+    if env_dir:
+        p = Path(env_dir).expanduser().resolve()
+    else:
+        # api/routers/web_session.py → api/ → repo root → sessions/
+        p = Path(__file__).resolve().parent.parent.parent / "sessions"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
 def _create_telethon_session_file(session_path: Path, dc_id: int, auth_key_hex: str):
