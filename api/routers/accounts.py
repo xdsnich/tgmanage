@@ -508,10 +508,30 @@ async def export_tdata(
 
     try:
         session_path = acc.session_file.replace(".session", "")
-        print(f"📦 Экспорт TData: {acc.phone}, session={session_path}, "
-              f"proxy={proxy_dict.get('addr')}:{proxy_dict.get('port')}")
+        # КРИТИЧНО: подставляем тот же device_fingerprint что был при последнем
+        # логине. Без него Telethon шлёт дефолтные device_model="AMD64" /
+        # system_version=OS-release, которые гарантированно не совпадают с
+        # сохранённым профилем. Telegram видит «новый вход с непривычного
+        # устройства» → push на других девайсах → шанс что юзер случайно
+        # нажмёт «Это не я» → revoke всех сессий.
+        fp_parts = (acc.device_fingerprint or "").split("|") if acc.device_fingerprint else []
+        device_model = fp_parts[0] if len(fp_parts) >= 1 and fp_parts[0] else "Samsung Galaxy S24"
+        system_version = fp_parts[1] if len(fp_parts) >= 2 and fp_parts[1] else "Android 14"
+        app_version = fp_parts[2] if len(fp_parts) >= 3 and fp_parts[2] else "10.12.0"
+        lang_code = fp_parts[3] if len(fp_parts) >= 4 and fp_parts[3] else "en"
+        system_lang_code = fp_parts[4] if len(fp_parts) >= 5 and fp_parts[4] else "en"
 
-        client = OpenteleClient(session_path, proxy=proxy_dict)
+        print(f"📦 Экспорт TData: {acc.phone}, session={session_path}, "
+              f"proxy={proxy_dict.get('addr')}:{proxy_dict.get('port')}, "
+              f"device={device_model}/{system_version}")
+
+        client = OpenteleClient(
+            session_path, proxy=proxy_dict,
+            device_model=device_model, system_version=system_version,
+            app_version=app_version,
+            lang_code=lang_code, system_lang_code=system_lang_code,
+            timeout=30,
+        )
         tdesk = await client.ToTDesktop(flag=UseCurrentSession)
         tdesk.SaveTData(tdata_dir)
 
@@ -663,9 +683,23 @@ async def bulk_export_tdata(
                 try:
                     session_path = acc.session_file.replace(".session", "")
                     px = proxy_by_acc[acc.id]
+                    # Тот же fingerprint что в БД — критично для anti-revoke,
+                    # см. комментарий в одиночном экспорте выше.
+                    fp_parts = (acc.device_fingerprint or "").split("|") if acc.device_fingerprint else []
+                    dev_model = fp_parts[0] if len(fp_parts) >= 1 and fp_parts[0] else "Samsung Galaxy S24"
+                    sys_ver = fp_parts[1] if len(fp_parts) >= 2 and fp_parts[1] else "Android 14"
+                    app_ver = fp_parts[2] if len(fp_parts) >= 3 and fp_parts[2] else "10.12.0"
+                    lang = fp_parts[3] if len(fp_parts) >= 4 and fp_parts[3] else "en"
+                    sys_lang = fp_parts[4] if len(fp_parts) >= 5 and fp_parts[4] else "en"
                     print(f"📦 [bulk_export] {acc.phone}: ToTDesktop via "
-                          f"{px.get('addr')}:{px.get('port')} ...")
-                    client = OpenteleClient(session_path, proxy=px)
+                          f"{px.get('addr')}:{px.get('port')}, device={dev_model} ...")
+                    client = OpenteleClient(
+                        session_path, proxy=px,
+                        device_model=dev_model, system_version=sys_ver,
+                        app_version=app_ver,
+                        lang_code=lang, system_lang_code=sys_lang,
+                        timeout=30,
+                    )
                     tdesk = await client.ToTDesktop(flag=UseCurrentSession)
                     tdesk.SaveTData(td_dir)
 
