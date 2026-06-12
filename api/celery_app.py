@@ -66,6 +66,7 @@ celery_app = Celery(
         "tasks.plan_executor",
         "tasks.parser_tasks",
         "tasks.parser_similar_tasks",   # ← ДОБАВЛЕНО: crawler похожих каналов
+        "tasks.web_scraper_tasks",      # ← ДОБАВЛЕНО: Camoufox web scraper
     ]
 )
 
@@ -96,6 +97,7 @@ celery_app.conf.update(
         # чтобы не блокировали planning/commenting
         "tasks.parser_tasks.*":          {"queue": "parsers"},
         "tasks.parser_similar_tasks.*":  {"queue": "parsers"},
+        "tasks.web_scraper_tasks.*":     {"queue": "parsers"},
 
         # Подписки — отдельно, бывают long-running
         "tasks.subscribe_tasks.*":       {"queue": "subscribe"},

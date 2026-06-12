@@ -1227,3 +1227,195 @@ async def stop_language(current_user: User = Depends(get_current_user)):
     r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
     r.setex(f"parser:lang:stop:{current_user.id}", 300, "1")
     return {"status": "stopping"}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Web-парсер (Camoufox + пул из ~34 статических IPv4)
+# ═══════════════════════════════════════════════════════════════════
+# Эндпоинты для отказоустойчивого парсинга публичной статистики со SPA.
+# Внутрянка: api/utils/web_scraper (worker pool + cooldown + UX-эмуляция),
+# Celery-таск: tasks.web_scraper_tasks.run_web_scraper.
+#
+# Flow:
+#   1. POST /parser/web/scrape/start  — фронт шлёт urls + proxies + options
+#      → бэк генерит job_id, ставит таск в queue=parsers, возвращает job_id
+#   2. GET /parser/web/scrape/progress?job_id=X — фронт поллит каждые 2 сек
+#   3. POST /parser/web/scrape/stop?job_id=X — фронт ставит cancel-флаг
+#   4. GET /parser/web/scrape/results?job_id=X — скачать JSONL с результатами
+
+import json as _json
+import uuid as _uuid
+from pathlib import Path as _Path
+from fastapi.responses import FileResponse as _FileResponse
+
+
+def _ws_progress_key(user_id: int, job_id: str) -> str:
+    return f"gramgpt:web_scraper:progress:{user_id}:{job_id}"
+
+
+def _ws_cancel_key(user_id: int, job_id: str) -> str:
+    return f"gramgpt:web_scraper:cancel:{user_id}:{job_id}"
+
+
+def _ws_jsonl_path(user_id: int, job_id: str) -> _Path:
+    api_dir = _Path(__file__).resolve().parent.parent
+    return (api_dir / ".." / "data" / "web_scraper" / str(user_id) / f"{job_id}.jsonl").resolve()
+
+
+class WebScrapeStartRequest(BaseModel):
+    urls: list[str]
+    proxies: list[str]
+    # Все опции необязательны — есть безопасные дефолты в Celery-таске
+    max_workers: Optional[int] = 3
+    max_retries: Optional[int] = 3
+    page_timeout_sec: Optional[float] = 60.0
+    cooldown_min_sec: Optional[int] = 900
+    cooldown_max_sec: Optional[int] = 1200
+    node_rotation_min_sec: Optional[float] = 15.0
+    node_rotation_max_sec: Optional[float] = 35.0
+    page_locale: Optional[str] = "en-US"
+    humanize: Optional[bool] = True
+    headless: Optional[bool] = True
+
+
+@router.post("/web/scrape/start")
+async def web_scrape_start(
+    body: WebScrapeStartRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Запускает Celery-таск Camoufox-скрейпинга. Возвращает job_id."""
+    urls = [u.strip() for u in body.urls if u and u.strip()]
+    proxies = [p.strip() for p in body.proxies if p and p.strip()]
+
+    if not urls:
+        raise HTTPException(status_code=400, detail="urls пустой")
+    if not proxies:
+        raise HTTPException(status_code=400, detail="proxies пустой")
+    if len(proxies) < 3:
+        # Меньше 3 узлов = нет смысла в cooldown'е, сразу упрёмся
+        raise HTTPException(
+            status_code=400,
+            detail=f"Минимум 3 прокси для скрейпинга (передано {len(proxies)})",
+        )
+
+    job_id = _uuid.uuid4().hex
+
+    options = {
+        "max_workers": max(1, min(int(body.max_workers or 3), 6)),
+        "max_retries": max(1, min(int(body.max_retries or 3), 5)),
+        "page_timeout_sec": float(body.page_timeout_sec or 60.0),
+        "cooldown_min_sec": int(body.cooldown_min_sec or 900),
+        "cooldown_max_sec": int(body.cooldown_max_sec or 1200),
+        "node_rotation_min_sec": float(body.node_rotation_min_sec or 15.0),
+        "node_rotation_max_sec": float(body.node_rotation_max_sec or 35.0),
+        "page_locale": body.page_locale or "en-US",
+        "camoufox": {
+            "humanize": bool(body.humanize),
+            "headless": bool(body.headless),
+        },
+    }
+
+    from celery_app import celery_app
+    task = celery_app.send_task(
+        "tasks.web_scraper_tasks.run_web_scraper",
+        args=[current_user.id, job_id, urls, proxies, options],
+        queue="parsers",
+    )
+
+    # Сразу публикуем initial progress, чтобы фронт не получил пустоту на
+    # первом поллинге, пока Celery поднимает Camoufox.
+    import redis as _redis_lib
+    r = _redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    initial = {
+        "status": "queued",
+        "job_id": job_id,
+        "urls_total": len(urls),
+        "proxies_total": len(proxies),
+        "ts": int(__import__("time").time()),
+    }
+    r.setex(_ws_progress_key(current_user.id, job_id), 86400,
+            _json.dumps(initial, ensure_ascii=False))
+
+    return {
+        "job_id": job_id,
+        "task_id": task.id,
+        "urls_total": len(urls),
+        "proxies_total": len(proxies),
+        "status": "queued",
+    }
+
+
+@router.get("/web/scrape/progress")
+async def web_scrape_progress(
+    job_id: str = Query(...),
+    current_user: User = Depends(get_current_user),
+):
+    """Текущий snapshot прогресса. Фронт поллит каждые 2 сек."""
+    import redis as _redis_lib
+    r = _redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    raw = r.get(_ws_progress_key(current_user.id, job_id))
+    if not raw:
+        return {"status": "unknown", "job_id": job_id}
+    try:
+        return _json.loads(raw)
+    except Exception:
+        return {"status": "unknown", "job_id": job_id, "raw": raw.decode("utf-8", errors="ignore")}
+
+
+@router.post("/web/scrape/stop")
+async def web_scrape_stop(
+    job_id: str = Query(...),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Выставляет cancel-флаг. WebScraper.cancel_check() читает его раз
+    в ~0.5-2 сек, после чего воркеры завершают текущий URL и выходят.
+    """
+    import redis as _redis_lib
+    r = _redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    r.setex(_ws_cancel_key(current_user.id, job_id), 3600, "1")
+    return {"status": "cancelling", "job_id": job_id}
+
+
+@router.get("/web/scrape/results")
+async def web_scrape_results(
+    job_id: str = Query(...),
+    current_user: User = Depends(get_current_user),
+):
+    """Скачивает JSONL с результатами. Содержит даже частично записанные строки."""
+    path = _ws_jsonl_path(current_user.id, job_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Файл результатов не найден")
+    return _FileResponse(
+        str(path),
+        media_type="application/x-ndjson",
+        filename=f"web_scrape_{job_id}.jsonl",
+    )
+
+
+@router.get("/web/scrape/jobs")
+async def web_scrape_list_jobs(current_user: User = Depends(get_current_user)):
+    """
+    Список последних job'ов юзера — по содержимому data/web_scraper/{user_id}/.
+    Для UI "история запусков".
+    """
+    api_dir = _Path(__file__).resolve().parent.parent
+    user_dir = (api_dir / ".." / "data" / "web_scraper" / str(current_user.id)).resolve()
+    if not user_dir.exists():
+        return {"jobs": []}
+    jobs = []
+    for f in sorted(user_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:50]:
+        try:
+            stat = f.stat()
+            # Считаем строки = записи. Дёшево — файл максимум на 10к URL.
+            with f.open("r", encoding="utf-8") as fh:
+                count = sum(1 for _ in fh)
+            jobs.append({
+                "job_id": f.stem,
+                "records": count,
+                "size_bytes": stat.st_size,
+                "modified_at": int(stat.st_mtime),
+            })
+        except Exception:
+            continue
+    return {"jobs": jobs}
