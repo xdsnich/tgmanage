@@ -42,12 +42,19 @@ function Start-BgProcess {
     # variable in PowerShell functions and silently gets overridden,
     # which makes -ArgumentList receive $null inside Start-Process.
     param([string]$Name, [string[]]$ProcArgs, [string]$WorkDir)
-    $logFile = Join-Path $LOG_DIR "$Name.console.log"
-    Write-Host "[start] $Name -> $logFile" -ForegroundColor Cyan
+    # Python (uvicorn, celery) defaults to logging on stderr.
+    # We point user to the .console.log (stderr) by name.
+    # .stdout.log will usually stay empty.
+    $stdoutFile = Join-Path $LOG_DIR "$Name.stdout.log"
+    $stderrFile = Join-Path $LOG_DIR "$Name.console.log"
+    Write-Host "[start] $Name -> $stderrFile" -ForegroundColor Cyan
+    # Important: Python (uvicorn, celery) defaults to logging on stderr.
+    # We name the stderr file as the "main" .log so the user looks at
+    # the right place. stdout (.out.log) usually stays empty.
     $proc = Start-Process -FilePath $python -ArgumentList $ProcArgs `
         -WorkingDirectory $WorkDir `
-        -RedirectStandardOutput $logFile `
-        -RedirectStandardError "$logFile.err" `
+        -RedirectStandardOutput $stdoutFile `
+        -RedirectStandardError $stderrFile `
         -PassThru -WindowStyle Hidden
     $proc.Id | Out-File -FilePath (Join-Path $PID_DIR "$Name.pid") -Encoding ascii
     Write-Host "        PID = $($proc.Id)" -ForegroundColor Gray
@@ -74,8 +81,14 @@ Start-BgProcess -Name "celery_beat" -WorkDir $apiDir -ProcArgs @(
 
 Start-Sleep -Seconds 2
 Write-Host ""
-Write-Host "[OK] Stack started. PID files in $PID_DIR" -ForegroundColor Green
-Write-Host "     Console logs: $LOG_DIR\*.console.log" -ForegroundColor Gray
-Write-Host "     API: http://localhost:8000" -ForegroundColor Gray
+Write-Host "[OK] Stack started." -ForegroundColor Green
+Write-Host "     API:  http://localhost:8000" -ForegroundColor Gray
+Write-Host "     Live log files (Python -> stderr, watch *.console.log):" -ForegroundColor Gray
+Write-Host "       $LOG_DIR\uvicorn.console.log" -ForegroundColor DarkGray
+Write-Host "       $LOG_DIR\celery_worker.console.log" -ForegroundColor DarkGray
+Write-Host "       $LOG_DIR\celery_beat.console.log" -ForegroundColor DarkGray
 Write-Host ""
-Write-Host "To stop everything at once: .\stop_all.ps1" -ForegroundColor Yellow
+Write-Host "Tail logs in real time:" -ForegroundColor Yellow
+Write-Host "  Get-Content $LOG_DIR\celery_worker.console.log -Wait -Tail 30" -ForegroundColor Gray
+Write-Host ""
+Write-Host "To stop everything: .\stop_all.ps1" -ForegroundColor Yellow
