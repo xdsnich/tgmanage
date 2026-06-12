@@ -64,6 +64,8 @@ export default function AccountDetailPage() {
   const [apiApps, setApiApps] = useState([])
   const [authStep, setAuthStep] = useState('idle') // idle | code_sent | needs_2fa
   const [authMsg, setAuthMsg] = useState('')
+  const [authCodeType, setAuthCodeType] = useState('')  // "app" | "sms" | "call"
+  const [authNextType, setAuthNextType] = useState('')  // "SentCodeTypeSms" / ...
   const [channelTitle, setChannelTitle] = useState('')
   const [channelDesc, setChannelDesc] = useState('')
   const [channelUsername, setChannelUsername] = useState('')
@@ -393,7 +395,22 @@ export default function AccountDetailPage() {
       const { data } = await tgAuthAPI.sendCode(authPhone, authProxyId || null, authApiAppId || null)
       setAuthStep('code_sent')
       setAuthMsg(data.message)
+      setAuthCodeType(data.code_type || '')
+      setAuthNextType(data.next_type || '')
     } catch (err) { setAuthMsg(err.response?.data?.detail || 'Ошибка') }
+    setSaving(false)
+  }
+
+  const handleResendCode = async () => {
+    setSaving(true)
+    try {
+      const { data } = await tgAuthAPI.resendCode(authPhone)
+      setAuthMsg(data.message)
+      setAuthCodeType(data.code_type || '')
+      setAuthNextType(data.next_type || '')
+    } catch (err) {
+      setAuthMsg(err.response?.data?.detail || 'Ошибка переотправки')
+    }
     setSaving(false)
   }
 
@@ -942,8 +959,38 @@ export default function AccountDetailPage() {
 
           {authStep === 'code_sent' && (
             <>
+              {/* Яркое предупреждение для App-доставки — самая частая причина «не пришёл код» */}
+              {authCodeType === 'app' && (
+                <div style={{
+                  padding: '12px 14px', background: 'rgba(227,161,63,0.10)',
+                  border: '1px solid rgba(227,161,63,0.4)', borderRadius: 10,
+                  fontSize: 13, color: 'var(--text)', lineHeight: 1.5,
+                }}>
+                  <div style={{ fontWeight: 700, marginBottom: 6, color: 'var(--yellow)' }}>
+                    📱 Код пришёл в Telegram, а не в SMS
+                  </div>
+                  <div style={{ fontSize: 12, color: 'var(--text-2)' }}>
+                    Открой <b>Telegram-приложение на твоём ДРУГОМ устройстве</b> (телефон/Desktop/Web)
+                    — код висит в чате «Telegram» (официальный сервисный чат). SMS не придёт пока в Telegram
+                    есть активная сессия — это политика Telegram, не наша.
+                  </div>
+                  <div style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 8 }}>
+                    Если другого устройства нет — жми <b>«Прислать SMS»</b> ниже, тогда Telegram
+                    переключится на SMS-доставку{authNextType && authNextType.includes('Sms') ? ' (так и должно быть)' : ''}.
+                  </div>
+                </div>
+              )}
+
               <Input label="Код авторизации" value={authCode} onChange={e => setAuthCode(e.target.value)} placeholder="12345" autoFocus />
-              <Button variant="primary" onClick={handleConfirmCode} loading={saving}>Подтвердить</Button>
+
+              <div style={{ display: 'flex', gap: 8 }}>
+                <Button variant="primary" onClick={handleConfirmCode} loading={saving} style={{ flex: 1 }}>Подтвердить</Button>
+                {/* Кнопка resend — особенно полезна когда code_type=app */}
+                <Button variant="outline" onClick={handleResendCode} loading={saving}
+                  title={authNextType && authNextType.includes('Sms') ? 'Переотправить — придёт SMS' : 'Переотправить код'}>
+                  {authCodeType === 'app' ? '📱 Прислать SMS' : '↻ Заново'}
+                </Button>
+              </div>
             </>
           )}
 

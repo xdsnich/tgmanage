@@ -319,6 +319,10 @@ export const tgAuthAPI = {
   sendCode: (phone, proxyId = null, apiAppId = null) =>
     api.post('/tg-auth/send-code', { phone, proxy_id: proxyId, api_app_id: apiAppId }),
 
+  // Переотправка — обычно переключает Telegram с App-доставки на SMS
+  resendCode: (phone) =>
+    api.post('/tg-auth/resend-code', { phone }),
+
   confirm: (phone, code) =>
     api.post('/tg-auth/confirm', { phone, code }),
 

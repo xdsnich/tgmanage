@@ -82,8 +82,9 @@ class Confirm2FARequest(BaseModel):
 
 class SendCodeResponse(BaseModel):
     phone: str
-    code_type: str
+    code_type: str    # "app" | "sms" | "call" | "already_authorized"
     message: str
+    next_type: Optional[str] = None  # "SentCodeTypeSms" / "SentCodeTypeCall" / "SentCodeTypeApp"
 
 class AuthResult(BaseModel):
     success: bool
@@ -261,14 +262,22 @@ async def send_code(
         print(f"🔑 ✅ КОД ОТПРАВЛЕН: тип={ctn}"
               + (f", next={nxt}" if nxt else "")
               + f" (api_id={api_id_use or 'default(env)'})")
+        next_hint = ""
+        if nxt:
+            if "Sms" in nxt: next_hint = " · повторная отправка («Прислать SMS») → SMS"
+            elif "Call" in nxt: next_hint = " · повторная отправка → звонок"
+            elif "App" in nxt: next_hint = " · повторная отправка → снова в приложение"
         if "App" in ctn:
             code_type = "app"
-            msg = "Код отправлен в приложение Telegram (на другом устройстве), НЕ по SMS"
-        elif "Sms" in ctn: code_type, msg = "sms", f"SMS на {phone}"
-        else: code_type, msg = "call", f"Код (тип: {ctn})"
+            msg = ("📱 Код пришёл в Telegram-приложение на твоё ДРУГОЕ устройство "
+                   "(телефон/Desktop), НЕ по SMS. Открой Telegram там — код висит "
+                   "в чате «Telegram»." + next_hint)
+        elif "Sms" in ctn: code_type, msg = "sms", f"✅ SMS отправлено на {phone}"
+        else: code_type, msg = "call", f"📞 Звонок на {phone} (тип: {ctn})"
         if proxy_dict: msg += " [через прокси]"
 
-        return SendCodeResponse(phone=phone, code_type=code_type, message=msg)
+        return SendCodeResponse(phone=phone, code_type=code_type, message=msg,
+                                next_type=nxt)
 
     except asyncio.TimeoutError:
         try: await client.disconnect()
@@ -302,6 +311,79 @@ async def send_code(
         if "Unexpected SOCKS version" in err:
             raise HTTPException(status_code=400, detail="Неверный протокол (SOCKS5 ↔ HTTP)")
         raise HTTPException(status_code=500, detail=f"Ошибка: {err[:200]}")
+
+
+class ResendCodeRequest(BaseModel):
+    phone: str
+
+
+@router.post("/resend-code", response_model=SendCodeResponse)
+async def resend_code(
+    body: ResendCodeRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Telegram сам решает каким каналом отправить код. На первой попытке часто
+    шлёт в Telegram-приложение (если оно где-то залогинено), а не SMS. Этот
+    эндпоинт зовёт ResendCodeRequest на ТОМ ЖЕ клиенте/сессии — Telegram
+    переключается на next_type (обычно SMS).
+    """
+    phone = body.phone.strip()
+    if not phone.startswith("+"):
+        phone = "+" + phone
+
+    client = ACTIVE_CLIENTS.get(phone)
+    if not client:
+        raise HTTPException(
+            status_code=400,
+            detail="Активной сессии нет — сначала «Запросить код».",
+        )
+
+    # Достаём phone_code_hash из Redis
+    r = _redis()
+    raw = r.get(_session_key(current_user.id, phone))
+    if not raw:
+        raise HTTPException(status_code=400, detail="Сессия истекла. Запроси код заново.")
+    session_data = json.loads(raw)
+    pch = session_data.get("phone_code_hash")
+    if not pch:
+        raise HTTPException(status_code=400, detail="phone_code_hash потерян. Запроси код заново.")
+
+    try:
+        from telethon.tl.functions.auth import ResendCodeRequest as TgResendCode
+        result = await client(TgResendCode(phone_number=phone, phone_code_hash=pch))
+
+        ctn = type(result.type).__name__
+        nxt = type(result.next_type).__name__ if getattr(result, "next_type", None) else None
+        print(f"🔑 ✅ КОД ПЕРЕОТПРАВЛЕН: тип={ctn}" + (f", next={nxt}" if nxt else ""))
+
+        # Обновим phone_code_hash в Redis — Telegram мог его поменять
+        new_pch = getattr(result, "phone_code_hash", pch)
+        r.setex(_session_key(current_user.id, phone), 600,
+                json.dumps({"phone_code_hash": new_pch, "phone": phone}))
+
+        if "Sms" in ctn:
+            code_type, msg = "sms", f"✅ SMS отправлено на {phone}"
+        elif "App" in ctn:
+            code_type = "app"
+            msg = ("📱 Снова в приложение Telegram. Открой Telegram на другом устройстве. "
+                   "Если хочешь SMS — попробуй ещё раз «Прислать SMS».")
+        elif "Call" in ctn:
+            code_type, msg = "call", f"📞 Звонок на {phone}"
+        else:
+            code_type, msg = "unknown", f"Код переотправлен (тип: {ctn})"
+
+        return SendCodeResponse(phone=phone, code_type=code_type, message=msg, next_type=nxt)
+
+    except Exception as e:
+        err = str(e)
+        print(f"🔑 ❌ RESEND-CODE: {type(e).__name__}: {err}")
+        if "FLOOD" in err.upper():
+            raise HTTPException(
+                status_code=429,
+                detail=f"Telegram временно блокирует переотправку (flood). Подожди и попробуй позже: {err[:120]}",
+            )
+        raise HTTPException(status_code=500, detail=f"Ошибка переотправки: {err[:200]}")
 
 
 @router.post("/confirm", response_model=AuthResult)
