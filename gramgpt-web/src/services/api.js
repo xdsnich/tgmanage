@@ -142,11 +142,17 @@ export const accountsAPI = {
 
   // Bulk: один ZIP для N аккаунтов сразу. На каждый акк ~10 сек
   // (~3 сек ToTDesktop + 5-10 сек anti-flood пауза). 500 акков ≈ 85 мин.
-  // Timeout 2 часа с запасом.
-  bulkExportTData: (accountIds) =>
-    api.post('/accounts/bulk/export-tdata', { account_ids: accountIds }, {
-      responseType: 'blob', timeout: 7200000,
-    }),
+  // Timeout 2 часа с запасом. jobId передаётся клиентом для прогресса/отмены.
+  bulkExportTData: (accountIds, jobId) =>
+    api.post('/accounts/bulk/export-tdata',
+      { account_ids: accountIds, job_id: jobId },
+      { responseType: 'blob', timeout: 7200000 }),
+
+  bulkExportTDataProgress: (jobId) =>
+    api.get('/accounts/bulk/export-tdata/progress', { params: { job_id: jobId } }),
+
+  bulkExportTDataCancel: (jobId) =>
+    api.post('/accounts/bulk/export-tdata/cancel', null, { params: { job_id: jobId } }),
 
   importTData: (file, proxyId = null) => {
     const form = new FormData()

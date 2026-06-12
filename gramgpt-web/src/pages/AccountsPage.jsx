@@ -68,24 +68,51 @@ export default function AccountsPage() {
   }
 
   const [bulkExporting, setBulkExporting] = useState(false)
+  const [exportProgress, setExportProgress] = useState(null) // {current, total, ok, failed, current_phone, status}
+  const [exportJobId, setExportJobId] = useState(null)
+  const exportPollRef = useRef(null)
+
+  const stopExportPoll = () => {
+    if (exportPollRef.current) {
+      clearInterval(exportPollRef.current)
+      exportPollRef.current = null
+    }
+  }
+
   const handleBulkExportTData = async () => {
     if (!selectedIds.size) return
     if (selectedIds.size > 500) {
       alert(`Слишком много за раз: ${selectedIds.size}. Лимит 500 — разбей на пачки.`)
       return
     }
-    // 5-10 сек пауза между акк + ~3 сек на сам ToTDesktop = ~10 сек на акк
     const estMin = Math.max(1, Math.round(selectedIds.size * 10 / 60))
     if (!window.confirm(
       `Экспортировать TData для ${selectedIds.size} аккаунтов в один ZIP?\n\n` +
       `Каждый экспорт коннектится к Telegram через прокси аккаунта — обязательно ` +
       `чтобы у всех выбранных был прокси (иначе вернётся 400). Между акками ` +
       `5-10 сек пауза — anti-flood защита.\n\n` +
-      `Это займёт примерно ${estMin} мин. Окно не закрывай — иначе загрузка прервётся.`
+      `Это займёт примерно ${estMin} мин. Можно отменить — экспортированные акки уйдут в архив частично.`
     )) return
+
+    // Генерируем job_id для прогресса/отмены
+    const jobId = (crypto.randomUUID && crypto.randomUUID()) ||
+                  `job_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+    setExportJobId(jobId)
+    setExportProgress({ status: 'running', current: 0, total: selectedIds.size, ok: 0, failed: 0, current_phone: '', message: 'Запуск...' })
     setBulkExporting(true)
+
+    // Поллинг прогресса
+    exportPollRef.current = setInterval(async () => {
+      try {
+        const { data } = await accountsAPI.bulkExportTDataProgress(jobId)
+        if (data && data.status && data.status !== 'idle') {
+          setExportProgress(data)
+        }
+      } catch { /* ignore */ }
+    }, 2000)
+
     try {
-      const { data } = await accountsAPI.bulkExportTData([...selectedIds])
+      const { data } = await accountsAPI.bulkExportTData([...selectedIds], jobId)
       // Скачиваем blob как файл
       const url = window.URL.createObjectURL(new Blob([data], { type: 'application/zip' }))
       const a = document.createElement('a')
@@ -97,7 +124,6 @@ export default function AccountsPage() {
       document.body.removeChild(a)
       window.URL.revokeObjectURL(url)
     } catch (err) {
-      // axios c responseType:'blob' заворачивает JSON-ошибку в Blob; распаковываем
       let msg = 'Ошибка экспорта TData'
       try {
         if (err.response?.data instanceof Blob) {
@@ -107,9 +133,26 @@ export default function AccountsPage() {
           msg = err.response.data.detail
         }
       } catch { /* ignore */ }
-      alert(msg)
+      // Если 499 — это отмена пользователем, не ошибка
+      if (err.response?.status !== 499) {
+        alert(msg)
+      }
+    } finally {
+      stopExportPoll()
+      setBulkExporting(false)
+      setExportJobId(null)
+      // Прогресс прячем через 4 сек чтобы юзер увидел финальный статус
+      setTimeout(() => setExportProgress(null), 4000)
     }
-    setBulkExporting(false)
+  }
+
+  const handleCancelExport = async () => {
+    if (!exportJobId) return
+    if (!window.confirm('Отменить экспорт? Уже экспортированные акк. попадут в архив, остальные — нет.')) return
+    try {
+      await accountsAPI.bulkExportTDataCancel(exportJobId)
+    } catch { /* ignore */ }
+    setExportProgress(p => p ? { ...p, message: 'Останавливаю...', status: 'cancelling' } : p)
   }
 
   const [filterStatus, setFilterStatus] = useState('all')
@@ -179,6 +222,11 @@ export default function AccountsPage() {
   }
 
   useEffect(() => { load() }, [])
+
+  // Стоп-интервал поллинга прогресса экспорта при размонтировании
+  useEffect(() => {
+    return () => stopExportPoll()
+  }, [])
 
   // Превью загруженных фото в модалке создания канала
   useEffect(() => {
@@ -1192,6 +1240,68 @@ export default function AccountsPage() {
           </div>
         )}
       </Modal>
+
+      {/* ══ Bulk export progress banner ══ */}
+      {exportProgress && (() => {
+        const pct = exportProgress.total > 0
+          ? Math.min(100, Math.round((exportProgress.current / exportProgress.total) * 100))
+          : 0
+        const isDone = exportProgress.status === 'done'
+        const isCancelled = exportProgress.status === 'cancelled' || exportProgress.status === 'cancelling'
+        const isError = exportProgress.status === 'error'
+        const colorTop = isDone ? 'var(--green)' : isError ? 'var(--red)' : isCancelled ? 'var(--yellow)' : 'var(--violet)'
+        return (
+          <div style={{
+            position: 'fixed', bottom: 90, left: '50%', transform: 'translateX(-50%)',
+            zIndex: 101, width: 'min(520px, 92vw)',
+            background: 'var(--bg-2)', border: `1px solid ${colorTop}55`,
+            borderRadius: 14, padding: '14px 18px',
+            boxShadow: `0 10px 40px rgba(0,0,0,0.5), 0 0 24px ${colorTop}33`,
+            display: 'flex', flexDirection: 'column', gap: 10,
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)', display: 'flex', alignItems: 'center', gap: 8 }}>
+                {isDone ? '✅' : isError ? '❌' : isCancelled ? '⏹' : '📦'}
+                <span>{isDone ? 'Экспорт TData завершён' : isError ? 'Ошибка экспорта' : isCancelled ? 'Экспорт отменён' : 'Экспорт TData'}</span>
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
+                {exportProgress.current}/{exportProgress.total} · {pct}%
+              </div>
+            </div>
+
+            {/* Progress bar */}
+            <div style={{ height: 6, background: 'rgba(255,255,255,0.06)', borderRadius: 3, overflow: 'hidden' }}>
+              <div style={{
+                height: '100%', width: `${pct}%`,
+                background: `linear-gradient(90deg, ${colorTop}, ${colorTop}99)`,
+                transition: 'width 0.4s ease',
+              }} />
+            </div>
+
+            {/* Stats row */}
+            <div style={{ display: 'flex', gap: 14, fontSize: 11, color: 'var(--text-2)', flexWrap: 'wrap' }}>
+              <span style={{ color: 'var(--green)' }}>✅ {exportProgress.ok || 0} OK</span>
+              {exportProgress.failed > 0 && <span style={{ color: 'var(--red)' }}>❌ {exportProgress.failed} fail</span>}
+              {exportProgress.current_phone && exportProgress.status === 'running' && (
+                <span style={{ color: 'var(--text-3)', fontFamily: 'var(--font-mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+                  📞 {exportProgress.current_phone}
+                </span>
+              )}
+            </div>
+
+            {exportProgress.message && (
+              <div style={{ fontSize: 11, color: 'var(--text-3)' }}>{exportProgress.message}</div>
+            )}
+
+            {bulkExporting && exportJobId && (
+              <Button variant="danger" size="sm" onClick={handleCancelExport}
+                disabled={exportProgress.status === 'cancelling'}>
+                {exportProgress.status === 'cancelling' ? '⏳ Останавливаю...' : '⏹ Отменить экспорт'}
+              </Button>
+            )}
+          </div>
+        )
+      })()}
 
       {/* ══ Floating action bar (multi-select) ══ */}
       {selectedIds.size > 0 && (

@@ -561,6 +561,45 @@ async def export_tdata(
 
 class BulkExportTDataRequest(BaseModel):
     account_ids: list[int]
+    job_id: Optional[str] = None    # клиент шлёт UUID для прогресса/отмены
+
+
+def _bulk_export_progress_key(user_id: int, job_id: str) -> str:
+    return f"gramgpt:bulk_tdata_export:progress:{user_id}:{job_id}"
+
+
+def _bulk_export_cancel_key(user_id: int, job_id: str) -> str:
+    return f"gramgpt:bulk_tdata_export:cancel:{user_id}:{job_id}"
+
+
+@router.get("/bulk/export-tdata/progress")
+async def bulk_export_tdata_progress(
+    job_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Текущий прогресс bulk-экспорта. Polled фронтом каждые 2 сек."""
+    from utils.redis_pool import get_redis
+    r = get_redis()
+    raw = r.get(_bulk_export_progress_key(current_user.id, job_id))
+    if not raw:
+        return {"status": "idle"}
+    import json as _json
+    try:
+        return _json.loads(raw)
+    except Exception:
+        return {"status": "idle"}
+
+
+@router.post("/bulk/export-tdata/cancel")
+async def bulk_export_tdata_cancel(
+    job_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Просим bulk-экспорт остановиться (флаг в Redis). Сервер проверяет перед каждым акком."""
+    from utils.redis_pool import get_redis
+    r = get_redis()
+    r.setex(_bulk_export_cancel_key(current_user.id, job_id), 3600, "1")
+    return {"status": "cancel_requested"}
 
 
 @router.post("/bulk/export-tdata")
@@ -651,6 +690,38 @@ async def bulk_export_tdata(
 
     import asyncio
     import random
+    import json as _json
+    import uuid as _uuid
+    from utils.redis_pool import get_redis as _get_redis
+
+    # job_id для прогресса/отмены. Если клиент не передал — генерируем сами,
+    # но тогда отменить не получится (клиент его не знает).
+    job_id = body.job_id or _uuid.uuid4().hex
+    redis = _get_redis()
+    prog_key = _bulk_export_progress_key(current_user.id, job_id)
+    cancel_key = _bulk_export_cancel_key(current_user.id, job_id)
+
+    def _set_progress(status: str, current: int, total: int, current_phone: str = "",
+                      ok_count: int = 0, fail_count: int = 0, message: str = ""):
+        try:
+            redis.setex(prog_key, 3600, _json.dumps({
+                "status": status, "current": current, "total": total,
+                "current_phone": current_phone,
+                "ok": ok_count, "failed": fail_count,
+                "message": message, "job_id": job_id,
+            }))
+        except Exception:
+            pass
+
+    def _check_cancel() -> bool:
+        try:
+            return bool(redis.get(cancel_key))
+        except Exception:
+            return False
+
+    # Сразу очищаем старый cancel-флаг (если был от прошлого запуска того же job_id)
+    try: redis.delete(cancel_key)
+    except Exception: pass
 
     work_dir = tempfile.mkdtemp(prefix="gramgpt_bulk_tdata_")
     zip_path = os.path.join(
@@ -659,19 +730,43 @@ async def bulk_export_tdata(
 
     failed: list[str] = []
     successful: list[str] = []
+    cancelled = False
+
+    _set_progress("running", 0, len(accounts), message="Запуск экспорта...")
 
     try:
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for idx, acc in enumerate(accounts):
+                # Проверка отмены ПЕРЕД работой над каждым акком
+                if _check_cancel():
+                    cancelled = True
+                    print(f"📦 [bulk_export] CANCELLED после {idx} акк.")
+                    break
+
                 phone_clean = (acc.phone or f"acc{acc.id}").replace("+", "")
                 acc_label = f"{phone_clean}_tdata"
+
+                _set_progress("running", idx, len(accounts), acc.phone or f"#{acc.id}",
+                              len(successful), len(failed),
+                              f"Обрабатываю {acc.phone}")
 
                 # Anti-flood: не дёргаем Telegram чаще чем раз в 5-10 сек.
                 # Каждый ToTDesktop = это коннект к MTProto с инициализацией
                 # сессии. Если делать без пауз — Telegram пометит как «бот»
                 # и может отозвать сессию через несколько коннектов.
                 if idx > 0:
-                    await asyncio.sleep(random.uniform(5.0, 10.0))
+                    # interruptible sleep — каждые 0.5с проверяем cancel
+                    pause = random.uniform(5.0, 10.0)
+                    slept = 0.0
+                    while slept < pause:
+                        if _check_cancel():
+                            cancelled = True
+                            break
+                        await asyncio.sleep(0.5)
+                        slept += 0.5
+                    if cancelled:
+                        print(f"📦 [bulk_export] CANCELLED во время паузы после {idx} акк.")
+                        break
 
                 if not acc.session_file or not Path(acc.session_file).exists():
                     failed.append(f"{acc.phone}: нет файла сессии ({acc.session_file})")
@@ -722,6 +817,11 @@ async def bulk_export_tdata(
                     try: shutil.rmtree(acc_tmp)
                     except Exception: pass
 
+                # Финальный прогресс этого акка
+                _set_progress("running", idx + 1, len(accounts), acc.phone or f"#{acc.id}",
+                              len(successful), len(failed),
+                              f"Готово {idx + 1}/{len(accounts)}")
+
             # _failed.txt — лог проблемных, чтобы юзер видел в архиве кто упал
             if failed:
                 failed_path = os.path.join(work_dir, "_failed.txt")
@@ -739,14 +839,32 @@ async def bulk_export_tdata(
                         fp.write(ph + "\n")
                 zf.write(summary_path, "_summary.txt")
 
+        if cancelled and not successful:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            _set_progress("cancelled", 0, len(accounts), "", 0, len(failed),
+                          "Отменено пользователем (ни один акк не успел)")
+            raise HTTPException(status_code=499, detail="Отменено пользователем")
+
         if not successful:
             shutil.rmtree(work_dir, ignore_errors=True)
+            _set_progress("error", 0, len(accounts), "", 0, len(failed),
+                          "Ни один аккаунт не экспортирован")
             raise HTTPException(
                 status_code=500,
                 detail=f"Ни один аккаунт не экспортирован. Ошибки: " + " | ".join(failed[:5]),
             )
 
-        filename = f"tdata_bulk_{len(successful)}acc.zip"
+        # Успешно (полностью или частично если cancelled)
+        final_status = "cancelled" if cancelled else "done"
+        final_msg = (
+            f"Отменено, но {len(successful)} акк. успели экспортироваться"
+            if cancelled
+            else f"Готово: {len(successful)}/{len(accounts)}"
+        )
+        _set_progress(final_status, len(successful) + len(failed), len(accounts), "",
+                      len(successful), len(failed), final_msg)
+
+        filename = f"tdata_bulk_{len(successful)}acc{'_partial' if cancelled else ''}.zip"
         return FileResponse(zip_path, filename=filename, media_type="application/zip")
 
     except HTTPException:
@@ -754,6 +872,8 @@ async def bulk_export_tdata(
     except Exception as e:
         try: shutil.rmtree(work_dir, ignore_errors=True)
         except Exception: pass
+        _set_progress("error", 0, len(accounts), "", len(successful), len(failed),
+                      f"Ошибка: {str(e)[:120]}")
         raise HTTPException(status_code=500, detail=f"Ошибка bulk-экспорта: {str(e)[:200]}")
 
 
