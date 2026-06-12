@@ -419,6 +419,14 @@ export const parserAPI = {
     responseType: 'blob',
   }),
   webScrapeListJobs: () => api.get('/parser/web/scrape/jobs'),
+
+  // ── TGStat preset (специальный режим под tgstat.com) ────────────
+  webScrapeTgstatOptions: () => api.get('/parser/web/scrape/tgstat/options'),
+  webScrapeTgstatStart: (data) => api.post('/parser/web/scrape/tgstat/start', data, { timeout: 30000 }),
+  webScrapeTgstatAggregate: (jobId, onlyComments = true, minSubs = 0) =>
+    api.get('/parser/web/scrape/tgstat/aggregate', {
+      params: { job_id: jobId, only_with_comments: onlyComments, min_subscribers: minSubs },
+    }),
 }
 
 // ── COMMENTING (нейрокомментинг) ─────────────────────────────

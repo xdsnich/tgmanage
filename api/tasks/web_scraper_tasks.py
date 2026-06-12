@@ -117,6 +117,7 @@ def run_web_scraper(self, user_id: int, job_id: str, urls: list[str],
         urls: список URL для обработки
         proxies: список прокси (рекомендуется 34, можно меньше — будет warn)
         options: {
+            "extractor": "universal" | "tgstat",   # выбор стратегии чтения
             "max_workers": 3,
             "max_retries": 3,
             "page_timeout_sec": 60,
@@ -140,9 +141,18 @@ def run_web_scraper(self, user_id: int, job_id: str, urls: list[str],
 async def _run(user_id: int, job_id: str, urls: list[str],
                proxies: list[str], options: dict) -> dict:
     from utils.redis_pool import get_redis
-    from utils.web_scraper import WebScraper
+    from utils.web_scraper import WebScraper, tgstat_channels_extractor
 
     redis = get_redis()
+
+    # Выбор extractor'а по options.extractor
+    extractor_name = (options.get("extractor") or "universal").lower()
+    if extractor_name == "tgstat":
+        page_extractor = tgstat_channels_extractor
+        logger.info("[web_scraper] extractor=tgstat (карточки каналов)")
+    else:
+        page_extractor = _universal_extractor
+        logger.info("[web_scraper] extractor=universal (title/meta/h1/body)")
     prog_k = _progress_key(user_id, job_id)
     cancel_k = _cancel_key(user_id, job_id)
     jsonl = _jsonl_path(user_id, job_id)
@@ -191,7 +201,7 @@ async def _run(user_id: int, job_id: str, urls: list[str],
         scraper = WebScraper(
             proxies=proxies,
             checkpoint_path=jsonl,
-            extractor=_universal_extractor,
+            extractor=page_extractor,
             max_workers=int(options.get("max_workers", 3)),
             max_retries=int(options.get("max_retries", 3)),
             page_timeout_sec=float(options.get("page_timeout_sec", 60.0)),

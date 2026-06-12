@@ -1419,3 +1419,182 @@ async def web_scrape_list_jobs(current_user: User = Depends(get_current_user)):
         except Exception:
             continue
     return {"jobs": jobs}
+
+
+# ── TGStat preset ──────────────────────────────────────────────────
+# Удобная обёртка над web/scrape/start для TGStat: вместо ручного
+# составления URL'ов фронт шлёт {languages, categories, only_with_comments,
+# pages_per_geo}, бэк сам генерит список URL через build_urls() и запускает
+# таску с extractor="tgstat".
+
+
+@router.get("/web/scrape/tgstat/options")
+async def web_scrape_tgstat_options(current_user: User = Depends(get_current_user)):
+    """Справочник для UI: какие гео и категории доступны на TGStat."""
+    from utils.web_scraper import GEO_LANGUAGES, GEO_CATEGORIES
+    return {
+        "languages": GEO_LANGUAGES,
+        "categories": GEO_CATEGORIES,
+    }
+
+
+class WebScrapeTgstatRequest(BaseModel):
+    proxies: list[str]
+    languages: list[str] = []           # коды из GEO_LANGUAGES, пусто = все
+    categories: list[str] = []          # slug'и из GEO_CATEGORIES, пусто = без фильтра
+    only_with_comments: bool = True
+    pages_per_geo: int = 1              # сколько страниц с каждого среза
+    include_global: bool = False        # добавлять глобальный (без language)
+
+    max_workers: Optional[int] = 3
+    max_retries: Optional[int] = 3
+    page_timeout_sec: Optional[float] = 60.0
+    cooldown_min_sec: Optional[int] = 900
+    cooldown_max_sec: Optional[int] = 1200
+    node_rotation_min_sec: Optional[float] = 15.0
+    node_rotation_max_sec: Optional[float] = 35.0
+    page_locale: Optional[str] = "en-US"
+    humanize: Optional[bool] = True
+    headless: Optional[bool] = True
+
+
+@router.post("/web/scrape/tgstat/start")
+async def web_scrape_tgstat_start(
+    body: WebScrapeTgstatRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """Запуск Camoufox-скрейпинга TGStat по выбранным гео/категориям."""
+    from utils.web_scraper import build_urls
+
+    proxies = [p.strip() for p in body.proxies if p and p.strip()]
+    if len(proxies) < 3:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Минимум 3 прокси (передано {len(proxies)})",
+        )
+
+    urls = build_urls(
+        languages=body.languages,
+        categories=body.categories,
+        only_with_comments=body.only_with_comments,
+        pages_per_geo=max(1, min(body.pages_per_geo, 10)),
+        include_global=body.include_global,
+    )
+    if not urls:
+        raise HTTPException(
+            status_code=400,
+            detail="Не получилось собрать ни одного URL — укажи хотя бы один язык или категорию",
+        )
+
+    job_id = _uuid.uuid4().hex
+    options = {
+        "extractor": "tgstat",
+        "max_workers": max(1, min(int(body.max_workers or 3), 6)),
+        "max_retries": max(1, min(int(body.max_retries or 3), 5)),
+        "page_timeout_sec": float(body.page_timeout_sec or 60.0),
+        "cooldown_min_sec": int(body.cooldown_min_sec or 900),
+        "cooldown_max_sec": int(body.cooldown_max_sec or 1200),
+        "node_rotation_min_sec": float(body.node_rotation_min_sec or 15.0),
+        "node_rotation_max_sec": float(body.node_rotation_max_sec or 35.0),
+        "page_locale": body.page_locale or "en-US",
+        "camoufox": {
+            "humanize": bool(body.humanize),
+            "headless": bool(body.headless),
+        },
+    }
+
+    from celery_app import celery_app
+    task = celery_app.send_task(
+        "tasks.web_scraper_tasks.run_web_scraper",
+        args=[current_user.id, job_id, urls, proxies, options],
+        queue="parsers",
+    )
+
+    import redis as _redis_lib
+    r = _redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    initial = {
+        "status": "queued",
+        "job_id": job_id,
+        "urls_total": len(urls),
+        "proxies_total": len(proxies),
+        "preset": "tgstat",
+        "languages": body.languages,
+        "categories": body.categories,
+        "ts": int(__import__("time").time()),
+    }
+    r.setex(_ws_progress_key(current_user.id, job_id), 86400,
+            _json.dumps(initial, ensure_ascii=False))
+
+    return {
+        "job_id": job_id,
+        "task_id": task.id,
+        "urls_total": len(urls),
+        "proxies_total": len(proxies),
+        "preview_urls": urls[:5],
+        "status": "queued",
+    }
+
+
+@router.get("/web/scrape/tgstat/aggregate")
+async def web_scrape_tgstat_aggregate(
+    job_id: str = Query(...),
+    only_with_comments: bool = Query(True),
+    min_subscribers: int = Query(0),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Агрегирует все каналы из JSONL job'а в один плоский список.
+    Дедуп по @username (если канал встретился в нескольких срезах).
+    Для UI "вот что я нашёл" — без скачивания файла.
+    """
+    path = _ws_jsonl_path(current_user.id, job_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Результаты ещё не записаны")
+
+    channels: dict[str, dict] = {}
+    rows_read = 0
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = _json.loads(line)
+                except Exception:
+                    continue
+                rows_read += 1
+                data = rec.get("data") or {}
+                geo = data.get("geo") or {}
+                for ch in (data.get("channels") or []):
+                    uname = (ch.get("username") or "").lstrip("@").lower()
+                    if not uname:
+                        continue
+                    if only_with_comments and not ch.get("has_comments"):
+                        continue
+                    if min_subscribers and (ch.get("subscribers") or 0) < min_subscribers:
+                        continue
+                    # Дедуп — оставляем запись с большим subscribers
+                    prev = channels.get(uname)
+                    if prev and (prev.get("subscribers") or 0) >= (ch.get("subscribers") or 0):
+                        continue
+                    channels[uname] = {
+                        "username": "@" + uname,
+                        "title": ch.get("title"),
+                        "subscribers": ch.get("subscribers"),
+                        "has_comments": bool(ch.get("has_comments")),
+                        "category": ch.get("category"),
+                        "verified": bool(ch.get("verified")),
+                        "language": geo.get("lang"),
+                        "source_url": geo.get("source_url"),
+                    }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Не смог прочитать JSONL: {e}")
+
+    items = sorted(channels.values(), key=lambda x: x.get("subscribers") or 0, reverse=True)
+    return {
+        "job_id": job_id,
+        "rows_read": rows_read,
+        "channels_count": len(items),
+        "channels": items,
+    }

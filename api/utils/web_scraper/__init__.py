@@ -15,6 +15,8 @@ from .scraper import WebScraper, ScrapeResult
 from .node_rotator import NodeRotator, ProxyNode
 from .context_pool import BrowserContextPool
 from .checkpoint import JSONLCheckpoint
+from .tgstat_extractor import tgstat_channels_extractor
+from .tgstat_urls import build_urls, GEO_LANGUAGES, GEO_CATEGORIES
 
 __all__ = [
     "WebScraper",
@@ -23,4 +25,8 @@ __all__ = [
     "ProxyNode",
     "BrowserContextPool",
     "JSONLCheckpoint",
+    "tgstat_channels_extractor",
+    "build_urls",
+    "GEO_LANGUAGES",
+    "GEO_CATEGORIES",
 ]
