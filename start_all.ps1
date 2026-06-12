@@ -38,10 +38,13 @@ $python = (Get-Command python).Source
 $apiDir = Join-Path $ROOT "api"
 
 function Start-BgProcess {
-    param([string]$Name, [string[]]$Args, [string]$WorkDir)
+    # NOTE: parameter is NOT named $Args -- that's a reserved automatic
+    # variable in PowerShell functions and silently gets overridden,
+    # which makes -ArgumentList receive $null inside Start-Process.
+    param([string]$Name, [string[]]$ProcArgs, [string]$WorkDir)
     $logFile = Join-Path $LOG_DIR "$Name.console.log"
     Write-Host "[start] $Name -> $logFile" -ForegroundColor Cyan
-    $proc = Start-Process -FilePath $python -ArgumentList $Args `
+    $proc = Start-Process -FilePath $python -ArgumentList $ProcArgs `
         -WorkingDirectory $WorkDir `
         -RedirectStandardOutput $logFile `
         -RedirectStandardError "$logFile.err" `
@@ -51,20 +54,20 @@ function Start-BgProcess {
 }
 
 # 1. Uvicorn (FastAPI)
-Start-BgProcess -Name "uvicorn" -WorkDir $apiDir -Args @(
+Start-BgProcess -Name "uvicorn" -WorkDir $apiDir -ProcArgs @(
     "-m", "uvicorn", "main:app",
     "--host", "0.0.0.0", "--port", "8000"
 )
 
 # 2. Celery worker -- all queues
-Start-BgProcess -Name "celery_worker" -WorkDir $apiDir -Args @(
+Start-BgProcess -Name "celery_worker" -WorkDir $apiDir -ProcArgs @(
     "-m", "celery", "-A", "celery_app", "worker",
     "-l", "info", "-P", "threads", "-c", "40",
     "-Q", "plans,warmup,parsers,ai_dialogs,high_priority,bulk_actions,subscribe"
 )
 
 # 3. Celery beat -- separate scheduler process
-Start-BgProcess -Name "celery_beat" -WorkDir $apiDir -Args @(
+Start-BgProcess -Name "celery_beat" -WorkDir $apiDir -ProcArgs @(
     "-m", "celery", "-A", "celery_app", "beat",
     "-l", "info"
 )
