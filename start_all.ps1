@@ -1,38 +1,36 @@
-# GramGPT — единый старт всех процессов
+# GramGPT -- single-shot starter for the whole stack.
 #
-# Что запускает:
-#   1. uvicorn (API + фронт)            — порт 8000
+# Starts:
+#   1. uvicorn   (FastAPI + frontend) on port 8000
 #   2. celery worker  (-P threads -c 40)
-#   3. celery beat    (диспетчер планов каждые 60 сек)
+#   3. celery beat    (dispatches plans every 60s)
 #
-# ВАЖНО:
-#   - PID'ы пишутся в .pids/*.pid чтобы stop_all.ps1 знал что убивать.
-#   - Логи каждого процесса в logs/<имя>.console.log (раздельно от
-#     ротируемого logs/api.log — там structured logger).
+# PIDs are written to .pids/*.pid so that stop_all.ps1 can kill them.
+# Console output goes to logs/<name>.console.log.
 #
-# Запуск:
+# Usage:
 #   .\start_all.ps1
-# Остановка:
+# Stop:
 #   .\stop_all.ps1
 #
-# После инцидента 2026-06-12 строго запрещено стартовать только uvicorn:
-# celery beat — отдельный процесс. Если не убить beat при "stop проги",
-# он продолжает слать dispatch_plans каждую минуту и копит pile-up.
+# Why this script exists: incident 2026-06-12 was caused partly by
+# leaving celery beat running while the user thought the program was
+# stopped. Beat kept firing dispatch_plans every minute, piling up
+# tasks, which then burst-launched on next worker startup. This
+# script kills the whole stack together.
 
 $ErrorActionPreference = "Stop"
 $ROOT = $PSScriptRoot
 $PID_DIR = Join-Path $ROOT ".pids"
 $LOG_DIR = Join-Path $ROOT "logs"
 
-# Создаём папки если нет
 New-Item -ItemType Directory -Force -Path $PID_DIR | Out-Null
 New-Item -ItemType Directory -Force -Path $LOG_DIR | Out-Null
 
-# Проверка, не запущено ли уже
 $existing = Get-ChildItem $PID_DIR -Filter "*.pid" -ErrorAction SilentlyContinue
 if ($existing) {
-    Write-Host "⚠ Найдены PID-файлы в .pids/. Возможно уже запущено." -ForegroundColor Yellow
-    Write-Host "  Сначала запусти .\stop_all.ps1 (или удали .pids вручную)." -ForegroundColor Yellow
+    Write-Host "[WARN] PID files found in .pids/. Already running?" -ForegroundColor Yellow
+    Write-Host "       Run .\stop_all.ps1 first (or delete .pids manually)." -ForegroundColor Yellow
     exit 1
 }
 
@@ -42,14 +40,14 @@ $apiDir = Join-Path $ROOT "api"
 function Start-BgProcess {
     param([string]$Name, [string[]]$Args, [string]$WorkDir)
     $logFile = Join-Path $LOG_DIR "$Name.console.log"
-    Write-Host "▶ Запускаю $Name → $logFile" -ForegroundColor Cyan
+    Write-Host "[start] $Name -> $logFile" -ForegroundColor Cyan
     $proc = Start-Process -FilePath $python -ArgumentList $Args `
         -WorkingDirectory $WorkDir `
         -RedirectStandardOutput $logFile `
         -RedirectStandardError "$logFile.err" `
         -PassThru -WindowStyle Hidden
     $proc.Id | Out-File -FilePath (Join-Path $PID_DIR "$Name.pid") -Encoding ascii
-    Write-Host "  PID = $($proc.Id)" -ForegroundColor Gray
+    Write-Host "        PID = $($proc.Id)" -ForegroundColor Gray
 }
 
 # 1. Uvicorn (FastAPI)
@@ -58,14 +56,14 @@ Start-BgProcess -Name "uvicorn" -WorkDir $apiDir -Args @(
     "--host", "0.0.0.0", "--port", "8000"
 )
 
-# 2. Celery worker — обрабатывает таски из всех очередей
+# 2. Celery worker -- all queues
 Start-BgProcess -Name "celery_worker" -WorkDir $apiDir -Args @(
     "-m", "celery", "-A", "celery_app", "worker",
     "-l", "info", "-P", "threads", "-c", "40",
     "-Q", "plans,warmup,parsers,ai_dialogs,high_priority,bulk_actions,subscribe"
 )
 
-# 3. Celery beat — отдельный планировщик. Шлёт dispatch_plans каждые 60с.
+# 3. Celery beat -- separate scheduler process
 Start-BgProcess -Name "celery_beat" -WorkDir $apiDir -Args @(
     "-m", "celery", "-A", "celery_app", "beat",
     "-l", "info"
@@ -73,8 +71,8 @@ Start-BgProcess -Name "celery_beat" -WorkDir $apiDir -Args @(
 
 Start-Sleep -Seconds 2
 Write-Host ""
-Write-Host "✅ Запущено. PID-файлы в $PID_DIR" -ForegroundColor Green
-Write-Host "   Логи: $LOG_DIR\*.console.log" -ForegroundColor Gray
-Write-Host "   API: http://localhost:8000" -ForegroundColor Gray
+Write-Host "[OK] Stack started. PID files in $PID_DIR" -ForegroundColor Green
+Write-Host "     Console logs: $LOG_DIR\*.console.log" -ForegroundColor Gray
+Write-Host "     API: http://localhost:8000" -ForegroundColor Gray
 Write-Host ""
-Write-Host "Чтобы остановить всё разом: .\stop_all.ps1" -ForegroundColor Yellow
+Write-Host "To stop everything at once: .\stop_all.ps1" -ForegroundColor Yellow
