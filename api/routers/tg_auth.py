@@ -126,13 +126,25 @@ def _make_client(phone, proxy_dict=None, api_id=None, api_hash=None, platform="a
         api_id = api_id or cli_config.API_ID
         api_hash = api_hash or cli_config.API_HASH
 
+    # Telethon строго требует api_id: int, api_hash: str. Если из БД пришли
+    # другие типы (например ApiApp.api_hash как-то превратилось в int),
+    # Telethon упадёт глубоко внутри MTProto сериализации с непонятным
+    # TypeError. Приводим явно — безопасно для строки/числа и для None.
+    try:
+        api_id = int(api_id) if api_id else 0
+    except (ValueError, TypeError):
+        api_id = 0
+    api_hash = str(api_hash).strip() if api_hash else ""
+
     sessions_dir = os.path.abspath(os.path.join(
         os.path.dirname(__file__), "..", "..", "sessions"
     ))
     os.makedirs(sessions_dir, exist_ok=True)
     session_path = os.path.join(sessions_dir, phone.replace("+", "")) + ".session"
 
-    print(f"🔑 _make_client: api_id={api_id}, platform={platform}, device={fingerprint['device']}")
+    print(f"🔑 _make_client: api_id={api_id} ({type(api_id).__name__}), "
+          f"api_hash_len={len(api_hash)} ({type(api_hash).__name__}), "
+          f"platform={platform}, device={fingerprint['device']}")
 
     return TelegramClient(
         session_path.replace(".session", ""),
@@ -164,8 +176,15 @@ async def _load_api_app_creds(db, api_app_id: int, user_id: int):
         raise HTTPException(status_code=404, detail="API app не найден или неактивен")
 
     platform = getattr(api_app, 'platform', 'android') or 'android'
-    print(f"🔑 Используем API app #{api_app_id}: api_id={api_app.api_id}, platform={platform}")
-    return api_app.api_id, api_app.api_hash, platform
+    # Гарантируем правильные типы: Telethon требует api_id:int + api_hash:str
+    try:
+        api_id_int = int(api_app.api_id)
+    except (ValueError, TypeError):
+        api_id_int = 0
+    api_hash_str = str(api_app.api_hash).strip() if api_app.api_hash else ""
+    print(f"🔑 Используем API app #{api_app_id}: api_id={api_id_int}, "
+          f"hash_len={len(api_hash_str)}, platform={platform}")
+    return api_id_int, api_hash_str, platform
 
 
 # ── Storage ──────────────────────────────────────────────────
