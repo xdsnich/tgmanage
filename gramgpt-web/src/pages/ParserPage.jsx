@@ -3,6 +3,7 @@ import { accountsAPI, parserAPI } from '../services/api'
 import { Card, Button, Input, Modal, Badge, Spinner, Empty, StatCard } from '../components/ui'
 import { useAutoRefresh } from '../hooks/useAutoRefresh'
 import ParserMetrics from './ParserMetrics'
+import WebScraperPanel from './WebScraperPanel'
 
 function CheckBanner({ icon, label, status, current, line, color, onStop, onDismiss }) {
   const running = status === 'running'
@@ -447,6 +448,7 @@ export default function ParserPage() {
           { key: 'channels', label: '📋 Каналы' },
           { key: 'whitelist', label: '📊 Проходимость' },
           { key: 'metrics', label: '📈 Метрики' },
+          { key: 'web', label: '🛰️ Web-парсер' },
         ].map(t => (
           <button key={t.key} onClick={() => {
             setPageTab(t.key)
@@ -763,6 +765,9 @@ export default function ParserPage() {
 
       {/* Metrics tab */}
       {pageTab === 'metrics' && <ParserMetrics />}
+
+      {/* Web-scraper tab (Camoufox + пул прокси) */}
+      {pageTab === 'web' && <WebScraperPanel />}
 
       {/* Folder assignment modal */}
       <Modal open={folderModal} onClose={() => setFolderModal(false)} title="📁 Назначить папку" width={400}>

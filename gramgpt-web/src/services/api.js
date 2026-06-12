@@ -409,6 +409,16 @@ export const parserAPI = {
   aliveStart: (data) => api.post('/parser/alive/start', data),
   aliveProgress: () => api.get('/parser/alive/progress'),
   aliveStop: () => api.post('/parser/alive/stop'),
+
+  // ── Web-парсер (Camoufox + пул прокси) ──────────────────────────
+  webScrapeStart: (data) => api.post('/parser/web/scrape/start', data, { timeout: 30000 }),
+  webScrapeProgress: (jobId) => api.get('/parser/web/scrape/progress', { params: { job_id: jobId } }),
+  webScrapeStop: (jobId) => api.post('/parser/web/scrape/stop', null, { params: { job_id: jobId } }),
+  webScrapeResults: (jobId) => api.get('/parser/web/scrape/results', {
+    params: { job_id: jobId },
+    responseType: 'blob',
+  }),
+  webScrapeListJobs: () => api.get('/parser/web/scrape/jobs'),
 }
 
 // ── COMMENTING (нейрокомментинг) ─────────────────────────────
