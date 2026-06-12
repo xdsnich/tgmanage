@@ -187,6 +187,14 @@ async def _dispatch_plans():
             )
             plans.extend(list(warmup_result.scalars().all()))
 
+            # ═══ ФИЛЬТРАЦИЯ: собираем только готовые ═══
+            # Раньше делали send_task прямо в цикле, и при batch'е 100+
+            # planов это превращалось в thundering herd (см. инцидент
+            # 2026-06-12: 166 Telethon-сессий за 2 сек, 5-6 акков на один
+            # IP синхронно → Telegram mass revoke).
+            # Теперь: сначала собираем все ready planы, потом размазываем
+            # старты по времени через countdown с jitter'ом.
+            ready_plans = []
             for plan in plans:
                 sessions = plan.plan.get("sessions", [])
                 if plan.executed_idx >= len(sessions):
@@ -225,11 +233,39 @@ async def _dispatch_plans():
                     skipped += 1
                     continue
 
-                # Отправляем задачу
+                ready_plans.append(plan)
+
+            # ═══ STAGGER ═══
+            # Размазываем старты в окне countdown_window_sec, чтобы НИКОГДА
+            # не было burst'а. Размер окна растёт с размером батча, но
+            # ограничен сверху (DISPATCH_STAGGER_MAX_SEC) — иначе очень
+            # долгий tail.
+            # Формула: window = max(MIN, min(MAX, N * PER_PLAN_SEC))
+            # Дефолты подобраны так, чтобы при IP_COOLDOWN_SEC=900 (15 мин)
+            # и ~34 прокси на одном IP реально стартовало ≤ 1 акка
+            # за окно cooldown'а: 200 planов × 30с = 100 мин окна,
+            # делим на 34 прокси = ~3 минуты между стартами на один IP.
+            import random as _rand
+            _rand.shuffle(ready_plans)
+            stagger_min  = int(os.getenv("DISPATCH_STAGGER_MIN_SEC", "30"))
+            stagger_max  = int(os.getenv("DISPATCH_STAGGER_MAX_SEC", "3600"))
+            per_plan_sec = float(os.getenv("DISPATCH_STAGGER_PER_PLAN_SEC", "30"))
+            window_sec = max(stagger_min, min(stagger_max, int(len(ready_plans) * per_plan_sec)))
+
+            if ready_plans:
+                logger.info(
+                    f"[plan_dispatch] STAGGER: {len(ready_plans)} planов размазываем "
+                    f"по {window_sec}с (≈{window_sec/60:.1f} мин)"
+                )
+
+            for plan in ready_plans:
+                # Full jitter: countdown ∈ [0, window_sec]
+                countdown = _rand.uniform(0, window_sec)
                 celery_app.send_task(
                     "tasks.plan_executor.execute_plan_session",
                     args=[plan.id],
                     queue="plans",
+                    countdown=countdown,
                 )
                 dispatched += 1
 
@@ -326,6 +362,7 @@ async def _execute_plan_session(plan_id: int):
     from utils.telegram import make_telethon_client
     from utils.account_lock import acquire_account_lock, release_account_lock
     from utils.user_lock import acquire_user_slot, release_user_slot
+    from utils.ip_throttle import acquire_ip_lock, get_ip_cooldown_remaining
     from utils.db_pool import async_session as Session
     from services.llm import generate_comment, build_comment_prompt
     from tasks.behavior_engine import assign_style_profile
@@ -434,6 +471,36 @@ async def _execute_plan_session(plan_id: int):
                         select(Proxy).where(Proxy.id == acc.proxy_id)
                     )).scalar_one_or_none()
 
+                # ═══ PER-IP COOLDOWN (anti-burst) ═══
+                # Защита от инцидента 2026-06-12: на одном IP не должно
+                # быть второй Telegram-сессии ближе чем через 10-15 мин.
+                # Если IP занят — НЕ запускаем сессию сейчас, а отправляем
+                # план в очередь снова с countdown = оставшийся TTL + jitter.
+                # Аккаунт-lock и user-slot отпускаем — пусть другие
+                # планы их используют.
+                if proxy and not acquire_ip_lock(proxy):
+                    remaining = get_ip_cooldown_remaining(proxy)
+                    defer_sec = remaining + random.uniform(30, 180)
+                    logger.info(
+                        f"[plan] IP {proxy.host}:{proxy.port} в cooldown "
+                        f"({remaining}с), откладываю plan #{plan.id} на {defer_sec:.0f}с"
+                    )
+                    release_user_slot(acc.user_id)
+                    slot_user_id = None
+                    release_account_lock(plan.account_id)
+                    celery_app.send_task(
+                        "tasks.plan_executor.execute_plan_session",
+                        args=[plan.id],
+                        queue="plans",
+                        countdown=defer_sec,
+                    )
+                    return {"status": "ip_cooldown", "defer_sec": int(defer_sec)}
+
+                # Объявляем client до try, чтобы finally:disconnect()
+                # никогда не падал на NameError. До этого момента upstream
+                # exception оставлял sqlite-сессию залоченной (WinError 32
+                # в logs/api.log 2026-06-12), потому что finally падал и
+                # последующий disconnect не выполнялся.
                 client = make_telethon_client(acc, proxy)
                 if not client:
                     plan.executed_idx += 1
@@ -1330,10 +1397,23 @@ async def _execute_plan_session(plan_id: int):
                                      detail=f"Ошибка сессии: {str(e)[:200]}", success=False,
                                      source=plan_source, campaign_id=plan_campaign_id)
                 finally:
+                    # Защищаем от NameError если client не успел создаться
+                    # (например, exception до make_telethon_client) И от
+                    # AttributeError если объект — пустой.
                     try:
-                        await client.disconnect()
-                    except:
+                        if client is not None:
+                            await client.disconnect()
+                    except Exception:
                         pass
+                    finally:
+                        # Принудительно закрываем session-файл — без этого
+                        # на Windows .session держится залоченным даже
+                        # после disconnect (sqlite + WAL).
+                        try:
+                            if client is not None and getattr(client, "session", None):
+                                client.session.close()
+                        except Exception:
+                            pass
 
                 logger.info(f"[plan][{phone}] ═══ Сессия {sess_num}/{total_sess} завершена: {done_actions}/{len(actions)} действий ═══")
                 await _safe_log(db,
