@@ -197,25 +197,66 @@ def check_accounts_bulk(self, accounts: list[dict], check_spam: bool = False) ->
 
     self.update_state(state="PROGRESS",
                       meta={"current": 0, "total": total, "message": "Начинаю проверку..."})
+    print(f"\n🔍 [check_accounts_bulk] Старт проверки {total} аккаунтов")
 
     for i, account in enumerate(accounts):
         phone = account.get("phone", "?")
+        acc_id = account.get("id")
         self.update_state(state="PROGRESS",
                           meta={"current": i + 1, "total": total,
                                 "percent": int((i + 1) / total * 100),
                                 "message": f"[{i+1}/{total}] Проверяю {phone}..."})
+        print(f"🔍 [{i+1}/{total}] {phone} — старт")
 
         try:
             result = run_async(_check_account_with_proxy(account, check_spam))
-            results.append({"success": True, "phone": phone,
-                            "status": result.get("status"), "trust_score": result.get("trust_score")})
+            status = result.get("status", "unknown")
+            err = result.get("error")
+            ts = result.get("trust_score")
+            # Эмодзи в логе чтобы взгляд быстро ловил frozen
+            emoji = {"active": "✅", "spamblock": "⚠️", "frozen": "❌",
+                     "error": "❌", "unknown": "❓"}.get(status, "❓")
+            tail = f"trust={ts}" if ts is not None else ""
+            if err:
+                tail = (tail + f" err={err[:60]}").strip()
+            print(f"🔍 [{i+1}/{total}] {phone} → {emoji} {status} {tail}".rstrip())
+
+            results.append({
+                "success": True,
+                "id": acc_id,
+                "phone": phone,
+                "status": status,
+                "trust_score": ts,
+                "error": err,
+            })
         except Exception as e:
-            results.append({"success": False, "phone": phone, "error": str(e)})
+            err_short = str(e)[:200]
+            print(f"🔍 [{i+1}/{total}] {phone} → 💥 EXCEPTION: {err_short}")
+            results.append({
+                "success": False,
+                "id": acc_id,
+                "phone": phone,
+                "status": "error",
+                "error": err_short,
+            })
 
     active = sum(1 for r in results if r.get("status") == "active")
     spam = sum(1 for r in results if r.get("status") == "spamblock")
+    frozen = sum(1 for r in results if r.get("status") == "frozen")
+    errors = sum(1 for r in results if r.get("status") in ("error", "unknown"))
+    print(
+        f"🔍 [check_accounts_bulk] Готово: {active} active, {spam} spam, "
+        f"{frozen} frozen, {errors} errors из {total}\n"
+    )
 
-    return {"total": total, "active": active, "spam": spam, "results": results}
+    return {
+        "total": total,
+        "active": active,
+        "spam": spam,
+        "frozen": frozen,
+        "errors": errors,
+        "results": results,
+    }
 
 
 @celery_app.task(bind=True, name="tasks.account_tasks.authorize_account")

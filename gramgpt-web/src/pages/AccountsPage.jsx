@@ -70,6 +70,7 @@ export default function AccountsPage() {
   const [bulkExporting, setBulkExporting] = useState(false)
   const [checkProgress, setCheckProgress] = useState(null) // {current, total, taskId}
   const [checking, setChecking] = useState(false)
+  const [checkResults, setCheckResults] = useState(null)   // {summary, results[]}
 
   // Запуск проверки выбранных аккаунтов: жмёт /tasks/check-accounts с
   // account_ids, ловит task_id, поллит /tasks/{id} раз в 2 сек до конца,
@@ -101,13 +102,21 @@ export default function AccountsPage() {
             setChecking(false)
             const r = st.result || {}
             const okStr = st.status === 'SUCCESS'
-              ? `✅ Проверено ${r.total || total}: ${r.active || 0} активных, ${r.spam || 0} спам`
+              ? `✅ Проверено ${r.total || total}: ${r.active || 0} active · ${r.spam || 0} spam · ${r.frozen || 0} frozen · ${r.errors || 0} err`
               : `❌ Ошибка: ${st.error || 'не удалось'}`
             setCheckProgress({
               current: r.total || total, total: r.total || total,
               taskId, status: st.status === 'SUCCESS' ? 'done' : 'error',
               message: okStr,
             })
+            // Открываем модал с детальными результатами по каждому акку
+            if (st.status === 'SUCCESS' && Array.isArray(r.results)) {
+              setCheckResults({
+                total: r.total, active: r.active, spam: r.spam,
+                frozen: r.frozen, errors: r.errors,
+                results: r.results,
+              })
+            }
             await load()
             setTimeout(() => setCheckProgress(null), 5000)
           }
@@ -1426,6 +1435,83 @@ export default function AccountsPage() {
           <Button variant="ghost" size="sm" onClick={clearSelection}>Снять выбор</Button>
         </div>
       )}
+
+      {/* ══ Check-accounts: модал с детальными результатами ══ */}
+      <Modal
+        open={!!checkResults}
+        onClose={() => setCheckResults(null)}
+        title="🔍 Результаты проверки аккаунтов"
+        width={680}
+      >
+        {checkResults && (() => {
+          const STATUS_META = {
+            active:    { emoji: '✅', label: 'Живой',     color: 'var(--green)' },
+            spamblock: { emoji: '⚠️', label: 'Спамблок',  color: '#f59e0b' },
+            frozen:    { emoji: '❌', label: 'Заморожен', color: 'var(--red)' },
+            error:     { emoji: '💥', label: 'Ошибка',    color: 'var(--red)' },
+            unknown:   { emoji: '❓', label: 'Неизвестно', color: 'var(--text-3)' },
+          }
+          const rows = [...checkResults.results].sort((a, b) => {
+            // Сначала проблемные (frozen/error/spam), потом active
+            const order = { frozen: 0, error: 1, spamblock: 2, unknown: 3, active: 4 }
+            return (order[a.status] ?? 5) - (order[b.status] ?? 5)
+          })
+          return (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+              {/* Сводка */}
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8 }}>
+                <div style={{ padding: 10, borderRadius: 8, background: 'rgba(34,197,94,0.12)', textAlign: 'center' }}>
+                  <div style={{ fontSize: 11, color: 'var(--text-3)' }}>✅ Живых</div>
+                  <div style={{ fontSize: 20, fontWeight: 700, color: 'var(--green)' }}>{checkResults.active || 0}</div>
+                </div>
+                <div style={{ padding: 10, borderRadius: 8, background: 'rgba(245,158,11,0.12)', textAlign: 'center' }}>
+                  <div style={{ fontSize: 11, color: 'var(--text-3)' }}>⚠️ Спам</div>
+                  <div style={{ fontSize: 20, fontWeight: 700, color: '#f59e0b' }}>{checkResults.spam || 0}</div>
+                </div>
+                <div style={{ padding: 10, borderRadius: 8, background: 'rgba(239,68,68,0.12)', textAlign: 'center' }}>
+                  <div style={{ fontSize: 11, color: 'var(--text-3)' }}>❌ Заморожен</div>
+                  <div style={{ fontSize: 20, fontWeight: 700, color: 'var(--red)' }}>{checkResults.frozen || 0}</div>
+                </div>
+                <div style={{ padding: 10, borderRadius: 8, background: 'rgba(168,85,247,0.12)', textAlign: 'center' }}>
+                  <div style={{ fontSize: 11, color: 'var(--text-3)' }}>💥 Ошибок</div>
+                  <div style={{ fontSize: 20, fontWeight: 700, color: 'var(--violet)' }}>{checkResults.errors || 0}</div>
+                </div>
+              </div>
+
+              {/* Таблица по каждому акку */}
+              <div style={{ maxHeight: 380, overflowY: 'auto', border: '1px solid var(--border)', borderRadius: 10 }}>
+                {rows.map((r, i) => {
+                  const meta = STATUS_META[r.status] || STATUS_META.unknown
+                  return (
+                    <div key={i} style={{
+                      display: 'grid',
+                      gridTemplateColumns: '24px 1fr 120px 1fr',
+                      gap: 10, padding: '10px 14px', alignItems: 'center',
+                      borderBottom: i < rows.length - 1 ? '1px solid var(--border)' : 'none',
+                      background: r.status === 'frozen' || r.status === 'error' ? 'rgba(239,68,68,0.04)' : 'transparent',
+                    }}>
+                      <span style={{ fontSize: 16 }}>{meta.emoji}</span>
+                      <span style={{ fontSize: 13, fontWeight: 600 }}>{r.phone}</span>
+                      <span style={{ fontSize: 12, fontWeight: 600, color: meta.color }}>{meta.label}</span>
+                      <span style={{ fontSize: 11, color: 'var(--text-3)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {r.error || (r.trust_score != null ? `trust: ${r.trust_score}` : '')}
+                      </span>
+                    </div>
+                  )
+                })}
+              </div>
+
+              <div style={{ fontSize: 11, color: 'var(--text-3)', textAlign: 'center' }}>
+                Подробнее в logs/celery_worker.console.log
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+                <Button variant="ghost" onClick={() => setCheckResults(null)}>Закрыть</Button>
+              </div>
+            </div>
+          )
+        })()}
+      </Modal>
 
       {/* ══ Check-accounts progress banner ══ */}
       {checkProgress && (() => {
