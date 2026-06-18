@@ -96,7 +96,7 @@ export default function AccountsPage() {
 
     // Генерируем job_id для прогресса/отмены
     const jobId = (crypto.randomUUID && crypto.randomUUID()) ||
-                  `job_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+      `job_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
     setExportJobId(jobId)
     setExportProgress({ status: 'running', current: 0, total: selectedIds.size, ok: 0, failed: 0, current_phone: '', message: 'Запуск...' })
     setBulkExporting(true)
@@ -359,16 +359,21 @@ export default function AccountsPage() {
           <Input placeholder="🔍  Поиск..." value={search} onChange={e => setSearch(e.target.value)} />
         </div>
         <div style={{ display: 'flex', gap: 6 }}>
-          {STATUS_FILTERS.map(({ key, label }) => (
-            <button key={key} onClick={() => setFilterStatus(key)} style={{
-              padding: '9px 14px', borderRadius: 10, cursor: 'pointer',
-              border: `1px solid ${filterStatus === key ? 'rgba(124,77,255,0.4)' : 'var(--border)'}`,
-              background: filterStatus === key ? 'rgba(124,77,255,0.15)' : 'transparent',
-              color: filterStatus === key ? 'var(--violet)' : 'var(--text-2)',
-              fontSize: 12, fontWeight: filterStatus === key ? 600 : 400,
-              transition: 'all 0.15s',
-            }}>{label}</button>
-          ))}
+          {STATUS_FILTERS.map(({ key, label }) => {
+            const count = key === 'all'
+              ? accounts.length
+              : accounts.filter(a => a.status === key).length
+            return (
+              <button key={key} onClick={() => setFilterStatus(key)} style={{
+                padding: '9px 14px', borderRadius: 10, cursor: 'pointer',
+                border: `1px solid ${filterStatus === key ? 'rgba(124,77,255,0.4)' : 'var(--border)'}`,
+                background: filterStatus === key ? 'rgba(124,77,255,0.15)' : 'transparent',
+                color: filterStatus === key ? 'var(--violet)' : 'var(--text-2)',
+                fontSize: 12, fontWeight: filterStatus === key ? 600 : 400,
+                transition: 'all 0.15s',
+              }}>{label} <span style={{ opacity: 0.6, marginLeft: 4 }}>{count}</span></button>
+            )
+          })}
         </div>
       </div>
 
@@ -934,8 +939,10 @@ export default function AccountsPage() {
                   const done = myIdx < curIdx
                   const active = myIdx === curIdx
                   return (
-                    <div key={s.key} style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12,
-                      color: done ? 'var(--green)' : active ? 'var(--violet)' : 'var(--text-3)' }}>
+                    <div key={s.key} style={{
+                      display: 'flex', alignItems: 'center', gap: 8, fontSize: 12,
+                      color: done ? 'var(--green)' : active ? 'var(--violet)' : 'var(--text-3)'
+                    }}>
                       <span style={{ width: 14 }}>{done ? '✓' : active ? '◐' : '○'}</span>
                       <span style={{ fontWeight: active ? 600 : 400 }}>{s.label}</span>
                     </div>
@@ -1105,7 +1112,7 @@ export default function AccountsPage() {
                     // Шаг 1: Детектим аккаунты
                     const { data } = await accountsAPI.detectTData(importFiles[0])
                     setTdataSessionId(data.session_id)
-                    setTdataDetected(data.accounts.map(a => ({ ...a, proxy_string: '' })))
+                    setTdataDetected(data.accounts.map(a => ({ ...a, proxy_string: a.proxy_string || '', selected: true })))
                     setTdataStep('assign')
                     setImporting(false)
                     return // Не закрываем модал — показываем таблицу
@@ -1131,12 +1138,37 @@ export default function AccountsPage() {
             }}>← Назад</button>
 
             <div style={{ padding: '10px 14px', background: 'rgba(61,214,140,0.08)', border: '1px solid rgba(61,214,140,0.2)', borderRadius: 10, fontSize: 13, color: 'var(--green)' }}>
-              Найдено {tdataDetected.length} аккаунтов. Назначьте прокси и нажмите "Импортировать".
+              Найдено {tdataDetected.length} аккаунтов. Отметьте нужные, назначьте прокси и нажмите "Импортировать".
             </div>
 
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {/* Чекбокс "Выбрать все" */}
+            <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', padding: '4px 8px' }}>
+              <input type="checkbox"
+                checked={tdataDetected.every(a => a.selected)}
+                onChange={e => {
+                  const checked = e.target.checked
+                  setTdataDetected(prev => prev.map(a => ({ ...a, selected: checked })))
+                }}
+                style={{ width: 16, height: 16, accentColor: 'var(--violet)' }}
+              />
+              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-2)' }}>
+                Выбрать все ({tdataDetected.filter(a => a.selected).length} из {tdataDetected.length})
+              </span>
+            </label>
+
+            {/* Список аккаунтов с прокруткой */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: '45vh', overflowY: 'auto', paddingRight: 6 }}>
               {tdataDetected.map((acc, i) => (
-                <div key={i} style={{ padding: '12px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, display: 'flex', alignItems: 'center', gap: 12 }}>
+                <div key={i} style={{
+                  padding: '12px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)',
+                  borderRadius: 10, display: 'flex', alignItems: 'center', gap: 12,
+                  opacity: acc.selected ? 1 : 0.5, transition: 'opacity 0.2s'
+                }}>
+                  <input type="checkbox"
+                    checked={acc.selected}
+                    onChange={e => setTdataDetected(prev => prev.map((a, j) => j === i ? { ...a, selected: e.target.checked } : a))}
+                    style={{ width: 18, height: 18, accentColor: 'var(--violet)', cursor: 'pointer' }}
+                  />
                   <div style={{ flex: '0 0 30px', fontSize: 18, textAlign: 'center' }}>👤</div>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontWeight: 600, fontSize: 13 }}>{acc.name || 'Без имени'}</div>
@@ -1144,6 +1176,7 @@ export default function AccountsPage() {
                   </div>
                   <div style={{ flex: '0 0 280px' }}>
                     <input
+                      disabled={!acc.selected}
                       value={acc.proxy_string}
                       onChange={e => setTdataDetected(prev => prev.map((a, j) => j === i ? { ...a, proxy_string: e.target.value } : a))}
                       placeholder="ip:port:login:password"
@@ -1154,16 +1187,15 @@ export default function AccountsPage() {
               ))}
             </div>
 
-            {/* Быстрое назначение одного прокси всем */}
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-              <input id="bulk-proxy" placeholder="Один прокси для всех (ip:port:login:password)" style={{ flex: 1, padding: '8px 12px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 12, outline: 'none', fontFamily: 'monospace' }} />
+            {/* Быстрое назначение одного прокси ВЫБРАННЫМ */}
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 6 }}>
+              <input id="bulk-proxy" placeholder="Один прокси для выбранных (ip:port:log:pass)" style={{ flex: 1, padding: '8px 12px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 12, outline: 'none', fontFamily: 'monospace' }} />
               <Button variant="outline" size="sm" onClick={() => {
                 const v = document.getElementById('bulk-proxy')?.value || ''
-                if (v) setTdataDetected(prev => prev.map(a => ({ ...a, proxy_string: v })))
-              }}>Применить ко всем</Button>
+                if (v) setTdataDetected(prev => prev.map(a => a.selected ? { ...a, proxy_string: v } : a))
+              }}>Применить к выбранным</Button>
             </div>
 
-            {/* Или выбрать из существующих */}
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
               <select id="bulk-proxy-select"
                 onFocus={async () => { if (!importProxies.length) { try { const { data } = await proxiesAPI.list(); setImportProxies(data) } catch { } } }}
@@ -1173,7 +1205,7 @@ export default function AccountsPage() {
               </select>
               <Button variant="outline" size="sm" onClick={() => {
                 const v = document.getElementById('bulk-proxy-select')?.value || ''
-                if (v) setTdataDetected(prev => prev.map(a => ({ ...a, proxy_string: v })))
+                if (v) setTdataDetected(prev => prev.map(a => a.selected ? { ...a, proxy_string: v } : a))
               }}>Применить</Button>
             </div>
 
@@ -1197,44 +1229,47 @@ export default function AccountsPage() {
               </div>
             )}
 
-            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 10 }}>
               <Button variant="ghost" onClick={() => { setImportModal(false); setTdataStep('upload'); setTdataDetected([]); setImportResult(null) }}>Закрыть</Button>
-              <Button variant="primary" loading={importing} onClick={async () => {
-                setImporting(true); setImportResult(null)
-                try {
-                  const accounts = tdataDetected.map(a => ({ index: a.index, proxy_string: a.proxy_string }))
-                  const { data } = await accountsAPI.importTDataBatch(tdataSessionId, accounts)
-                  const failed = (data.results || []).filter(r => !r.success)
-                  if (data.success > 0) {
-                    setImportResult({
-                      success: true,
-                      message: `Импортировано ${data.success}/${data.total} аккаунтов`
-                                + (failed.length ? `. С ошибками: ${failed.length}.` : ''),
-                      failed,
-                    })
-                    await load()
-                    // Если все ок — авто-закрытие. Если были фейлы — оставляем
-                    // модалку открытой чтобы юзер прочитал ошибки.
-                    if (failed.length === 0) {
-                      setTimeout(() => {
-                        setImportModal(false); setTdataStep('upload')
-                        setTdataDetected([]); setImportResult(null)
-                      }, 1500)
+              <Button variant="primary" loading={importing}
+                disabled={tdataDetected.filter(a => a.selected).length === 0}
+                onClick={async () => {
+                  const selectedAccounts = tdataDetected.filter(a => a.selected)
+                  if (selectedAccounts.length === 0) return
+
+                  setImporting(true); setImportResult(null)
+                  try {
+                    const accountsPayload = selectedAccounts.map(a => ({ index: a.index, proxy_string: a.proxy_string }))
+                    const { data } = await accountsAPI.importTDataBatch(tdataSessionId, accountsPayload)
+
+                    const failed = (data.results || []).filter(r => !r.success)
+                    if (data.success > 0) {
+                      setImportResult({
+                        success: true,
+                        message: `Импортировано ${data.success}/${selectedAccounts.length} аккаунтов`
+                          + (failed.length ? `. С ошибками: ${failed.length}.` : ''),
+                        failed,
+                      })
+                      await load()
+                      if (failed.length === 0) {
+                        setTimeout(() => {
+                          setImportModal(false); setTdataStep('upload')
+                          setTdataDetected([]); setImportResult(null)
+                        }, 1500)
+                      }
+                    } else {
+                      setImportResult({
+                        success: false,
+                        message: `Не импортирован ни один аккаунт (${selectedAccounts.length}). Причины:`,
+                        failed,
+                      })
                     }
-                  } else {
-                    // Ни один не прошёл — показываем все ошибки построчно
-                    setImportResult({
-                      success: false,
-                      message: `Не импортирован ни один аккаунт (${data.total}). Причины:`,
-                      failed,
-                    })
+                  } catch (err) {
+                    setImportResult({ success: false, message: err.response?.data?.detail || 'Ошибка импорта', failed: [] })
                   }
-                } catch (err) {
-                  setImportResult({ success: false, message: err.response?.data?.detail || 'Ошибка импорта', failed: [] })
-                }
-                setImporting(false)
-              }}>
-                📦 Импортировать {tdataDetected.length} аккаунтов
+                  setImporting(false)
+                }}>
+                📦 Импортировать {tdataDetected.filter(a => a.selected).length} акк.
               </Button>
             </div>
           </div>
