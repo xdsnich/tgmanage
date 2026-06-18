@@ -224,8 +224,11 @@ export const proxiesAPI = {
 
 // ── TASKS ────────────────────────────────────────────────────
 export const tasksAPI = {
-  checkAccounts: (check_spam = false) =>
-    api.post('/tasks/check-accounts', { check_spam }),
+  checkAccounts: (check_spam = false, account_ids = null) =>
+    api.post('/tasks/check-accounts', {
+      check_spam,
+      ...(account_ids && account_ids.length ? { account_ids } : {}),
+    }),
 
   checkProxies: () =>
     api.post('/tasks/check-proxies'),

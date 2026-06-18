@@ -36,6 +36,12 @@ async def start_check_accounts(
 ):
     """
     Запускает мультипоточную проверку аккаунтов в фоне.
+
+    body:
+      check_spam: bool — гонять @SpamBot? (~15 сек/аккаунт)
+      account_ids: list[int] | None — если передан, проверяем
+        только эти. Если пусто/нет — проверяем ВСЕХ аккаунтов юзера.
+
     Возвращает task_id для отслеживания прогресса.
     """
     from services.accounts import get_accounts
@@ -44,9 +50,21 @@ async def start_check_accounts(
     if not accounts:
         raise HTTPException(status_code=400, detail="Нет аккаунтов для проверки")
 
+    # Фильтр по конкретным account_ids — если передан
+    account_ids = body.get("account_ids") or None
+    if account_ids:
+        wanted = set(int(x) for x in account_ids)
+        accounts = [a for a in accounts if a.id in wanted]
+        if not accounts:
+            raise HTTPException(
+                status_code=400,
+                detail="Указанные аккаунты не найдены среди твоих",
+            )
+
     # Конвертируем в dict для передачи в Celery
     accounts_data = [
         {
+            "id": a.id,
             "phone": a.phone,
             "session_file": a.session_file,
             "status": a.status.value,

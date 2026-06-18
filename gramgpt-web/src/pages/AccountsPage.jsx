@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { accountsAPI, importAPI, proxiesAPI, channelsAPI, diagnosticsAPI, apiAppsAPI, accountMediaAPI } from '../services/api'
+import { accountsAPI, importAPI, proxiesAPI, channelsAPI, diagnosticsAPI, apiAppsAPI, accountMediaAPI, tasksAPI } from '../services/api'
 import WebSessionImport from './WebSessionImport'
 import { proxyLabel, countryFlag } from '../utils/proxy'
 import { Card, Button, Input, Modal, TrustBar, StatusBadge, Empty, Spinner, Badge } from '../components/ui'
@@ -68,6 +68,51 @@ export default function AccountsPage() {
   }
 
   const [bulkExporting, setBulkExporting] = useState(false)
+  const [checkProgress, setCheckProgress] = useState(null) // {current, total, taskId}
+  const [checking, setChecking] = useState(false)
+
+  // Запуск проверки выбранных аккаунтов: жмёт /tasks/check-accounts с
+  // account_ids, ловит task_id, поллит /tasks/{id} раз в 2 сек до конца,
+  // потом refresh списка чтобы статусы (active/frozen/spamblock) обновились.
+  const handleCheckSelected = async () => {
+    if (!selectedIds.size) return
+    if (!window.confirm(`Проверить статус ${selectedIds.size} аккаунтов?\n\nЭто подключится к каждому через прокси и обновит статус (active/frozen/spamblock).`)) return
+    setChecking(true)
+    setCheckProgress({ current: 0, total: selectedIds.size, taskId: null })
+    try {
+      const { data } = await tasksAPI.checkAccounts(false, [...selectedIds])
+      const taskId = data.task_id
+      setCheckProgress(p => ({ ...p, taskId, total: data.total || p.total }))
+
+      // Поллинг прогресса
+      const poll = setInterval(async () => {
+        try {
+          const { data: st } = await tasksAPI.getStatus(taskId)
+          const meta = st.info || st.meta || {}
+          const current = meta.current || 0
+          const total = meta.total || selectedIds.size
+          setCheckProgress({ current, total, taskId, message: meta.message })
+          if (st.state === 'SUCCESS' || st.state === 'FAILURE') {
+            clearInterval(poll)
+            setChecking(false)
+            const r = st.result || {}
+            const okStr = `✅ Проверено ${r.total || total}: ${r.active || 0} активных, ${r.spam || 0} спам`
+            setCheckProgress({ ...checkProgress, status: st.state === 'SUCCESS' ? 'done' : 'error', message: okStr })
+            await load()
+            setTimeout(() => setCheckProgress(null), 5000)
+          }
+        } catch (e) {
+          clearInterval(poll)
+          setChecking(false)
+          setCheckProgress(null)
+        }
+      }, 2000)
+    } catch (e) {
+      setChecking(false)
+      setCheckProgress(null)
+      alert(e.response?.data?.detail || 'Ошибка запуска проверки')
+    }
+  }
   const [exportProgress, setExportProgress] = useState(null) // {current, total, ok, failed, current_phone, status}
   const [exportJobId, setExportJobId] = useState(null)
   const exportPollRef = useRef(null)
@@ -1363,9 +1408,48 @@ export default function AccountsPage() {
             title="Экспортировать TData всех выбранных аккаунтов в один ZIP-архив">
             📦 Экспорт TData
           </Button>
+          <Button variant="outline" size="sm" loading={checking}
+            onClick={handleCheckSelected}
+            title="Подключиться к каждому через прокси и обновить статус (active/frozen/spamblock)">
+            ✅ Проверить
+          </Button>
           <Button variant="ghost" size="sm" onClick={clearSelection}>Снять выбор</Button>
         </div>
       )}
+
+      {/* ══ Check-accounts progress banner ══ */}
+      {checkProgress && (() => {
+        const pct = Math.min(100, Math.round((checkProgress.current / Math.max(1, checkProgress.total)) * 100))
+        const isDone = checkProgress.status === 'done'
+        const isError = checkProgress.status === 'error'
+        const color = isDone ? 'var(--green)' : isError ? 'var(--red)' : 'var(--violet)'
+        return (
+          <div style={{
+            position: 'fixed', bottom: 90, left: '50%', transform: 'translateX(-50%)',
+            zIndex: 99, background: 'var(--bg-2)',
+            border: `2px solid ${color}`, borderRadius: 14, padding: '14px 22px',
+            minWidth: 360, maxWidth: 640,
+            boxShadow: '0 10px 40px rgba(0,0,0,0.5)',
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+              <div style={{ fontWeight: 700, color, fontSize: 13 }}>
+                {isDone ? '✅' : isError ? '❌' : '🔍'} Проверка аккаунтов
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--text-2)' }}>
+                {checkProgress.current} / {checkProgress.total} · {pct}%
+              </div>
+            </div>
+            <div style={{ height: 6, borderRadius: 3, background: 'var(--bg-3)', overflow: 'hidden' }}>
+              <div style={{ height: '100%', width: `${pct}%`, background: color, transition: 'width 0.4s ease' }} />
+            </div>
+            {checkProgress.message && (
+              <div style={{ marginTop: 6, fontSize: 11, color: 'var(--text-3)' }}>
+                {checkProgress.message}
+              </div>
+            )}
+          </div>
+        )
+      })()}
 
       {/* ══ Bulk media upload modal ══ */}
       <Modal open={bulkMediaModal} onClose={() => setBulkMediaModal(false)}

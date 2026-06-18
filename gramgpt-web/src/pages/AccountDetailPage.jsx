@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { accountsAPI, securityAPI, channelsAPI, actionsAPI, tgAuthAPI, proxiesAPI, apiAppsAPI, accountMediaAPI } from '../services/api'
+import { accountsAPI, securityAPI, channelsAPI, actionsAPI, tgAuthAPI, proxiesAPI, apiAppsAPI, accountMediaAPI, tasksAPI } from '../services/api'
 import { proxyLabel } from '../utils/proxy'
 import { Card, Button, Input, Modal, TrustBar, StatusBadge, Badge, Spinner, Empty } from '../components/ui'
 
@@ -385,6 +385,46 @@ export default function AccountDetailPage() {
     setSaving(false)
   }
 
+  // Проверка живости конкретного аккаунта: гонит /tasks/check-accounts
+  // с одним account_id, поллит прогресс, потом перезагружает acc.
+  const handleCheckAccount = async () => {
+    setSaving(true)
+    showToast('🔍 Проверяю аккаунт через прокси...', 'info')
+    try {
+      const { data } = await tasksAPI.checkAccounts(false, [parseInt(id)])
+      const taskId = data.task_id
+      // Поллим до завершения
+      const poll = setInterval(async () => {
+        try {
+          const { data: st } = await tasksAPI.getStatus(taskId)
+          if (st.state === 'SUCCESS' || st.state === 'FAILURE') {
+            clearInterval(poll)
+            const r = st.result || {}
+            const found = (r.results || [])[0]
+            const status = found?.status || 'unknown'
+            const label = status === 'active' ? '✅ Аккаунт живой'
+              : status === 'spamblock' ? '⚠ Спамблок'
+              : status === 'frozen' ? '❌ Заморожен'
+              : `Статус: ${status}`
+            showToast(label, status === 'active' ? 'success' : 'error')
+            // перезагружаем детали аккаунта
+            try {
+              const { data: fresh } = await accountsAPI.get(id)
+              setAccount(fresh)
+            } catch {}
+            setSaving(false)
+          }
+        } catch {
+          clearInterval(poll)
+          setSaving(false)
+        }
+      }, 1500)
+    } catch (err) {
+      showToast(err.response?.data?.detail || 'Ошибка запуска проверки', 'error')
+      setSaving(false)
+    }
+  }
+
   const handleSendCode = async () => {
     setSaving(true); setAuthMsg('')
     try {
@@ -716,6 +756,10 @@ export default function AccountDetailPage() {
               </Button>
               <Button variant="ghost" size="sm" onClick={handleExportTData} loading={saving} style={{ width: '100%' }}>
                 📦 Экспорт TData (ZIP)
+              </Button>
+              <Button variant="outline" size="sm" onClick={handleCheckAccount} loading={saving} style={{ width: '100%' }}
+                title="Подключиться через прокси и проверить — живой ли аккаунт">
+                ✅ Проверить аккаунт
               </Button>
             </div>
           </Card>
