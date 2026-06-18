@@ -151,10 +151,14 @@ celery_app.conf.update(
         # dispatch-warmups ОТКЛЮЧЁН: родной warmup_v2-движок больше не исполняет
         # прогрев. Прогрев теперь гоняет plan_executor (см. dispatch-plans),
         # чтобы план ВСЕГДА совпадал с выполнением (был баг двойного движка).
-        "process-ai-dialogs": {
-            "task": "tasks.ai_tasks.process_ai_dialogs",
-            "schedule": 60.0,
-            "options": {"queue": "ai_dialogs"},
-        },
+        #
+        # process-ai-dialogs ОТКЛЮЧЁН (по запросу 2026-06-13):
+        # пока идёт стабилизация после инцидента с потерей 200 акков —
+        # не дёргаем AI-сценарии вообще. Включить обратно: вернуть блок.
+        # "process-ai-dialogs": {
+        #     "task": "tasks.ai_tasks.process_ai_dialogs",
+        #     "schedule": 60.0,
+        #     "options": {"queue": "ai_dialogs"},
+        # },
     },
 )

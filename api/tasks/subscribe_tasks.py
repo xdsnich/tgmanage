@@ -133,6 +133,23 @@ async def _run_subscribe_task(task_data: dict):
                         failed += 1
                     continue
 
+                # ── Per-IP cooldown ──────────────────────
+                # Не подключаемся если этот же IP только что использовался
+                # warmup'ом/комментингом/AI-диалогом — ждём пока IP отдохнёт.
+                # Subscribe не критичен по времени, можно подождать.
+                from utils.ip_throttle import acquire_ip_lock, get_ip_cooldown_remaining
+                if not acquire_ip_lock(proxy):
+                    remaining = get_ip_cooldown_remaining(proxy)
+                    logger.info(
+                        f"[subscribe] {acc.phone} IP {proxy.host}:{proxy.port} "
+                        f"в cooldown ({remaining}с) — пропуск"
+                    )
+                    for ch in channels:
+                        results.append({"account_id": acc_id, "channel": ch, "phone": acc.phone,
+                                        "ok": False, "detail": f"IP в cooldown ({remaining}с)"})
+                        skipped += 1
+                    continue
+
                 # ── ОДНО подключение на аккаунт ──────────
                 client = make_telethon_client(acc, proxy)
                 if not client:

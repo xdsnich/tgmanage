@@ -57,14 +57,67 @@ async def _get_client_for_phone(phone: str):
 # ── Универсальная обёртка ────────────────────────────────────
 
 async def _run_bulk(accounts, action_fn, action_name):
-    """Выполняет action_fn(client, phone) для каждого аккаунта с прокси."""
+    """Выполняет action_fn(client, phone) для каждого аккаунта с прокси.
+
+    Координация с warmup/commenting:
+      - acquire_account_lock — чтобы bulk не конфликтовал с execute_plan_session
+        на этом же акке (два параллельных connect = revoke)
+      - acquire_ip_lock — чтобы не делать N connect'ов на одном IP за секунды
+        (anti-burst, как plan_executor)
+      - asyncio.sleep между акками — мягкая пауза, чтобы один прокси не
+        получал серию connect'ов даже если IP-lock'и истекли
+
+    Если account_lock занят (warmup идёт) — ждём до 10 сек освобождения.
+    Если IP занят — пропускаем акк, юзер увидит "IP в cooldown" в детали.
+    """
+    import asyncio
+    import random
+    from utils.account_lock import acquire_account_lock, release_account_lock
+    from utils.ip_throttle import acquire_ip_lock, get_ip_cooldown_remaining
+
     results = []
-    for acc in accounts:
+    for idx, acc in enumerate(accounts):
         phone = acc.get("phone", "?")
+        acc_id = acc.get("id") or acc.get("account_id")
+
+        # Загружаем client и proxy (нужен proxy для IP-lock)
         client, proxy = await _get_client_for_phone(phone)
         if not client:
             results.append({"phone": phone, "success": False, "error": "Аккаунт/сессия не найдены"})
             continue
+
+        # ── Per-account lock (короткое TTL — bulk быстрый) ──
+        # Если занят warmup'ом — ждём до 10 сек и пропускаем.
+        acquired_acc = False
+        if acc_id:
+            for _ in range(10):
+                if acquire_account_lock(acc_id, ttl=120):
+                    acquired_acc = True
+                    break
+                await asyncio.sleep(1)
+            if not acquired_acc:
+                try: await client.disconnect()
+                except: pass
+                results.append({"phone": phone, "success": False,
+                                "error": "Аккаунт занят (warmup/commenting) — пропуск"})
+                continue
+
+        # ── Per-IP lock — bulk не должен запускать burst на IP ──
+        if proxy and not acquire_ip_lock(proxy):
+            remaining = get_ip_cooldown_remaining(proxy)
+            try: await client.disconnect()
+            except: pass
+            if acc_id and acquired_acc:
+                release_account_lock(acc_id)
+            results.append({"phone": phone, "success": False,
+                            "error": f"IP {proxy.host}:{proxy.port} в cooldown ({remaining}с)"})
+            continue
+
+        # Мягкая пауза между акками — чтобы Telegram не видел серию
+        # connect'ов на одном IP вплотную друг за другом, даже если
+        # юзер кликнул bulk на пачку акков одного прокси.
+        if idx > 0:
+            await asyncio.sleep(random.uniform(3.0, 7.0))
 
         try:
             await client.connect()
@@ -80,6 +133,9 @@ async def _run_bulk(accounts, action_fn, action_name):
             try: await client.disconnect()
             except: pass
             results.append({"phone": phone, "success": False, "error": str(e)[:200]})
+        finally:
+            if acc_id and acquired_acc:
+                release_account_lock(acc_id)
 
     return results
 
