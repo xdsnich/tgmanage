@@ -48,6 +48,7 @@ export default function ParserPage() {
   const [toast, setToast] = useState(null)
   const [folders, setFolders] = useState([])
   const [filterFolder, setFilterFolder] = useState('all')
+  const [onlyWithComments, setOnlyWithComments] = useState(false)
   const [newFolderInput, setNewFolderInput] = useState(false)
   const [selectedChannels, setSelectedChannels] = useState([])
   const [folderModal, setFolderModal] = useState(false)
@@ -341,9 +342,11 @@ export default function ParserPage() {
     } catch { showToast('Ошибка', 'error') }
   }
 
-  const filteredChannels = channels.filter(c =>
-    filterFolder === 'all' || (c.folder || '') === filterFolder
-  )
+  const filteredChannels = channels.filter(c => {
+    if (filterFolder !== 'all' && (c.folder || '') !== filterFolder) return false
+    if (onlyWithComments && !c.has_comments) return false
+    return true
+  })
 
   const handleSetFolder = async (folder) => {
     if (!selectedChannels.length) return
@@ -465,8 +468,24 @@ export default function ParserPage() {
 
       {pageTab === 'channels' && channels.length > 0 && (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, marginBottom: 20 }}>
-          <StatCard label="Каналов в базе" value={channels.length} icon="📢" />
-          <StatCard label="С комментариями" value={channels.filter(c => c.has_comments).length} color="var(--green)" icon="💬" />
+          <div onClick={() => setOnlyWithComments(false)} style={{
+            cursor: 'pointer',
+            outline: !onlyWithComments ? '2px solid rgba(124,77,255,0.5)' : 'none',
+            outlineOffset: -2, borderRadius: 12,
+          }}>
+            <StatCard label={`Каналов в базе${!onlyWithComments ? ' • активный' : ''}`} value={channels.length} icon="📢" />
+          </div>
+          <div onClick={() => setOnlyWithComments(true)} style={{
+            cursor: 'pointer',
+            outline: onlyWithComments ? '2px solid var(--green)' : 'none',
+            outlineOffset: -2, borderRadius: 12,
+          }} title="Кликни — показать только каналы с открытыми комментариями">
+            <StatCard
+              label={`С комментариями${onlyWithComments ? ' • активный' : ''}`}
+              value={channels.filter(c => c.has_comments).length}
+              color="var(--green)" icon="💬"
+            />
+          </div>
           <StatCard label="Ср. подписчиков" value={channels.length > 0 ? Math.round(channels.reduce((s, c) => s + c.subscribers, 0) / channels.length).toLocaleString() : 0} color="var(--violet)" icon="👥" />
         </div>
       )}
