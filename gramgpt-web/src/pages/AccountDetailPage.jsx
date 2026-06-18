@@ -393,11 +393,11 @@ export default function AccountDetailPage() {
     try {
       const { data } = await tasksAPI.checkAccounts(false, [parseInt(id)])
       const taskId = data.task_id
-      // Поллим до завершения
+      // Поллим до завершения. Бэк отдаёт st.status и st.result (не state).
       const poll = setInterval(async () => {
         try {
           const { data: st } = await tasksAPI.getStatus(taskId)
-          if (st.state === 'SUCCESS' || st.state === 'FAILURE') {
+          if (st.status === 'SUCCESS' || st.status === 'FAILURE') {
             clearInterval(poll)
             const r = st.result || {}
             const found = (r.results || [])[0]
@@ -407,7 +407,6 @@ export default function AccountDetailPage() {
               : status === 'frozen' ? '❌ Заморожен'
               : `Статус: ${status}`
             showToast(label, status === 'active' ? 'success' : 'error')
-            // перезагружаем детали аккаунта
             try {
               const { data: fresh } = await accountsAPI.get(id)
               setAccount(fresh)

@@ -84,20 +84,30 @@ export default function AccountsPage() {
       const taskId = data.task_id
       setCheckProgress(p => ({ ...p, taskId, total: data.total || p.total }))
 
-      // Поллинг прогресса
+      // Поллинг прогресса.
+      // Бэк отдаёт: { status: PENDING|PROGRESS|SUCCESS|FAILURE,
+      //               progress: {current, total, message}, result: {...} }
+      // (а не st.state/st.info/st.meta — это была опечатка)
+      const selSize = selectedIds.size
       const poll = setInterval(async () => {
         try {
           const { data: st } = await tasksAPI.getStatus(taskId)
-          const meta = st.info || st.meta || {}
-          const current = meta.current || 0
-          const total = meta.total || selectedIds.size
-          setCheckProgress({ current, total, taskId, message: meta.message })
-          if (st.state === 'SUCCESS' || st.state === 'FAILURE') {
+          const prog = st.progress || {}
+          const current = prog.current ?? 0
+          const total = prog.total || selSize
+          setCheckProgress({ current, total, taskId, message: prog.message })
+          if (st.status === 'SUCCESS' || st.status === 'FAILURE') {
             clearInterval(poll)
             setChecking(false)
             const r = st.result || {}
-            const okStr = `✅ Проверено ${r.total || total}: ${r.active || 0} активных, ${r.spam || 0} спам`
-            setCheckProgress({ ...checkProgress, status: st.state === 'SUCCESS' ? 'done' : 'error', message: okStr })
+            const okStr = st.status === 'SUCCESS'
+              ? `✅ Проверено ${r.total || total}: ${r.active || 0} активных, ${r.spam || 0} спам`
+              : `❌ Ошибка: ${st.error || 'не удалось'}`
+            setCheckProgress({
+              current: r.total || total, total: r.total || total,
+              taskId, status: st.status === 'SUCCESS' ? 'done' : 'error',
+              message: okStr,
+            })
             await load()
             setTimeout(() => setCheckProgress(null), 5000)
           }
