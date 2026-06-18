@@ -22,6 +22,7 @@ export default function WarmupPage() {
   const [saving, setSaving] = useState(false)
 
   const [form, setForm] = useState({ account_ids: [], total_days: 7, mode: 'normal', target_channels: '', daily_join_max: 3 })
+  const [onlyAlive, setOnlyAlive] = useState(true)
   const logsRef = useRef(null)
 
   // План прогрева (мониторинг)
@@ -225,11 +226,19 @@ export default function WarmupPage() {
     setLogsLoading(false)
   }
 
+  // Видимый список — фильтруется по «живые» если тогл включён.
+  const visibleAccounts = onlyAlive
+    ? accounts.filter(a => a.status === 'active')
+    : accounts
+
   const toggleAccount = (id) => setForm(f => ({
     ...f, account_ids: f.account_ids.includes(id) ? f.account_ids.filter(x => x !== id) : [...f.account_ids, id]
   }))
   const selectAll = () => setForm(f => ({
-    ...f, account_ids: f.account_ids.length === accounts.length ? [] : accounts.map(a => a.id)
+    // «Выбрать все» работает с ВИДИМЫМИ. Уже выбранные но скрытые сохраняем.
+    ...f, account_ids: f.account_ids.length >= visibleAccounts.length
+      ? f.account_ids.filter(id => !visibleAccounts.some(a => a.id === id))
+      : [...new Set([...f.account_ids, ...visibleAccounts.map(a => a.id)])]
   }))
 
   const statusBadge = (t) => {
@@ -467,14 +476,20 @@ export default function WarmupPage() {
             <div>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
                 <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase' }}>
-                  Аккаунты ({form.account_ids.length})
+                  Аккаунты ({form.account_ids.length} / {visibleAccounts.length})
                 </label>
-                <button onClick={selectAll} style={{ fontSize: 11, color: 'var(--violet)', background: 'none', border: 'none', cursor: 'pointer' }}>
-                  {form.account_ids.length === accounts.length ? 'Снять все' : 'Выбрать все'}
-                </button>
+                <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+                  <label style={{ fontSize: 11, color: 'var(--text-2)', display: 'flex', alignItems: 'center', gap: 5, cursor: 'pointer' }}>
+                    <input type="checkbox" checked={onlyAlive} onChange={e => setOnlyAlive(e.target.checked)} />
+                    Только живые
+                  </label>
+                  <button onClick={selectAll} style={{ fontSize: 11, color: 'var(--violet)', background: 'none', border: 'none', cursor: 'pointer' }}>
+                    {form.account_ids.length >= visibleAccounts.length ? 'Снять видимые' : 'Выбрать видимые'}
+                  </button>
+                </div>
               </div>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, maxHeight: 120, overflowY: 'auto' }}>
-                {accounts.map(a => (
+                {visibleAccounts.map(a => (
                   <button key={a.id} onClick={() => toggleAccount(a.id)} style={{
                     padding: '6px 12px', borderRadius: 8, fontSize: 12, cursor: 'pointer',
                     background: form.account_ids.includes(a.id) ? 'rgba(124,77,255,0.2)' : 'var(--bg-3)',
@@ -482,6 +497,11 @@ export default function WarmupPage() {
                     color: form.account_ids.includes(a.id) ? 'var(--violet)' : 'var(--text-2)', transition: 'all 0.15s',
                   }}>{a.first_name || a.phone}</button>
                 ))}
+                {visibleAccounts.length === 0 && (
+                  <span style={{ fontSize: 11, color: 'var(--text-3)' }}>
+                    {onlyAlive ? 'Живых аккаунтов нет. Сними галку «Только живые» чтобы увидеть остальных.' : 'Аккаунтов нет'}
+                  </span>
+                )}
               </div>
             </div>
 

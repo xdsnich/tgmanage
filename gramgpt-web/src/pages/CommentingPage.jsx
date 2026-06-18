@@ -106,6 +106,7 @@ export default function CommentingPage() {
     max_comments: 100, max_hours: 24,
     delay_join: 10, delay_comment: 250, delay_between: 60,
   })
+  const [onlyAlive, setOnlyAlive] = useState(true)
 
   // LLM keys, доступные пользователю (для селектора в форме кампании)
   const [llmCreds, setLlmCreds] = useState([])
@@ -531,9 +532,17 @@ export default function CommentingPage() {
           <Input label="Название" value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="Крипто-комментинг" />
 
           <div>
-            <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Аккаунты</label>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+              <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+                Аккаунты ({form.account_ids.length} / {(onlyAlive ? accounts.filter(a => a.status === 'active') : accounts).length})
+              </label>
+              <label style={{ fontSize: 11, color: 'var(--text-2)', display: 'flex', alignItems: 'center', gap: 5, cursor: 'pointer' }}>
+                <input type="checkbox" checked={onlyAlive} onChange={e => setOnlyAlive(e.target.checked)} />
+                Только живые
+              </label>
+            </div>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-              {accounts.map(a => (
+              {(onlyAlive ? accounts.filter(a => a.status === 'active') : accounts).map(a => (
                 <button key={a.id} onClick={() => setForm(f => ({ ...f, account_ids: f.account_ids.includes(a.id) ? f.account_ids.filter(x => x !== a.id) : [...f.account_ids, a.id] }))} style={{
                   padding: '6px 12px', borderRadius: 8, fontSize: 12, cursor: 'pointer', transition: 'all 0.15s',
                   background: form.account_ids.includes(a.id) ? 'rgba(124,77,255,0.2)' : 'var(--bg-3)',
@@ -541,7 +550,11 @@ export default function CommentingPage() {
                   color: form.account_ids.includes(a.id) ? 'var(--violet)' : 'var(--text-2)',
                 }}>{a.first_name || a.phone}</button>
               ))}
-              {accounts.length === 0 && <div style={{ fontSize: 12, color: 'var(--text-3)' }}>Нет активных аккаунтов</div>}
+              {(onlyAlive ? accounts.filter(a => a.status === 'active') : accounts).length === 0 && (
+                <div style={{ fontSize: 12, color: 'var(--text-3)' }}>
+                  {onlyAlive ? 'Живых аккаунтов нет. Сними галку «Только живые» чтобы увидеть остальных.' : 'Нет аккаунтов'}
+                </div>
+              )}
             </div>
           </div>
 
