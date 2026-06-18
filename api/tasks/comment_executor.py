@@ -430,15 +430,32 @@ async def _dispatch_comments():
             )
             items = result.scalars().all()
 
+            # STAGGER — копия логики из plan_executor.dispatch_plans.
+            # Без неё 50 готовых комментариев улетели бы в очередь за
+            # один тик и создали burst (как dispatch_plans до фикса
+            # 2026-06-12). Размазываем countdown по окну.
+            import random as _rand
+            _rand.shuffle(items)
+            stagger_min  = int(os.getenv("DISPATCH_STAGGER_MIN_SEC", "30"))
+            stagger_max  = int(os.getenv("DISPATCH_STAGGER_MAX_SEC", "3600"))
+            per_plan_sec = float(os.getenv("DISPATCH_STAGGER_PER_PLAN_SEC", "30"))
+            window_sec = max(stagger_min, min(stagger_max, int(len(items) * per_plan_sec)))
+
             for item in items:
+                countdown = _rand.uniform(0, window_sec) if items else 0
                 celery_app.send_task(
                     "tasks.comment_executor.execute_single_comment",
                     args=[item.id],
                     queue="ai_dialogs",
+                    countdown=countdown,
                 )
                 dispatched += 1
 
-            logger.info(f"[dispatch] Comments: отправлено {dispatched}")
+            if dispatched:
+                logger.info(
+                    f"[dispatch] Comments: отправлено {dispatched} в окне "
+                    f"{window_sec}с (anti-burst stagger)"
+                )
     except Exception as e:
         logger.error(f"[dispatch] Comments ошибка: {e}")
 

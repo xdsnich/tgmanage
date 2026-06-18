@@ -116,9 +116,33 @@ def _make_proxy(proxy_row):
 
 
 def _make_client(phone, proxy_dict=None, api_id=None, api_hash=None, platform="android"):
-    """Создаёт Telethon клиент для авторизации."""
+    """Создаёт Telethon клиент для авторизации.
+
+    ОБЯЗАТЕЛЬНО: proxy_dict не None. Иначе Telethon подключится с
+    локального IP — этот аккаунт станет навсегда привязан к домашнему
+    адресу пользователя, что Telegram воспринимает как потерю
+    доверия и может моментально revoke.
+
+    Раньше функция молча принимала proxy=None, и три callsite
+    (confirm/resend/2FA) могли передать None если PENDING_PROXY
+    (in-memory dict) был потерян из-за рестарта uvicorn между
+    /send-code и /confirm. Это второй вероятный сценарий инцидента
+    с потерей 200 акков (поверх burst-инцидента 2026-06-12).
+    """
     from utils.telegram import _get_device_for_platform
     from telethon import TelegramClient
+
+    if not proxy_dict:
+        # ВАЖНО: не молчать. Без прокси любое подключение к Telegram
+        # привязывает аккаунт к локальному IP сервера.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Не указан прокси для аккаунта. Возможно сессия авторизации "
+                "истекла после рестарта сервера — начни авторизацию заново "
+                "и выбери прокси при отправке кода."
+            ),
+        )
 
     fingerprint = _get_device_for_platform(phone, platform)
 

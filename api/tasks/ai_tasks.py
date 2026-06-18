@@ -409,9 +409,25 @@ async def _process_all_dialogs():
                 # ONE connection per account, process all dialogs
                 from utils.telegram import make_telethon_client
                 from utils.account_lock import acquire_account_lock, release_account_lock
+                from utils.ip_throttle import acquire_ip_lock, get_ip_cooldown_remaining
 
                 if not acquire_account_lock(account.id, ttl=300):
                     logger.info(f"[ai] Аккаунт {account.phone} занят — пропуск")
+                    continue
+
+                # Per-IP cooldown — защищает от того что несколько активных
+                # AI-диалогов на разных аккаунтах одного IP начнут
+                # подключаться в одну минуту. Если IP занят — пропускаем
+                # на этом тике, следующий beat-тик через 60 сек попробует
+                # снова. Это безопаснее чем re-queue (process_ai_dialogs
+                # просто рестартанётся через минуту).
+                if proxy and not acquire_ip_lock(proxy):
+                    remaining = get_ip_cooldown_remaining(proxy)
+                    logger.info(
+                        f"[ai] IP {proxy.host}:{proxy.port} в cooldown "
+                        f"({remaining}с) — акк {account.phone} пропуск"
+                    )
+                    release_account_lock(account.id)
                     continue
 
                 client = make_telethon_client(account, proxy)
