@@ -31,15 +31,37 @@ export default function WarmupPage() {
     setChannelsModal(true)
     setChPoolLoading(true)
     try {
+      // Для одиночных задач (без реального batch_id) у нас на фронте
+      // создаётся виртуальный id "single_<task_id>". В этом случае —
+      // показываем target_channels из самой таски (батча на бэке нет).
+      const isSingle = String(batch.batch_id || '').startsWith('single_')
+      if (isSingle) {
+        const t = (batch.tasks || [])[0]
+        const targets = (t?.target_channels || [])  // если поле есть
+        const subbed = t?.subscribed_channels || {}
+        const subbedLow = new Set(Object.keys(subbed).map(s => s.toLowerCase()))
+        const pool = targets.map(c => ({
+          channel: c.replace(/^@/, ''),
+          tasks_count: 1,
+          subscribed_count: subbedLow.has(c.replace(/^@/, '').toLowerCase()) ? 1 : 0,
+        }))
+        setChPool(pool)
+        setChText(pool.map(p => '@' + p.channel).join('\n'))
+        return
+      }
       const { data } = await warmupAPI.batchChannels(batch.batch_id)
       const pool = data.channels || []
       setChPool(pool)
-      // Сразу предзаполняем textarea текущим списком — юзер
-      // правит на месте, как хочет, и сохраняет полный новый список.
       setChText(pool.map(p => '@' + p.channel).join('\n'))
     } catch (e) {
       setChPool([])
-      alert('Не удалось загрузить список каналов: ' + (e.response?.data?.detail || e.message))
+      const status = e.response?.status
+      const detail = e.response?.data?.detail || e.message
+      // 404 чаще всего значит что uvicorn не подхватил новый код
+      const hint = status === 404
+        ? '\n\nЭто эндпоинт добавили недавно. Если только обновил код — перезапусти прогу:\n  .\\stop_all.ps1\n  .\\start_all.ps1'
+        : ''
+      alert(`Не удалось загрузить список каналов: ${detail}${hint}`)
     } finally {
       setChPoolLoading(false)
     }
@@ -58,6 +80,22 @@ export default function WarmupPage() {
     }
     setChSaving(true)
     try {
+      const isSingle = String(chBatch.batch_id || '').startsWith('single_')
+      if (isSingle) {
+        const t = (chBatch.tasks || [])[0]
+        if (!t) { alert('Не найдена задача прогрева'); return }
+        const { data } = await warmupAPI.editChannels(t.id, 'replace', channels)
+        setChannelsModal(false)
+        setChText('')
+        await load()
+        alert(
+          `✅ Каналы обновлены\n\n` +
+          `Было: ${data.old_count} → стало: ${data.new_count}\n` +
+          `Перегенерировано будущих дней: ${data.future_days_regenerated}` +
+          (data.warning ? `\n\n⚠ ${data.warning}` : '')
+        )
+        return
+      }
       const { data } = await warmupAPI.editBatchChannels(chBatch.batch_id, 'replace', channels)
       setChannelsModal(false)
       setChText('')
@@ -69,7 +107,12 @@ export default function WarmupPage() {
         `Перегенерировано будущих дней: ${data.future_days_regenerated}`
       )
     } catch (e) {
-      alert('Ошибка: ' + (e.response?.data?.detail || e.message))
+      const status = e.response?.status
+      const detail = e.response?.data?.detail || e.message
+      const hint = status === 404
+        ? '\n\nПерезапусти прогу: .\\stop_all.ps1 + .\\start_all.ps1'
+        : ''
+      alert(`Ошибка: ${detail}${hint}`)
     } finally {
       setChSaving(false)
     }
