@@ -67,12 +67,26 @@ export default function WarmupPage() {
     }
   }
 
+  // Парсит textarea с дедупом case-insensitive (первое вхождение остаётся).
+  // Если юзер вставил тот же @channel дважды или скопировал список поверх
+  // старого — авто-чистится.
+  const parseChannelsDedup = (text) => {
+    const seen = new Set()
+    const out = []
+    for (const raw of text.split(/[\n,]+/)) {
+      const c = raw.trim().replace(/^@/, '')
+      if (!c) continue
+      const low = c.toLowerCase()
+      if (seen.has(low)) continue
+      seen.add(low)
+      out.push(c)
+    }
+    return out
+  }
+
   const handleChannelsSave = async () => {
     if (!chBatch) return
-    const channels = chText
-      .split(/[\n,]+/)
-      .map(s => s.trim().replace(/^@/, ''))
-      .filter(Boolean)
+    const channels = parseChannelsDedup(chText)
     // Замена всем списком (action=replace) — юзер видит и правит финальный
     // вариант. Пустой список = убрать всё, на это нужен confirm.
     if (channels.length === 0) {
@@ -847,7 +861,9 @@ export default function WarmupPage() {
 
       {/* ══ Edit channels Modal (batch-level) ══ */}
       {channelsModal && chBatch && (() => {
-        const inFormCount = chText.split(/[\n,]+/).map(s => s.trim()).filter(Boolean).length
+        const rawCount = chText.split(/[\n,]+/).map(s => s.trim()).filter(Boolean).length
+        const inFormCount = parseChannelsDedup(chText).length   // ← после дедупа
+        const duplicates = rawCount - inFormCount
         const wasCount = chPool?.length || 0
         return (
           <Modal open={true} title={`📢 Каналы прогрева · ${chBatch.batch_name}`}
@@ -870,6 +886,11 @@ export default function WarmupPage() {
                       </label>
                       <span style={{ fontSize: 11, color: inFormCount === wasCount ? 'var(--text-3)' : 'var(--violet)' }}>
                         Было {wasCount} → станет <strong>{inFormCount}</strong>
+                        {duplicates > 0 && (
+                          <span style={{ marginLeft: 6, color: '#e8a400' }}>
+                            (повторов будет убрано: {duplicates})
+                          </span>
+                        )}
                       </span>
                     </div>
                     <textarea

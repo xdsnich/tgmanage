@@ -859,11 +859,24 @@ async def edit_batch_channels(
 
     old_pool = list(pool_set.values())
 
-    incoming = [_norm_ch(c) for c in (body.channels or []) if _norm_ch(c)]
+    # Дедуп incoming case-insensitive с сохранением первого вхождения.
+    # Юзер может вставить тот же канал дважды (особенно при copy-paste
+    # старого списка поверх нового) — авто-чистим.
+    incoming = []
+    _seen_in = set()
+    for c in (body.channels or []):
+        k = _norm_ch(c)
+        if not k:
+            continue
+        low = k.lower()
+        if low in _seen_in:
+            continue
+        _seen_in.add(low)
+        incoming.append(k)
     incoming_low = {c.lower(): c for c in incoming}
 
     if body.action == "replace":
-        new_pool = incoming
+        new_pool = incoming   # уже дедуплицировано выше
     elif body.action == "add":
         new_pool = old_pool + [c for low, c in incoming_low.items() if low not in pool_set]
     else:  # remove
