@@ -18,7 +18,6 @@ export default function WarmupPage() {
   const [logsModal, setLogsModal] = useState(false)
   const [selectedTask, setSelectedTask] = useState(null)
   const [channelsModal, setChannelsModal] = useState(false)
-  const [chAction, setChAction] = useState('add')   // 'replace' | 'add' | 'remove'
   const [chText, setChText] = useState('')
   const [chSaving, setChSaving] = useState(false)
   const [chBatch, setChBatch] = useState(null)      // {batch_id, batch_name}
@@ -26,31 +25,23 @@ export default function WarmupPage() {
   const [chPoolLoading, setChPoolLoading] = useState(false)
 
   const openChannelsModal = async (batch) => {
-    // batch = {batch_id, batch_name, tasks}
     setChBatch(batch)
-    setChAction('add')
     setChText('')
     setChPool(null)
     setChannelsModal(true)
     setChPoolLoading(true)
     try {
       const { data } = await warmupAPI.batchChannels(batch.batch_id)
-      setChPool(data.channels || [])
+      const pool = data.channels || []
+      setChPool(pool)
+      // Сразу предзаполняем textarea текущим списком — юзер
+      // правит на месте, как хочет, и сохраняет полный новый список.
+      setChText(pool.map(p => '@' + p.channel).join('\n'))
     } catch (e) {
       setChPool([])
       alert('Не удалось загрузить список каналов: ' + (e.response?.data?.detail || e.message))
     } finally {
       setChPoolLoading(false)
-    }
-  }
-
-  // При смене режима — если replace, предзаполняем textarea текущим списком
-  // (чтобы юзер мог увидеть и отредактировать). Для add/remove — оставляем
-  // как есть (юзер решает что добавить или убрать).
-  const setChActionWithPrefill = (action) => {
-    setChAction(action)
-    if (action === 'replace' && chPool && chPool.length > 0 && !chText.trim()) {
-      setChText(chPool.map(p => '@' + p.channel).join('\n'))
     }
   }
 
@@ -60,15 +51,19 @@ export default function WarmupPage() {
       .split(/[\n,]+/)
       .map(s => s.trim().replace(/^@/, ''))
       .filter(Boolean)
-    if (channels.length === 0) { alert('Добавь хотя бы один канал'); return }
+    // Замена всем списком (action=replace) — юзер видит и правит финальный
+    // вариант. Пустой список = убрать всё, на это нужен confirm.
+    if (channels.length === 0) {
+      if (!window.confirm('Список пуст — это удалит ВСЕ целевые каналы из прогрева. Продолжить?')) return
+    }
     setChSaving(true)
     try {
-      const { data } = await warmupAPI.editBatchChannels(chBatch.batch_id, chAction, channels)
+      const { data } = await warmupAPI.editBatchChannels(chBatch.batch_id, 'replace', channels)
       setChannelsModal(false)
       setChText('')
       await load()
       alert(
-        `✅ Каналы обновлены (${chAction})\n\n` +
+        `✅ Каналы обновлены\n\n` +
         `Пул каналов: ${data.old_pool_count} → ${data.new_pool_count}\n` +
         `Аккаунтов обновлено: ${data.tasks_updated}\n` +
         `Перегенерировано будущих дней: ${data.future_days_regenerated}`
@@ -808,112 +803,84 @@ export default function WarmupPage() {
       )}
 
       {/* ══ Edit channels Modal (batch-level) ══ */}
-      {channelsModal && chBatch && (
-        <Modal open={true} title={`📢 Каналы прогрева · ${chBatch.batch_name}`}
-               onClose={() => setChannelsModal(false)} width={680}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 14, maxHeight: '75vh', overflow: 'auto' }}>
-            {/* Текущий пул */}
-            <div style={{ padding: 10, borderRadius: 8, background: 'var(--bg-3)' }}>
-              <div style={{ fontSize: 12, color: 'var(--text-3)', marginBottom: 8, display: 'flex', justifyContent: 'space-between' }}>
-                <span>
-                  Сейчас в пуле: <strong style={{ color: 'var(--text)' }}>{chPool ? chPool.length : '…'}</strong>
-                  {' '}каналов · аккаунтов в batch'е: <strong style={{ color: 'var(--text)' }}>{chBatch.tasks?.length || 0}</strong>
-                </span>
-                {chPool && chPool.length > 0 && (
-                  <button onClick={() => {
-                    setChText(chPool.map(p => '@' + p.channel).join('\n'))
-                  }} style={{ background: 'none', border: 'none', color: 'var(--violet)', cursor: 'pointer', fontSize: 11 }}>
-                    Скопировать в форму ↓
-                  </button>
-                )}
+      {channelsModal && chBatch && (() => {
+        const inFormCount = chText.split(/[\n,]+/).map(s => s.trim()).filter(Boolean).length
+        const wasCount = chPool?.length || 0
+        return (
+          <Modal open={true} title={`📢 Каналы прогрева · ${chBatch.batch_name}`}
+                 onClose={() => setChannelsModal(false)} width={620}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12, maxHeight: '75vh', overflow: 'auto' }}>
+              <div style={{ fontSize: 12, color: 'var(--text-3)' }}>
+                Список целевых каналов для всех {chBatch.tasks?.length || 0} аккаунтов в этом прогреве.
+                Редактируй прямо в форме — добавляй новые строки, удаляй ненужные, или сноси всё. После
+                сохранения новый список заново распределится по аккаунтам.
               </div>
+
               {chPoolLoading ? (
-                <div style={{ padding: 16, textAlign: 'center' }}><Spinner size={20} /></div>
-              ) : !chPool || chPool.length === 0 ? (
-                <div style={{ fontSize: 12, color: 'var(--text-3)', padding: 10, textAlign: 'center' }}>
-                  Пока нет каналов в пуле. Добавь через форму ниже.
-                </div>
+                <div style={{ padding: 30, textAlign: 'center' }}><Spinner size={24} /></div>
               ) : (
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, maxHeight: 130, overflowY: 'auto' }}>
-                  {chPool.map(p => {
-                    const allSubbed = p.subscribed_count >= p.tasks_count
-                    return (
-                      <span key={p.channel} title={`Назначен ${p.tasks_count} акк., подписано ${p.subscribed_count}`}
-                        style={{
-                          padding: '3px 8px', borderRadius: 6, fontSize: 11,
-                          background: allSubbed ? 'rgba(61,214,140,0.15)' : 'rgba(124,77,255,0.10)',
-                          color: allSubbed ? 'var(--green)' : 'var(--text-2)',
-                          border: `1px solid ${allSubbed ? 'rgba(61,214,140,0.3)' : 'rgba(124,77,255,0.25)'}`,
-                          fontFamily: 'monospace',
-                        }}>
-                        {allSubbed && '✓ '}@{p.channel}
-                        <span style={{ opacity: 0.5, marginLeft: 4 }}>{p.subscribed_count}/{p.tasks_count}</span>
+                <>
+                  <div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 6 }}>
+                      <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+                        Каналы (по одному на строку или через запятую)
+                      </label>
+                      <span style={{ fontSize: 11, color: inFormCount === wasCount ? 'var(--text-3)' : 'var(--violet)' }}>
+                        Было {wasCount} → станет <strong>{inFormCount}</strong>
                       </span>
-                    )
-                  })}
-                </div>
+                    </div>
+                    <textarea
+                      value={chText}
+                      onChange={e => setChText(e.target.value)}
+                      placeholder={'@channel1\nchannel2\n@channel3'}
+                      style={{
+                        width: '100%', minHeight: 280, padding: 12, borderRadius: 8,
+                        background: 'var(--bg-3)', border: '1px solid var(--border)',
+                        color: 'var(--text)', fontSize: 12, fontFamily: 'monospace', resize: 'vertical',
+                        lineHeight: 1.5,
+                      }}
+                    />
+                  </div>
+
+                  {chPool && chPool.length > 0 && (
+                    <details style={{ fontSize: 11, color: 'var(--text-3)' }}>
+                      <summary style={{ cursor: 'pointer', userSelect: 'none' }}>
+                        Статус подписок ({chPool.filter(p => p.subscribed_count >= p.tasks_count).length}/{chPool.length} полностью подписаны)
+                      </summary>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, maxHeight: 100, overflowY: 'auto', marginTop: 8, padding: 8, background: 'var(--bg-3)', borderRadius: 6 }}>
+                        {chPool.map(p => {
+                          const done = p.subscribed_count >= p.tasks_count
+                          return (
+                            <span key={p.channel}
+                              title={`${p.subscribed_count} из ${p.tasks_count} акк. уже подписаны`}
+                              style={{
+                                padding: '2px 7px', borderRadius: 5, fontSize: 10,
+                                background: done ? 'rgba(61,214,140,0.15)' : 'rgba(255,180,0,0.10)',
+                                color: done ? 'var(--green)' : '#e8a400',
+                                fontFamily: 'monospace',
+                              }}>
+                              {done ? '✓' : '○'} @{p.channel} {p.subscribed_count}/{p.tasks_count}
+                            </span>
+                          )
+                        })}
+                      </div>
+                    </details>
+                  )}
+
+                  <div style={{ fontSize: 11, color: 'var(--text-3)', padding: '8px 10px', background: 'rgba(255,180,0,0.06)', border: '1px solid rgba(255,180,0,0.2)', borderRadius: 8 }}>
+                    Сегодняшний день не трогается. Каналы на которые акки уже подписаны — повторно не подписываются.
+                  </div>
+                </>
               )}
-              <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 6, opacity: 0.8 }}>
-                <span style={{ color: 'var(--green)' }}>✓</span> — все аккаунты подписаны на этот канал.
-                Цифра = подписано / назначено.
+
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+                <Button variant="ghost" onClick={() => setChannelsModal(false)} disabled={chSaving}>Отмена</Button>
+                <Button variant="primary" onClick={handleChannelsSave} loading={chSaving} disabled={chPoolLoading}>Сохранить</Button>
               </div>
             </div>
-
-            {/* Action radio */}
-            <div>
-              <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 8 }}>Действие над пулом</label>
-              <div style={{ display: 'flex', gap: 8 }}>
-                {[
-                  { key: 'add', label: '➕ Добавить', desc: 'дописать к существующему пулу' },
-                  { key: 'remove', label: '➖ Удалить', desc: 'убрать указанные из пула' },
-                  { key: 'replace', label: '🔄 Заменить', desc: 'снести весь пул, поставить новый' },
-                ].map(o => (
-                  <button key={o.key} onClick={() => setChActionWithPrefill(o.key)} style={{
-                    flex: 1, padding: '10px 12px', borderRadius: 10, cursor: 'pointer', textAlign: 'left',
-                    background: chAction === o.key ? 'rgba(124,77,255,0.15)' : 'var(--bg-3)',
-                    border: `1px solid ${chAction === o.key ? 'rgba(124,77,255,0.4)' : 'var(--border)'}`,
-                    color: chAction === o.key ? 'var(--violet)' : 'var(--text-2)', transition: 'all 0.15s',
-                  }}>
-                    <div style={{ fontSize: 13, fontWeight: 600 }}>{o.label}</div>
-                    <div style={{ fontSize: 10, opacity: 0.7, marginTop: 2 }}>{o.desc}</div>
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* Textarea */}
-            <div>
-              <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>
-                {chAction === 'remove' ? 'Каналы для удаления' : chAction === 'replace' ? 'Новый полный список' : 'Каналы для добавления'}
-                {' '}<span style={{ opacity: 0.6, fontWeight: 400 }}>(по одному на строку или через запятую)</span>
-              </label>
-              <textarea
-                value={chText}
-                onChange={e => setChText(e.target.value)}
-                placeholder={'@channel1\nchannel2\n@channel3'}
-                style={{
-                  width: '100%', minHeight: 160, padding: 10, borderRadius: 8,
-                  background: 'var(--bg-3)', border: '1px solid var(--border)',
-                  color: 'var(--text)', fontSize: 12, fontFamily: 'monospace', resize: 'vertical',
-                }}
-              />
-              <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4 }}>
-                {chText.split(/[\n,]+/).map(s => s.trim()).filter(Boolean).length} каналов в форме
-              </div>
-            </div>
-
-            <div style={{ fontSize: 11, color: 'var(--text-3)', padding: '8px 10px', background: 'rgba(255,180,0,0.06)', border: '1px solid rgba(255,180,0,0.2)', borderRadius: 8 }}>
-              Новый пул будет распределён между всеми {chBatch.tasks?.length || 0} аккаунтами с ~25% пересечением.
-              Сегодняшний день не трогается. Уже подписанные каналы не подписываются повторно.
-            </div>
-
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
-              <Button variant="ghost" onClick={() => setChannelsModal(false)} disabled={chSaving}>Отмена</Button>
-              <Button variant="primary" onClick={handleChannelsSave} loading={chSaving}>Сохранить</Button>
-            </div>
-          </div>
-        </Modal>
-      )}
+          </Modal>
+        )
+      })()}
 
       {/* ══ Schedule campaign after warmup ══ */}
       {scheduleModal && scheduleBatch && (
