@@ -34,6 +34,19 @@ logger = logging.getLogger(__name__)
 # битую карточку.
 _JS_EXTRACT_CARDS = r"""
 () => {
+  // Селекторы подобраны под реальную разметку tgstat.com на 2026-06:
+  //   <div class="col col-12 col-sm-5 col-md-5 col-lg-4">
+  //     <a href="https://tgstat.com/channel/@xxx/stat">
+  //       <div class="row">
+  //         <div class="text-truncate font-16 text-dark">TITLE</div>
+  //         <div class="text-truncate font-14 text-dark">17 584 188 <span>subscribers</span></div>
+  //         <div class="text-truncate font-12 text-dark">
+  //           <span class="border rounded bg-light">Cryptocurrencies</span>
+  //         </div>
+  //       </div>
+  //     </a>
+  //   </div>
+
   const out = [];
   // Карточки канала. Селектор широкий — на странице есть ссылки
   // на каналы (/channel/@user) и на чаты (/chat/@user). Берём оба и
@@ -51,17 +64,44 @@ _JS_EXTRACT_CARDS = r"""
       const username = m[1];
       if (seen.has(username)) continue;
 
-      // Карточка = ближайший разумный контейнер
-      const card = a.closest('.card, .peer-item, .channels-list-item, .row, li, .col-md-6, .col-lg-4') || a.parentElement || a;
+      // Карточка = ближайший разумный контейнер. Сначала пробуем
+      // closest(), потом fallback на ручной подъём до 4 уровней.
+      let card = a.closest('.col-lg-4, .col-md-6, .col-lg-3, .col-sm-5, .card, .peer-item, .channels-list-item, li');
+      if (!card) {
+        card = a;
+        for (let i = 0; i < 4; i++) {
+          if (!card.parentElement) break;
+          card = card.parentElement;
+        }
+      }
       const cardText = (card.innerText || '').replace(/\s+/g, ' ').trim();
 
-      // Заголовок: ищем h6/h5/strong/первый <b> в карточке или alt у img
+      // ── TITLE ─────────────────────────────────────────────
+      // Современный tgstat: <div class="text-truncate font-16 text-dark">
       let title = null;
-      const titleEl = card.querySelector('h6, h5, h4, .card-title, strong, b');
-      if (titleEl) title = (titleEl.innerText || '').trim();
+      const titleSelectors = [
+        '.text-truncate.font-16.text-dark',
+        '.font-16.text-dark',
+        '.text-truncate.font-18',
+        'h6', 'h5', 'h4',
+        '.card-title', 'strong', 'b',
+      ];
+      for (const sel of titleSelectors) {
+        const el = card.querySelector(sel);
+        if (!el) continue;
+        const txt = (el.innerText || '').trim();
+        // Откидываем если внутри число (это subs-блок), пустое или служебное
+        if (txt && !/^\d/.test(txt) && txt.length < 200) {
+          title = txt;
+          break;
+        }
+      }
       if (!title) {
         const img = card.querySelector('img[alt]');
-        if (img) title = (img.getAttribute('alt') || '').trim();
+        if (img) {
+          const alt = (img.getAttribute('alt') || '').trim();
+          if (alt && !/^image|channel/i.test(alt)) title = alt;
+        }
       }
 
       // Подписчики: ищем число + "subs"/"подп"/"K"/"M" рядом
@@ -83,23 +123,51 @@ _JS_EXTRACT_CARDS = r"""
         if (nums.length) subscribers = Math.max(...nums);
       }
 
-      // has_comments: тип сущности — /chat/@... ИЛИ карточка содержит
-      // явные маркеры (значок чата, текст "комментарии", "обсуждение",
-      // "Группа", link на discussion)
+      // ── has_comments (best-effort на rating-page) ─────────
+      // На rating-странице TGStat нет прямого индикатора чата у
+      // карточки. Точное определение возможно только:
+      //   (a) парсингом детальной /channel/@xxx/stat (дорого)
+      //   (b) использованием URL с sort=discussions — там первые N
+      //       каналов имеют активные чаты по факту сортировки
+      //   (c) последующей TG-верификацией через свои аккаунты
+      //       (см. parser_similar_tasks.run_verify_comments)
+      // Здесь детектим только явные сигналы внутри карточки.
       const isChatHref = href.includes('/chat/@');
-      const hasCommentText = /коммент|обсужд|чат канала|comments|linked\s*chat/i.test(cardText);
+      const hasCommentText = /чат\s*канала|комментар|обсужд|linked\s*chat|discussion\s*group/i.test(cardText);
+      // Узкий селектор: только однозначные маркеры (не слишком жадный
+      // [class*="chat"] который ловит весь chat-list контейнер)
       const hasCommentIcon = !!card.querySelector(
-        '[class*="comment"], [class*="discussion"], [class*="chat"], i[class*="bi-chat"]'
+        'i.fa-comments, i.bi-chat-dots, i.fa-comment-dots, [title*="чат" i]'
       );
       const has_comments = isChatHref || hasCommentText || hasCommentIcon;
 
-      // Категория — ищем badge/label
+      // ── CATEGORY ──────────────────────────────────────────
+      // На tgstat: <span class="border rounded bg-light px-1">Cryptocurrencies</span>
       let category = null;
-      const catEl = card.querySelector('.badge, .label, .tag, .category, [class*="badge-category"]');
-      if (catEl) category = (catEl.innerText || '').trim().slice(0, 50);
+      const catSelectors = [
+        '.border.rounded.bg-light',
+        'span.border.bg-light',
+        'span.bg-light',
+        '.badge', '.label', '.tag',
+        '[class*="badge-category"]',
+      ];
+      for (const sel of catSelectors) {
+        const el = card.querySelector(sel);
+        if (!el) continue;
+        const txt = (el.innerText || '').trim();
+        if (txt && txt.length < 60 && !/^\d/.test(txt)) {
+          category = txt;
+          break;
+        }
+      }
 
-      // Verified — синяя галка
-      const verified = !!card.querySelector('[class*="verified"], .text-primary i[class*="check"], img[alt*="verified" i]');
+      // ── VERIFIED ──────────────────────────────────────────
+      // На tgstat у проверенных каналов — зелёная рамка вокруг аватара:
+      // <img class="img-thumbnail border-2px border-success rounded-circle">
+      const verified = !!card.querySelector(
+        '.border-success, .text-success i.fa-check, ' +
+        '[class*="verified"], img[alt*="verified" i]'
+      );
 
       // Позиция в рейтинге — если есть номер слева от карточки
       let position = null;
