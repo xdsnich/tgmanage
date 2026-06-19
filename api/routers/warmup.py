@@ -746,12 +746,238 @@ async def delete_warmup_batch(
     return {"deleted": len(task_ids), "message": f"Удалён прогрев ({len(task_ids)} аккаунтов)"}
 
 
-# ── РЕДАКТИРОВАНИЕ КАНАЛОВ ───────────────────────────────────
+# ── РЕДАКТИРОВАНИЕ КАНАЛОВ (batch-level) ─────────────────────
 
 
 class WarmupChannelsEdit(BaseModel):
     action: str               # "replace" | "add" | "remove"
     channels: list[str]       # список username'ов (с @ или без — нормализуем)
+
+
+def _norm_ch(ch: str) -> str:
+    return ch.lstrip("@").strip()
+
+
+@router.get("/batches/{batch_id}/channels")
+async def get_batch_channels(
+    batch_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Возвращает текущий пул каналов batch'а (union по всем WarmupTask)."""
+    tasks = (await db.execute(
+        select(WarmupTask).where(
+            WarmupTask.batch_id == batch_id,
+            WarmupTask.user_id == current_user.id,
+        )
+    )).scalars().all()
+    if not tasks:
+        raise HTTPException(status_code=404, detail="Batch не найден")
+
+    pool: dict[str, dict] = {}
+    for t in tasks:
+        for c in (t.target_channels or []):
+            key = _norm_ch(c)
+            if not key:
+                continue
+            low = key.lower()
+            if low not in pool:
+                pool[low] = {"channel": key, "tasks_count": 0, "subscribed_count": 0}
+            pool[low]["tasks_count"] += 1
+        subbed = (t.subscribed_channels or {})
+        for c in subbed.keys():
+            key = _norm_ch(c)
+            low = key.lower()
+            if low in pool:
+                pool[low]["subscribed_count"] += 1
+
+    items = sorted(
+        pool.values(),
+        key=lambda x: (-x["subscribed_count"], -x["tasks_count"], x["channel"].lower()),
+    )
+    return {
+        "batch_id": batch_id,
+        "channels_total": len(items),
+        "tasks_in_batch": len(tasks),
+        "channels": items,
+    }
+
+
+@router.patch("/batches/{batch_id}/channels")
+async def edit_batch_channels(
+    batch_id: str,
+    body: WarmupChannelsEdit,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Изменяет пул каналов для ВСЕГО batch'а прогрева.
+
+    Режимы:
+      replace — заменить весь пул новым
+      add     — добавить к существующим (dedup)
+      remove  — удалить указанные из пула
+
+    Новый пул заново распределяется между аккаунтами batch'а через
+    _distribute_warmup_channels (с overlap 25% чтобы Telegram не палил
+    ферму по одинаковым подпискам).
+
+    Уже подписанные каналы (subscribed_channels на task'е) НЕ трогаются —
+    бот не подписывается повторно. Будущие CampaignPlan для каждой задачи
+    перегенерируются с новым составом target_channels (минус subscribed).
+    Сегодняшний день не трогается.
+    """
+    from datetime import date
+    from models.campaign_plan import CampaignPlan
+    from tasks.plan_generator import generate_daily_plan
+    from tasks.behavior_engine import assign_personality
+
+    if body.action not in ("replace", "add", "remove"):
+        raise HTTPException(status_code=400, detail="action: replace | add | remove")
+
+    tasks = (await db.execute(
+        select(WarmupTask).where(
+            WarmupTask.batch_id == batch_id,
+            WarmupTask.user_id == current_user.id,
+        )
+    )).scalars().all()
+    if not tasks:
+        raise HTTPException(status_code=404, detail="Batch не найден")
+
+    # Собираем текущий пул каналов и subscribed-set по всему batch'у
+    pool_set: dict[str, str] = {}      # low -> display
+    subscribed_low: set[str] = set()
+    for t in tasks:
+        for c in (t.target_channels or []):
+            k = _norm_ch(c)
+            if k and k.lower() not in pool_set:
+                pool_set[k.lower()] = k
+        for c in (t.subscribed_channels or {}).keys():
+            k = _norm_ch(c)
+            if k:
+                subscribed_low.add(k.lower())
+
+    old_pool = list(pool_set.values())
+
+    incoming = [_norm_ch(c) for c in (body.channels or []) if _norm_ch(c)]
+    incoming_low = {c.lower(): c for c in incoming}
+
+    if body.action == "replace":
+        new_pool = incoming
+    elif body.action == "add":
+        new_pool = old_pool + [c for low, c in incoming_low.items() if low not in pool_set]
+    else:  # remove
+        rm = {low for low in incoming_low}
+        new_pool = [c for low, c in pool_set.items() if low not in rm]
+
+    # Каналы для распределения: все из нового пула, но subscribed не
+    # подписываемся повторно. Однако target_channels у task'а должны
+    # содержать ПОЛНЫЙ список (чтобы /subscribed-channels endpoint
+    # знал что у этой таски эти каналы в плане) — поэтому распределяем
+    # ВЕСЬ new_pool, а в join_channel actions добавляем только
+    # remaining (target минус уже подписанные).
+
+    account_ids = [t.account_id for t in tasks]
+    # Маппинг task_id -> WarmupTask для удобства
+    by_acc = {t.account_id: t for t in tasks}
+
+    distribution = _distribute_warmup_channels(new_pool, account_ids, overlap=0.25)
+
+    today = date.today()
+    total_regen = 0
+
+    for acc_id, channels_for_acc in distribution.items():
+        t = by_acc.get(acc_id)
+        if not t:
+            continue
+
+        t.target_channels = list(channels_for_acc)
+
+        # Удаляем будущие планы
+        await db.execute(
+            sa_delete(CampaignPlan).where(
+                CampaignPlan.warmup_task_id == t.id,
+                CampaignPlan.plan_date > today,
+            )
+        )
+        await db.flush()
+
+        # Текущий день этой таски
+        today_plan = (await db.execute(
+            select(CampaignPlan).where(
+                CampaignPlan.warmup_task_id == t.id,
+                CampaignPlan.plan_date == today,
+            )
+        )).scalar_one_or_none()
+        current_day = today_plan.day_number if today_plan else (t.day or 1)
+        total_days = getattr(t, "total_days", 7) or 7
+        future_days = list(range(current_day + 1, total_days + 1))
+
+        if not future_days:
+            continue
+
+        acc = (await db.execute(
+            select(TelegramAccount).where(TelegramAccount.id == t.account_id)
+        )).scalar_one_or_none()
+        phone = acc.phone if acc else str(t.account_id)
+
+        # Только ещё-не-подписанные каналы получают join action
+        remaining = [c for c in channels_for_acc if c.lower() not in subscribed_low]
+        daily_max = max(0, t.daily_join_max or 0)
+        shuffled = list(remaining)
+        random.shuffle(shuffled)
+        day_subs = {d: [] for d in future_days}
+        if daily_max > 0:
+            for ch in shuffled:
+                days_order = list(future_days)
+                random.shuffle(days_order)
+                for d in days_order:
+                    if len(day_subs[d]) < daily_max:
+                        day_subs[d].append(ch)
+                        break
+
+        personality = assign_personality(str(t.account_id))
+        for day_num in future_days:
+            plan_date = today + timedelta(days=day_num - current_day)
+            plan = generate_daily_plan(
+                account_id=t.account_id, phone=phone,
+                campaign_channels=[], campaign_id=0,
+                day_number=day_num, comments_today=0, personality=personality,
+            )
+            subs_today = day_subs.get(day_num, [])
+            if subs_today:
+                sessions = [s for s in plan.get("sessions", [])
+                            if not s.get("skipped") and s.get("actions")]
+                for i, ch in enumerate(subs_today):
+                    if sessions:
+                        sess = sessions[i % len(sessions)]
+                        pos = random.randint(0, len(sess["actions"]))
+                        sess["actions"].insert(pos, {
+                            "type": "warmup_subscribe",
+                            "channel": ch,
+                            "pause_after": random.randint(30, 120),
+                        })
+            db.add(CampaignPlan(
+                campaign_id=None, warmup_task_id=t.id,
+                account_id=t.account_id, plan_date=plan_date,
+                day_number=day_num, plan=plan,
+                total_comments=0, executed_idx=0, status="active",
+            ))
+            total_regen += 1
+
+    await db.flush()
+
+    return {
+        "success": True,
+        "old_pool_count": len(old_pool),
+        "new_pool_count": len(new_pool),
+        "tasks_updated": len(tasks),
+        "future_days_regenerated": total_regen,
+        "action": body.action,
+    }
+
+
+# ── DEPRECATED: одиночный task-level edit (оставлен для совместимости) ──
 
 
 @router.patch("/tasks/{task_id}/channels")

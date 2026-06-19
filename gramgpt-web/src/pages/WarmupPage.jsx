@@ -21,16 +21,41 @@ export default function WarmupPage() {
   const [chAction, setChAction] = useState('add')   // 'replace' | 'add' | 'remove'
   const [chText, setChText] = useState('')
   const [chSaving, setChSaving] = useState(false)
+  const [chBatch, setChBatch] = useState(null)      // {batch_id, batch_name}
+  const [chPool, setChPool] = useState(null)        // [{channel, tasks_count, subscribed_count}]
+  const [chPoolLoading, setChPoolLoading] = useState(false)
 
-  const openChannelsModal = (task) => {
-    setSelectedTask(task)
+  const openChannelsModal = async (batch) => {
+    // batch = {batch_id, batch_name, tasks}
+    setChBatch(batch)
     setChAction('add')
     setChText('')
+    setChPool(null)
     setChannelsModal(true)
+    setChPoolLoading(true)
+    try {
+      const { data } = await warmupAPI.batchChannels(batch.batch_id)
+      setChPool(data.channels || [])
+    } catch (e) {
+      setChPool([])
+      alert('Не удалось загрузить список каналов: ' + (e.response?.data?.detail || e.message))
+    } finally {
+      setChPoolLoading(false)
+    }
+  }
+
+  // При смене режима — если replace, предзаполняем textarea текущим списком
+  // (чтобы юзер мог увидеть и отредактировать). Для add/remove — оставляем
+  // как есть (юзер решает что добавить или убрать).
+  const setChActionWithPrefill = (action) => {
+    setChAction(action)
+    if (action === 'replace' && chPool && chPool.length > 0 && !chText.trim()) {
+      setChText(chPool.map(p => '@' + p.channel).join('\n'))
+    }
   }
 
   const handleChannelsSave = async () => {
-    if (!selectedTask) return
+    if (!chBatch) return
     const channels = chText
       .split(/[\n,]+/)
       .map(s => s.trim().replace(/^@/, ''))
@@ -38,17 +63,15 @@ export default function WarmupPage() {
     if (channels.length === 0) { alert('Добавь хотя бы один канал'); return }
     setChSaving(true)
     try {
-      const { data } = await warmupAPI.editChannels(selectedTask.id, chAction, channels)
+      const { data } = await warmupAPI.editBatchChannels(chBatch.batch_id, chAction, channels)
       setChannelsModal(false)
       setChText('')
       await load()
       alert(
-        `✅ Каналы обновлены\n\n` +
-        `Действие: ${chAction}\n` +
-        `Было: ${data.old_count} → стало: ${data.new_count}\n` +
-        `Подписаться осталось: ${data.remaining_to_subscribe}\n` +
-        `Перегенерировано будущих дней: ${data.future_days_regenerated}` +
-        (data.warning ? `\n\n⚠ ${data.warning}` : '')
+        `✅ Каналы обновлены (${chAction})\n\n` +
+        `Пул каналов: ${data.old_pool_count} → ${data.new_pool_count}\n` +
+        `Аккаунтов обновлено: ${data.tasks_updated}\n` +
+        `Перегенерировано будущих дней: ${data.future_days_regenerated}`
       )
     } catch (e) {
       alert('Ошибка: ' + (e.response?.data?.detail || e.message))
@@ -367,7 +390,6 @@ export default function WarmupPage() {
           {t.status === 'paused' && <Button variant="primary" size="sm" onClick={() => handleStart(t.id)}>▶ Продолжить</Button>}
           <Button variant="ghost" size="sm" onClick={() => openPlan(t)}>📅 План</Button>
           <Button variant="ghost" size="sm" onClick={() => openLogs(t)}>📋 Логи</Button>
-          <Button variant="ghost" size="sm" onClick={() => openChannelsModal(t)} title="Изменить список целевых каналов">📢 Каналы</Button>
           {t.status !== 'running' && <Button variant="ghost" size="sm" onClick={() => handleDelete(t.id)}>✕</Button>}
         </div>
       </div>
@@ -451,6 +473,9 @@ export default function WarmupPage() {
                             📅 Запланировать кампанию
                           </Button>
                         )}
+                        <Button variant="ghost" size="sm" onClick={() => openChannelsModal(g)} title="Изменить список каналов для всех аккаунтов этого прогрева">
+                          📢 Каналы
+                        </Button>
                         {running === 0 && <Button variant="ghost" size="sm" onClick={() => handleDeleteBatch(g)} title="Удалить весь прогрев">🗑 Удалить</Button>}
                       </div>
                     </div>
@@ -782,32 +807,68 @@ export default function WarmupPage() {
         </Modal>
       )}
 
-      {/* ══ Edit channels Modal ══ */}
-      {channelsModal && selectedTask && (
-        <Modal open={true} title={`📢 Каналы прогрева: ${selectedTask.account_phone || selectedTask.account_name}`}
-               onClose={() => setChannelsModal(false)} width={580}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-            {/* Текущие каналы */}
-            <div style={{ padding: 10, borderRadius: 8, background: 'var(--bg-3)', fontSize: 12 }}>
-              <div style={{ color: 'var(--text-3)', marginBottom: 4 }}>
-                Сейчас в плане: <strong style={{ color: 'var(--text)' }}>{selectedTask.target_count ?? 0}</strong>
-                {' '}· уже подписан: <strong style={{ color: 'var(--green)' }}>{selectedTask.subscribed_count ?? 0}</strong>
+      {/* ══ Edit channels Modal (batch-level) ══ */}
+      {channelsModal && chBatch && (
+        <Modal open={true} title={`📢 Каналы прогрева · ${chBatch.batch_name}`}
+               onClose={() => setChannelsModal(false)} width={680}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14, maxHeight: '75vh', overflow: 'auto' }}>
+            {/* Текущий пул */}
+            <div style={{ padding: 10, borderRadius: 8, background: 'var(--bg-3)' }}>
+              <div style={{ fontSize: 12, color: 'var(--text-3)', marginBottom: 8, display: 'flex', justifyContent: 'space-between' }}>
+                <span>
+                  Сейчас в пуле: <strong style={{ color: 'var(--text)' }}>{chPool ? chPool.length : '…'}</strong>
+                  {' '}каналов · аккаунтов в batch'е: <strong style={{ color: 'var(--text)' }}>{chBatch.tasks?.length || 0}</strong>
+                </span>
+                {chPool && chPool.length > 0 && (
+                  <button onClick={() => {
+                    setChText(chPool.map(p => '@' + p.channel).join('\n'))
+                  }} style={{ background: 'none', border: 'none', color: 'var(--violet)', cursor: 'pointer', fontSize: 11 }}>
+                    Скопировать в форму ↓
+                  </button>
+                )}
               </div>
-              <div style={{ color: 'var(--text-3)', fontSize: 11 }}>
-                Будущие дни плана будут пересчитаны под новый список. Сегодняшний день не трогается.
+              {chPoolLoading ? (
+                <div style={{ padding: 16, textAlign: 'center' }}><Spinner size={20} /></div>
+              ) : !chPool || chPool.length === 0 ? (
+                <div style={{ fontSize: 12, color: 'var(--text-3)', padding: 10, textAlign: 'center' }}>
+                  Пока нет каналов в пуле. Добавь через форму ниже.
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, maxHeight: 130, overflowY: 'auto' }}>
+                  {chPool.map(p => {
+                    const allSubbed = p.subscribed_count >= p.tasks_count
+                    return (
+                      <span key={p.channel} title={`Назначен ${p.tasks_count} акк., подписано ${p.subscribed_count}`}
+                        style={{
+                          padding: '3px 8px', borderRadius: 6, fontSize: 11,
+                          background: allSubbed ? 'rgba(61,214,140,0.15)' : 'rgba(124,77,255,0.10)',
+                          color: allSubbed ? 'var(--green)' : 'var(--text-2)',
+                          border: `1px solid ${allSubbed ? 'rgba(61,214,140,0.3)' : 'rgba(124,77,255,0.25)'}`,
+                          fontFamily: 'monospace',
+                        }}>
+                        {allSubbed && '✓ '}@{p.channel}
+                        <span style={{ opacity: 0.5, marginLeft: 4 }}>{p.subscribed_count}/{p.tasks_count}</span>
+                      </span>
+                    )
+                  })}
+                </div>
+              )}
+              <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 6, opacity: 0.8 }}>
+                <span style={{ color: 'var(--green)' }}>✓</span> — все аккаунты подписаны на этот канал.
+                Цифра = подписано / назначено.
               </div>
             </div>
 
             {/* Action radio */}
             <div>
-              <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 8 }}>Действие</label>
+              <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 8 }}>Действие над пулом</label>
               <div style={{ display: 'flex', gap: 8 }}>
                 {[
-                  { key: 'add', label: '➕ Добавить', desc: 'к существующим' },
-                  { key: 'remove', label: '➖ Удалить', desc: 'указанные из списка' },
-                  { key: 'replace', label: '🔄 Заменить', desc: 'весь список целиком' },
+                  { key: 'add', label: '➕ Добавить', desc: 'дописать к существующему пулу' },
+                  { key: 'remove', label: '➖ Удалить', desc: 'убрать указанные из пула' },
+                  { key: 'replace', label: '🔄 Заменить', desc: 'снести весь пул, поставить новый' },
                 ].map(o => (
-                  <button key={o.key} onClick={() => setChAction(o.key)} style={{
+                  <button key={o.key} onClick={() => setChActionWithPrefill(o.key)} style={{
                     flex: 1, padding: '10px 12px', borderRadius: 10, cursor: 'pointer', textAlign: 'left',
                     background: chAction === o.key ? 'rgba(124,77,255,0.15)' : 'var(--bg-3)',
                     border: `1px solid ${chAction === o.key ? 'rgba(124,77,255,0.4)' : 'var(--border)'}`,
@@ -823,21 +884,27 @@ export default function WarmupPage() {
             {/* Textarea */}
             <div>
               <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>
-                {chAction === 'remove' ? 'Каналы для удаления (по одному на строку)' : 'Каналы (по одному на строку или через запятую)'}
+                {chAction === 'remove' ? 'Каналы для удаления' : chAction === 'replace' ? 'Новый полный список' : 'Каналы для добавления'}
+                {' '}<span style={{ opacity: 0.6, fontWeight: 400 }}>(по одному на строку или через запятую)</span>
               </label>
               <textarea
                 value={chText}
                 onChange={e => setChText(e.target.value)}
                 placeholder={'@channel1\nchannel2\n@channel3'}
                 style={{
-                  width: '100%', minHeight: 180, padding: 10, borderRadius: 8,
+                  width: '100%', minHeight: 160, padding: 10, borderRadius: 8,
                   background: 'var(--bg-3)', border: '1px solid var(--border)',
                   color: 'var(--text)', fontSize: 12, fontFamily: 'monospace', resize: 'vertical',
                 }}
               />
               <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4 }}>
-                {chText.split(/[\n,]+/).map(s => s.trim()).filter(Boolean).length} каналов
+                {chText.split(/[\n,]+/).map(s => s.trim()).filter(Boolean).length} каналов в форме
               </div>
+            </div>
+
+            <div style={{ fontSize: 11, color: 'var(--text-3)', padding: '8px 10px', background: 'rgba(255,180,0,0.06)', border: '1px solid rgba(255,180,0,0.2)', borderRadius: 8 }}>
+              Новый пул будет распределён между всеми {chBatch.tasks?.length || 0} аккаунтами с ~25% пересечением.
+              Сегодняшний день не трогается. Уже подписанные каналы не подписываются повторно.
             </div>
 
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>

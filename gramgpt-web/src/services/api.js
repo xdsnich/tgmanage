@@ -583,6 +583,10 @@ export const warmupAPI = {
   // Изменение списка target_channels: action = 'replace' | 'add' | 'remove'
   editChannels: (id, action, channels) =>
     api.patch(`/warmup/tasks/${id}/channels`, { action, channels }),
+  // Batch-level: текущий пул каналов + редактирование
+  batchChannels: (batchId) => api.get(`/warmup/batches/${batchId}/channels`),
+  editBatchChannels: (batchId, action, channels) =>
+    api.patch(`/warmup/batches/${batchId}/channels`, { action, channels }),
   batchSubscribedChannels: (batchId) => api.get(`/warmup/batches/${batchId}/subscribed-channels`),
   plan: (id) => api.get(`/warmup/tasks/${id}/plan`),
 }
