@@ -17,6 +17,45 @@ export default function WarmupPage() {
   const [createModal, setCreateModal] = useState(false)
   const [logsModal, setLogsModal] = useState(false)
   const [selectedTask, setSelectedTask] = useState(null)
+  const [channelsModal, setChannelsModal] = useState(false)
+  const [chAction, setChAction] = useState('add')   // 'replace' | 'add' | 'remove'
+  const [chText, setChText] = useState('')
+  const [chSaving, setChSaving] = useState(false)
+
+  const openChannelsModal = (task) => {
+    setSelectedTask(task)
+    setChAction('add')
+    setChText('')
+    setChannelsModal(true)
+  }
+
+  const handleChannelsSave = async () => {
+    if (!selectedTask) return
+    const channels = chText
+      .split(/[\n,]+/)
+      .map(s => s.trim().replace(/^@/, ''))
+      .filter(Boolean)
+    if (channels.length === 0) { alert('Добавь хотя бы один канал'); return }
+    setChSaving(true)
+    try {
+      const { data } = await warmupAPI.editChannels(selectedTask.id, chAction, channels)
+      setChannelsModal(false)
+      setChText('')
+      await load()
+      alert(
+        `✅ Каналы обновлены\n\n` +
+        `Действие: ${chAction}\n` +
+        `Было: ${data.old_count} → стало: ${data.new_count}\n` +
+        `Подписаться осталось: ${data.remaining_to_subscribe}\n` +
+        `Перегенерировано будущих дней: ${data.future_days_regenerated}` +
+        (data.warning ? `\n\n⚠ ${data.warning}` : '')
+      )
+    } catch (e) {
+      alert('Ошибка: ' + (e.response?.data?.detail || e.message))
+    } finally {
+      setChSaving(false)
+    }
+  }
   const [taskLogs, setTaskLogs] = useState([])
   const [logsLoading, setLogsLoading] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -328,6 +367,7 @@ export default function WarmupPage() {
           {t.status === 'paused' && <Button variant="primary" size="sm" onClick={() => handleStart(t.id)}>▶ Продолжить</Button>}
           <Button variant="ghost" size="sm" onClick={() => openPlan(t)}>📅 План</Button>
           <Button variant="ghost" size="sm" onClick={() => openLogs(t)}>📋 Логи</Button>
+          <Button variant="ghost" size="sm" onClick={() => openChannelsModal(t)} title="Изменить список целевых каналов">📢 Каналы</Button>
           {t.status !== 'running' && <Button variant="ghost" size="sm" onClick={() => handleDelete(t.id)}>✕</Button>}
         </div>
       </div>
@@ -739,6 +779,72 @@ export default function WarmupPage() {
               ))}
             </div>
           )}
+        </Modal>
+      )}
+
+      {/* ══ Edit channels Modal ══ */}
+      {channelsModal && selectedTask && (
+        <Modal open={true} title={`📢 Каналы прогрева: ${selectedTask.account_phone || selectedTask.account_name}`}
+               onClose={() => setChannelsModal(false)} width={580}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            {/* Текущие каналы */}
+            <div style={{ padding: 10, borderRadius: 8, background: 'var(--bg-3)', fontSize: 12 }}>
+              <div style={{ color: 'var(--text-3)', marginBottom: 4 }}>
+                Сейчас в плане: <strong style={{ color: 'var(--text)' }}>{selectedTask.target_count ?? 0}</strong>
+                {' '}· уже подписан: <strong style={{ color: 'var(--green)' }}>{selectedTask.subscribed_count ?? 0}</strong>
+              </div>
+              <div style={{ color: 'var(--text-3)', fontSize: 11 }}>
+                Будущие дни плана будут пересчитаны под новый список. Сегодняшний день не трогается.
+              </div>
+            </div>
+
+            {/* Action radio */}
+            <div>
+              <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 8 }}>Действие</label>
+              <div style={{ display: 'flex', gap: 8 }}>
+                {[
+                  { key: 'add', label: '➕ Добавить', desc: 'к существующим' },
+                  { key: 'remove', label: '➖ Удалить', desc: 'указанные из списка' },
+                  { key: 'replace', label: '🔄 Заменить', desc: 'весь список целиком' },
+                ].map(o => (
+                  <button key={o.key} onClick={() => setChAction(o.key)} style={{
+                    flex: 1, padding: '10px 12px', borderRadius: 10, cursor: 'pointer', textAlign: 'left',
+                    background: chAction === o.key ? 'rgba(124,77,255,0.15)' : 'var(--bg-3)',
+                    border: `1px solid ${chAction === o.key ? 'rgba(124,77,255,0.4)' : 'var(--border)'}`,
+                    color: chAction === o.key ? 'var(--violet)' : 'var(--text-2)', transition: 'all 0.15s',
+                  }}>
+                    <div style={{ fontSize: 13, fontWeight: 600 }}>{o.label}</div>
+                    <div style={{ fontSize: 10, opacity: 0.7, marginTop: 2 }}>{o.desc}</div>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Textarea */}
+            <div>
+              <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>
+                {chAction === 'remove' ? 'Каналы для удаления (по одному на строку)' : 'Каналы (по одному на строку или через запятую)'}
+              </label>
+              <textarea
+                value={chText}
+                onChange={e => setChText(e.target.value)}
+                placeholder={'@channel1\nchannel2\n@channel3'}
+                style={{
+                  width: '100%', minHeight: 180, padding: 10, borderRadius: 8,
+                  background: 'var(--bg-3)', border: '1px solid var(--border)',
+                  color: 'var(--text)', fontSize: 12, fontFamily: 'monospace', resize: 'vertical',
+                }}
+              />
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4 }}>
+                {chText.split(/[\n,]+/).map(s => s.trim()).filter(Boolean).length} каналов
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <Button variant="ghost" onClick={() => setChannelsModal(false)} disabled={chSaving}>Отмена</Button>
+              <Button variant="primary" onClick={handleChannelsSave} loading={chSaving}>Сохранить</Button>
+            </div>
+          </div>
         </Modal>
       )}
 

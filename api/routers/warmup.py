@@ -746,6 +746,178 @@ async def delete_warmup_batch(
     return {"deleted": len(task_ids), "message": f"Удалён прогрев ({len(task_ids)} аккаунтов)"}
 
 
+# ── РЕДАКТИРОВАНИЕ КАНАЛОВ ───────────────────────────────────
+
+
+class WarmupChannelsEdit(BaseModel):
+    action: str               # "replace" | "add" | "remove"
+    channels: list[str]       # список username'ов (с @ или без — нормализуем)
+
+
+@router.patch("/tasks/{task_id}/channels")
+async def edit_warmup_channels(
+    task_id: int,
+    body: WarmupChannelsEdit,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Изменяет список target_channels для прогрева.
+
+    Режимы:
+      replace — заменить весь список новым
+      add     — добавить к существующим (с дедупом)
+      remove  — удалить указанные из списка
+
+    Что происходит:
+    - Поле target_channels обновляется.
+    - subscribed_channels (уже подписанные) НЕ трогаем — нет смысла
+      подписываться повторно.
+    - Будущие CampaignPlan (где plan_date > today) удаляются и
+      перегенерируются: оставшиеся каналы (target - subscribed)
+      распределяются по оставшимся дням с daily_join_max лимитом.
+    - Сегодняшний план НЕ трогаем — он может уже частично выполнен.
+    """
+    from datetime import date
+    from models.campaign_plan import CampaignPlan
+    from tasks.plan_generator import generate_daily_plan
+    from tasks.behavior_engine import assign_personality
+
+    if body.action not in ("replace", "add", "remove"):
+        raise HTTPException(status_code=400, detail="action: replace | add | remove")
+
+    result = await db.execute(
+        select(WarmupTask).where(
+            WarmupTask.id == task_id,
+            WarmupTask.user_id == current_user.id,
+        )
+    )
+    t = result.scalar_one_or_none()
+    if not t:
+        raise HTTPException(status_code=404, detail="Прогрев не найден")
+
+    def _norm(ch: str) -> str:
+        return ch.lstrip("@").strip()
+
+    incoming = [_norm(c) for c in (body.channels or []) if _norm(c)]
+    old = [_norm(c) for c in (t.target_channels or []) if _norm(c)]
+
+    if body.action == "replace":
+        new_list = incoming
+    elif body.action == "add":
+        # dedup с сохранением порядка
+        seen = set()
+        new_list = []
+        for c in old + incoming:
+            if c.lower() not in seen:
+                seen.add(c.lower())
+                new_list.append(c)
+    else:  # remove
+        rm = {c.lower() for c in incoming}
+        new_list = [c for c in old if c.lower() not in rm]
+
+    t.target_channels = new_list
+    await db.flush()
+
+    # ── Перегенерируем планы для будущих дней ─────────────────
+    # Сегодняшний план не трогаем (его actions могут уже частично
+    # выполниться). Для plan_date > today — удаляем и заново.
+    today = date.today()
+    subscribed_set = {_norm(k) for k in (t.subscribed_channels or {}).keys()}
+    remaining = [c for c in new_list if c.lower() not in {s.lower() for s in subscribed_set}]
+
+    # Удаляем будущие планы
+    await db.execute(
+        sa_delete(CampaignPlan).where(
+            CampaignPlan.warmup_task_id == t.id,
+            CampaignPlan.plan_date > today,
+        )
+    )
+    await db.flush()
+
+    # Определяем какой сейчас day_number для этой задачи (по сегодняшнему плану)
+    today_plan_r = await db.execute(
+        select(CampaignPlan).where(
+            CampaignPlan.warmup_task_id == t.id,
+            CampaignPlan.plan_date == today,
+        )
+    )
+    today_plan = today_plan_r.scalar_one_or_none()
+    current_day = today_plan.day_number if today_plan else (t.day or 1)
+
+    # Загружаем акк (для phone в plan generator)
+    acc = (await db.execute(
+        select(TelegramAccount).where(TelegramAccount.id == t.account_id)
+    )).scalar_one_or_none()
+    phone = acc.phone if acc else str(t.account_id)
+
+    # Распределяем remaining по оставшимся дням
+    total_days = getattr(t, "total_days", 7) or 7
+    daily_max = max(0, t.daily_join_max or 0)
+    future_days = [d for d in range(current_day + 1, total_days + 1)]
+    if not future_days:
+        return {
+            "success": True,
+            "target_channels": new_list,
+            "remaining_to_subscribe": len(remaining),
+            "future_days_regenerated": 0,
+            "warning": "Прогрев уже на последнем дне — будущих планов нет, обновлён только список",
+        }
+
+    shuffled = list(remaining)
+    random.shuffle(shuffled)
+    day_subs = {d: [] for d in future_days}
+    if daily_max > 0:
+        for ch in shuffled:
+            days_order = list(future_days)
+            random.shuffle(days_order)
+            for d in days_order:
+                if len(day_subs[d]) < daily_max:
+                    day_subs[d].append(ch)
+                    break
+
+    personality = assign_personality(str(t.account_id))
+
+    for day_num in future_days:
+        plan_date = today + timedelta(days=day_num - current_day)
+        plan = generate_daily_plan(
+            account_id=t.account_id,
+            phone=phone,
+            campaign_channels=[], campaign_id=0,
+            day_number=day_num, comments_today=0, personality=personality,
+        )
+        subs_today = day_subs.get(day_num, [])
+        if subs_today:
+            sessions = [s for s in plan.get("sessions", [])
+                        if not s.get("skipped") and s.get("actions")]
+            for i, ch in enumerate(subs_today):
+                if sessions:
+                    sess = sessions[i % len(sessions)]
+                    pos = random.randint(0, len(sess["actions"]))
+                    sess["actions"].insert(pos, {
+                        "type": "warmup_subscribe",
+                        "channel": ch,
+                        "pause_after": random.randint(30, 120),
+                    })
+        db.add(CampaignPlan(
+            campaign_id=None, warmup_task_id=t.id,
+            account_id=t.account_id, plan_date=plan_date,
+            day_number=day_num, plan=plan,
+            total_comments=0, executed_idx=0, status="active",
+        ))
+
+    await db.flush()
+
+    return {
+        "success": True,
+        "target_channels": new_list,
+        "old_count": len(old),
+        "new_count": len(new_list),
+        "remaining_to_subscribe": len(remaining),
+        "future_days_regenerated": len(future_days),
+    }
+
+
 # ── ЛОГИ ─────────────────────────────────────────────────────
 
 @router.get("/tasks/{task_id}/logs")

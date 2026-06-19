@@ -580,6 +580,9 @@ export const warmupAPI = {
   modes: () => api.get('/warmup/modes'),
   pause: (id) => api.post(`/warmup/tasks/${id}/pause`),
   subscribedChannels: (id) => api.get(`/warmup/tasks/${id}/subscribed-channels`),
+  // Изменение списка target_channels: action = 'replace' | 'add' | 'remove'
+  editChannels: (id, action, channels) =>
+    api.patch(`/warmup/tasks/${id}/channels`, { action, channels }),
   batchSubscribedChannels: (batchId) => api.get(`/warmup/batches/${batchId}/subscribed-channels`),
   plan: (id) => api.get(`/warmup/tasks/${id}/plan`),
 }
