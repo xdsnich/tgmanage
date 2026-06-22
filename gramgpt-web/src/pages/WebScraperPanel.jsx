@@ -330,7 +330,7 @@ export default function WebScraperPanel() {
                 return (
                   <button
                     key={l.code}
-                    onClick={toggle(selectedLangs, setSelectedLangs)(l.code)}
+                    onClick={() => toggle(selectedLangs, setSelectedLangs)(l.code)}
                     disabled={isRunning}
                     style={{
                       display: 'flex', alignItems: 'center', gap: 6,
@@ -372,7 +372,7 @@ export default function WebScraperPanel() {
                 return (
                   <button
                     key={c.code}
-                    onClick={toggle(selectedCats, setSelectedCats)(c.code)}
+                    onClick={() => toggle(selectedCats, setSelectedCats)(c.code)}
                     disabled={isRunning}
                     style={{
                       padding: '6px 9px', borderRadius: 6,
