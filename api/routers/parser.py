@@ -1430,21 +1430,29 @@ async def web_scrape_list_jobs(current_user: User = Depends(get_current_user)):
 
 @router.get("/web/scrape/tgstat/options")
 async def web_scrape_tgstat_options(current_user: User = Depends(get_current_user)):
-    """Справочник для UI: какие гео и категории доступны на TGStat."""
-    from utils.web_scraper import GEO_LANGUAGES, GEO_CATEGORIES
+    """Справочник для UI: какие гео доступны на TGStat."""
+    from utils.web_scraper import GEO_COUNTRIES
     return {
-        "languages": GEO_LANGUAGES,
-        "categories": GEO_CATEGORIES,
+        # languages/categories — legacy, оставлены для совместимости со старым фронтом
+        "languages": GEO_COUNTRIES,
+        "categories": [],
+        "countries": GEO_COUNTRIES,
+        "targets": [
+            {"key": "channels", "label": "📢 Каналы (рейтинг)"},
+            {"key": "chats",    "label": "💬 Чаты с комментами (рейтинг discussion-групп)"},
+        ],
     }
 
 
 class WebScrapeTgstatRequest(BaseModel):
     proxies: list[str]
-    languages: list[str] = []           # коды из GEO_LANGUAGES, пусто = все
-    categories: list[str] = []          # slug'и из GEO_CATEGORIES, пусто = без фильтра
+    languages: list[str] = []           # legacy, не используется
+    categories: list[str] = []          # legacy, не используется
+    countries: list[str] = []           # ISO-2 коды (RU, UA, KZ...) или пусто = глобально
+    target: str = "chats"               # "chats" (по умолчанию — с комментами) | "channels"
     only_with_comments: bool = True
     pages_per_geo: int = 1              # сколько страниц с каждого среза
-    include_global: bool = False        # добавлять глобальный (без language)
+    include_global: bool = False        # добавлять глобальный URL (без country)
 
     max_workers: Optional[int] = 3
     max_retries: Optional[int] = 3
@@ -1473,17 +1481,24 @@ async def web_scrape_tgstat_start(
             detail=f"Минимум 3 прокси (передано {len(proxies)})",
         )
 
+    # Если фронт прислал старое поле "languages" вместо нового "countries" —
+    # принимаем как страны (фронт ещё мог не обновиться). И наоборот.
+    countries = body.countries or body.languages or []
+    target = (body.target or "chats").lower()
+    if target not in ("channels", "chats"):
+        target = "chats"
+
     urls = build_urls(
-        languages=body.languages,
-        categories=body.categories,
+        countries=countries,
         only_with_comments=body.only_with_comments,
         pages_per_geo=max(1, min(body.pages_per_geo, 10)),
-        include_global=body.include_global,
+        include_global=body.include_global or not countries,
+        target=target,
     )
     if not urls:
         raise HTTPException(
             status_code=400,
-            detail="Не получилось собрать ни одного URL — укажи хотя бы один язык или категорию",
+            detail="Не получилось собрать ни одного URL — выбери хотя бы одну страну или включи глобальный.",
         )
 
     job_id = _uuid.uuid4().hex

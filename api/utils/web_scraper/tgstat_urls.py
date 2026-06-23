@@ -1,196 +1,134 @@
 """
-tgstat_urls.py — генератор URL для TGStat по гео и категориям.
+tgstat_urls.py — генератор URL для TGStat.
 
-TGStat использует разные паттерны URL для разных срезов:
-  - Главный рейтинг:            https://tgstat.com/ratings/channels
-  - Рейтинг по языку:           https://tgstat.com/{lang}/ratings/channels
-  - Категория глобально:        https://tgstat.com/channels/category/{cat}
-  - Категория по языку:         https://tgstat.com/{lang}/channels/category/{cat}
-  - Раздел "обсуждаемое":       https://tgstat.com/ratings/channels?sort=discussions
-                                                                              ^ комменты
+ВАЖНО: TGStat'овская реальная структура URL (проверена живо 2026-06-22):
 
-Здесь — справочник доступных стран/языков/категорий и функция build_urls,
-которая собирает финальный список URL'ов по выбору пользователя.
+  ✅ /ratings/channels                  — глобальный рейтинг каналов
+  ✅ /ratings/chats                     — рейтинг ЧАТОВ (discussion groups)
+                                          ← здесь и сидят чаты в которых можно писать
+  ✅ /ratings/chats?country=RU          — чаты по стране
+  ✅ /channel/@username                 — детальная страница канала
+  ✅ /channel/@username/N               — конкретный пост
 
-Списки взяты из публичного интерфейса TGStat — стандартный набор для
-русско/восточно-европейской аудитории + основные европейские и азиатские.
-Если конкретный gear не работает на стороне TGStat — он просто отдаст
-404 и узел этот URL пропустит без фатала.
+  ❌ /ratings/channels?sort=discussions — НЕ работает (404)
+  ❌ /channels/category/{cat}           — НЕ работает (404)
+  ❌ /{lang}/...                        — НЕ работает (404)
+
+Что значит "канал с открытыми комментами":
+  В Telegram комментарии под постом канала на самом деле пишутся в
+  привязанный discussion group (чат). Если у канала есть linked chat —
+  значит на канале можно писать комменты. На TGStat этот discussion
+  group имеет отдельную страницу /chat/@xxx и попадает в /ratings/chats.
+
+  Поэтому самый прямой способ получить "каналы с комментами" =
+  взять рейтинг чатов и для каждого определить линкованный канал
+  (часто по конвенции имени: @xxx_chat → @xxx).
 """
 
 from typing import Iterable
 from urllib.parse import urlencode
 
 
-# ── Языки/гео ──────────────────────────────────────────────────────
-# Код, который TGStat использует в первом сегменте пути (или country=).
-# label — для UI.
-GEO_LANGUAGES: list[dict] = [
-    {"code": "ru", "label": "Russia / Russian",     "flag": "🇷🇺"},
-    {"code": "uk", "label": "Ukraine / Ukrainian",  "flag": "🇺🇦"},
-    {"code": "by", "label": "Belarus / Belarusian", "flag": "🇧🇾"},
-    {"code": "kz", "label": "Kazakhstan",            "flag": "🇰🇿"},
-    {"code": "uz", "label": "Uzbekistan",            "flag": "🇺🇿"},
-    {"code": "az", "label": "Azerbaijan",            "flag": "🇦🇿"},
-    {"code": "en", "label": "English (global)",      "flag": "🇬🇧"},
-    {"code": "de", "label": "Germany / German",      "flag": "🇩🇪"},
-    {"code": "fr", "label": "France / French",       "flag": "🇫🇷"},
-    {"code": "es", "label": "Spain / Spanish",       "flag": "🇪🇸"},
-    {"code": "it", "label": "Italy / Italian",       "flag": "🇮🇹"},
-    {"code": "pt", "label": "Portugal / Portuguese", "flag": "🇵🇹"},
-    {"code": "pl", "label": "Poland / Polish",       "flag": "🇵🇱"},
-    {"code": "tr", "label": "Turkey / Turkish",      "flag": "🇹🇷"},
-    {"code": "ar", "label": "Arabic",                "flag": "🇸🇦"},
-    {"code": "in", "label": "India / Hindi",         "flag": "🇮🇳"},
-    {"code": "id", "label": "Indonesia",             "flag": "🇮🇩"},
-    {"code": "vn", "label": "Vietnam",               "flag": "🇻🇳"},
-    {"code": "us", "label": "USA",                   "flag": "🇺🇸"},
-    {"code": "br", "label": "Brazil / Portuguese",   "flag": "🇧🇷"},
+# ── Гео ────────────────────────────────────────────────────────────
+# На TGStat используется ISO country code в верхнем регистре в параметре
+# ?country=XX. Проверено вживую: ?country=RU отдаёт 200.
+GEO_COUNTRIES: list[dict] = [
+    {"code": "RU", "label": "Russia",        "flag": "🇷🇺"},
+    {"code": "UA", "label": "Ukraine",       "flag": "🇺🇦"},
+    {"code": "BY", "label": "Belarus",       "flag": "🇧🇾"},
+    {"code": "KZ", "label": "Kazakhstan",    "flag": "🇰🇿"},
+    {"code": "UZ", "label": "Uzbekistan",    "flag": "🇺🇿"},
+    {"code": "AZ", "label": "Azerbaijan",    "flag": "🇦🇿"},
+    {"code": "DE", "label": "Germany",       "flag": "🇩🇪"},
+    {"code": "FR", "label": "France",        "flag": "🇫🇷"},
+    {"code": "ES", "label": "Spain",         "flag": "🇪🇸"},
+    {"code": "IT", "label": "Italy",         "flag": "🇮🇹"},
+    {"code": "PT", "label": "Portugal",      "flag": "🇵🇹"},
+    {"code": "PL", "label": "Poland",        "flag": "🇵🇱"},
+    {"code": "TR", "label": "Turkey",        "flag": "🇹🇷"},
+    {"code": "IN", "label": "India",         "flag": "🇮🇳"},
+    {"code": "ID", "label": "Indonesia",     "flag": "🇮🇩"},
+    {"code": "VN", "label": "Vietnam",       "flag": "🇻🇳"},
+    {"code": "US", "label": "USA",           "flag": "🇺🇸"},
+    {"code": "BR", "label": "Brazil",        "flag": "🇧🇷"},
+    {"code": "GB", "label": "United Kingdom","flag": "🇬🇧"},
 ]
 
 
-# Категории TGStat. URL-slug может различаться, пробую общеупотребимые.
-GEO_CATEGORIES: list[dict] = [
-    {"code": "news",          "label": "Новости и СМИ"},
-    {"code": "politics",      "label": "Политика"},
-    {"code": "economics",     "label": "Экономика, бизнес"},
-    {"code": "cryptocurrencies", "label": "Криптовалюты"},
-    {"code": "technologies",  "label": "Технологии"},
-    {"code": "marketing-pr",  "label": "Маркетинг и PR"},
-    {"code": "sales",         "label": "Продажи"},
-    {"code": "education",     "label": "Образование"},
-    {"code": "telegram",      "label": "Telegram"},
-    {"code": "entertainment", "label": "Развлечения"},
-    {"code": "music",         "label": "Музыка"},
-    {"code": "movies-series", "label": "Кино, сериалы"},
-    {"code": "books",         "label": "Книги"},
-    {"code": "art-design",    "label": "Искусство, дизайн"},
-    {"code": "sport",         "label": "Спорт"},
-    {"code": "travels",       "label": "Путешествия"},
-    {"code": "fashion-beauty", "label": "Мода и красота"},
-    {"code": "health-medicine", "label": "Здоровье, медицина"},
-    {"code": "psychology",    "label": "Психология"},
-    {"code": "religion",      "label": "Религия"},
-    {"code": "humor",         "label": "Юмор"},
-    {"code": "games",         "label": "Игры"},
-    {"code": "cars",          "label": "Авто и мото"},
-    {"code": "food-cooking",  "label": "Еда и кулинария"},
-    {"code": "linguistics",   "label": "Лингвистика, языки"},
-]
+# Категории на TGStat сделаны как пользовательские "подборки" и
+# их URL'ы непредсказуемы. Поэтому фильтра по категории нет —
+# берём только страны и пагинацию.
+GEO_CATEGORIES: list[dict] = []   # legacy совместимость
+
+# Языки тоже не используются (на TGStat нет /{lang}/... URL'ов).
+# Поле оставлено чтобы старый фронт не падал на отсутствии ключа.
+GEO_LANGUAGES: list[dict] = GEO_COUNTRIES
 
 
-# Какие шаблоны URL мы генерируем. Каждый — функция, принимающая
-# (lang, category, sort, page). Возвращает абсолютный URL.
-def _url_rating_global(lang: str | None, category: str | None,
-                       sort: str | None, page: int) -> str:
-    """https://tgstat.com/ratings/channels (или с ?sort=&page=)"""
-    base = "https://tgstat.com/ratings/channels"
-    qs = {}
-    if sort:
-        qs["sort"] = sort
-    if page > 1:
-        qs["page"] = page
-    return f"{base}?{urlencode(qs)}" if qs else base
+# ── URL-генерация ──────────────────────────────────────────────────
 
-
-def _url_rating_by_lang(lang: str | None, category: str | None,
-                        sort: str | None, page: int) -> str | None:
-    """https://tgstat.com/{lang}/ratings/channels"""
-    if not lang:
-        return None
-    base = f"https://tgstat.com/{lang}/ratings/channels"
-    qs = {}
-    if sort:
-        qs["sort"] = sort
-    if page > 1:
-        qs["page"] = page
-    return f"{base}?{urlencode(qs)}" if qs else base
-
-
-def _url_category_global(lang: str | None, category: str | None,
-                         sort: str | None, page: int) -> str | None:
-    """https://tgstat.com/channels/category/{cat}"""
-    if not category:
-        return None
-    base = f"https://tgstat.com/channels/category/{category}"
-    qs = {}
-    if sort:
-        qs["sort"] = sort
-    if page > 1:
-        qs["page"] = page
-    return f"{base}?{urlencode(qs)}" if qs else base
-
-
-def _url_category_by_lang(lang: str | None, category: str | None,
-                          sort: str | None, page: int) -> str | None:
-    """https://tgstat.com/{lang}/channels/category/{cat}"""
-    if not lang or not category:
-        return None
-    base = f"https://tgstat.com/{lang}/channels/category/{category}"
-    qs = {}
-    if sort:
-        qs["sort"] = sort
-    if page > 1:
-        qs["page"] = page
-    return f"{base}?{urlencode(qs)}" if qs else base
+# Target type:
+#   "channels" — обычный рейтинг каналов (/ratings/channels)
+#   "chats"    — рейтинг чатов = discussion groups (/ratings/chats)
+#                ← вот это и есть "каналы с открытыми комментами"
 
 
 def build_urls(
-    languages: Iterable[str] | None = None,
-    categories: Iterable[str] | None = None,
+    languages: Iterable[str] | None = None,    # legacy совместимость, не используется
+    categories: Iterable[str] | None = None,   # legacy совместимость, не используется
     only_with_comments: bool = False,
     pages_per_geo: int = 1,
-    include_global: bool = True,
+    include_global: bool = False,
+    countries: Iterable[str] | None = None,
+    target: str = "channels",                  # "channels" | "chats"
 ) -> list[str]:
     """
-    Собирает финальный список URL'ов из выбора пользователя.
+    Собирает финальный список URL'ов TGStat по выбору пользователя.
+
+    only_with_comments=True АВТОМАТИЧЕСКИ переключает target на "chats"
+    (потому что чаты на TGStat = discussion groups = места где
+    собственно ведутся обсуждения под постами каналов).
 
     Args:
-        languages: список language кодов (см. GEO_LANGUAGES). Если пусто
-            и include_global=True — только глобальный рейтинг.
-        categories: список slug'ов категорий (см. GEO_CATEGORIES). Если
-            пусто — рейтинг без фильтра по категории.
-        only_with_comments: если True — добавляет sort=discussions,
-            чтобы рейтинг был отсортирован по обсуждаемости (там
-            каналы с активными чатами всплывают наверх). Финальная
-            фильтрация has_comments всё равно делается extractor'ом.
-        pages_per_geo: сколько страниц с каждого среза взять. На каждом
-            URL extractor сам подгружает "Показать ещё" 8 раз, поэтому
-            обычно 1 страницы хватает на 60-100 карточек.
-        include_global: добавлять ли URL'ы без язык-сегмента (глобальный
-            рейтинг + категории глобально).
+        countries: список ISO-2 кодов стран (см. GEO_COUNTRIES).
+            Если пуст и include_global=True — только глобальный рейтинг.
+        pages_per_geo: страниц с каждого среза. У TGStat пагинации в
+            явном виде нет (это infinite scroll), поэтому реально
+            ставим 1; параметр оставлен для совместимости.
+        include_global: добавлять ли URL без фильтра по стране.
+        target: "channels" или "chats". "chats" = discussion groups
+            (в них пишут комменты под постами канала).
 
     Returns:
         list уникальных URL.
+
+    Игнорируемые параметры (для обратной совместимости с языко-/
+    категорийными вызовами):
+        languages, categories — TGStat не поддерживает такие фильтры
+        в URL. URL вида /{lang}/channels/category/{cat} возвращают 404.
     """
-    sort = "discussions" if only_with_comments else None
-    langs = list(languages or []) or [None]  # None означает "без языка"
-    cats = list(categories or []) or [None]  # None — без категории
+    # Если юзер хочет "только с комментариями" — это значит чаты
+    # (а не каналы). Переключаем target.
+    if only_with_comments and target == "channels":
+        target = "chats"
 
+    base_path = "/ratings/chats" if target == "chats" else "/ratings/channels"
+
+    countries_list = [c.upper() for c in (countries or [])]
     urls: list[str] = []
+    seen: set[str] = set()
 
-    for lang in langs:
-        for cat in cats:
-            for page in range(1, max(1, pages_per_geo) + 1):
-                # Выбираем подходящий шаблон по комбинации lang/category
-                if lang and cat:
-                    u = _url_category_by_lang(lang, cat, sort, page)
-                elif lang and not cat:
-                    u = _url_rating_by_lang(lang, cat, sort, page)
-                elif cat and not lang and include_global:
-                    u = _url_category_global(lang, cat, sort, page)
-                elif not lang and not cat and include_global:
-                    u = _url_rating_global(lang, cat, sort, page)
-                else:
-                    u = None
-                if u:
-                    urls.append(u)
+    def _add(url: str):
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
 
-    # Дедуп с сохранением порядка
-    seen = set()
-    out = []
-    for u in urls:
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
+    # 1. Глобальный (без country)
+    if include_global or not countries_list:
+        _add(f"https://tgstat.com{base_path}")
+
+    # 2. По странам
+    for cc in countries_list:
+        _add(f"https://tgstat.com{base_path}?{urlencode({'country': cc})}")
+
+    return urls

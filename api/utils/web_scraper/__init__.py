@@ -16,7 +16,7 @@ from .node_rotator import NodeRotator, ProxyNode
 from .context_pool import BrowserContextPool
 from .checkpoint import JSONLCheckpoint
 from .tgstat_extractor import tgstat_channels_extractor
-from .tgstat_urls import build_urls, GEO_LANGUAGES, GEO_CATEGORIES
+from .tgstat_urls import build_urls, GEO_LANGUAGES, GEO_CATEGORIES, GEO_COUNTRIES
 
 __all__ = [
     "WebScraper",
@@ -29,4 +29,5 @@ __all__ = [
     "build_urls",
     "GEO_LANGUAGES",
     "GEO_CATEGORIES",
+    "GEO_COUNTRIES",
 ]

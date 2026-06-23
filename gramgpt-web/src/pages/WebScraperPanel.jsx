@@ -30,12 +30,16 @@ export default function WebScraperPanel() {
   const [headless, setHeadless] = useState(true)
 
   // TGStat режим
-  const [tgstatOptions, setTgstatOptions] = useState({ languages: [], categories: [] })
-  const [selectedLangs, setSelectedLangs] = useState(['ru', 'uk', 'en'])
-  const [selectedCats, setSelectedCats] = useState([])
+  const [tgstatOptions, setTgstatOptions] = useState({ countries: [], targets: [] })
+  // Раньше было selectedLangs — теперь это страны (ISO-2: RU, UA, KZ…).
+  // Дефолт пуст = глобальный рейтинг.
+  const [selectedCountries, setSelectedCountries] = useState([])
+  // target: 'chats' (по умолчанию — discussion-группы, где можно писать
+  // комменты) ИЛИ 'channels' (обычный рейтинг каналов).
+  const [tgstatTarget, setTgstatTarget] = useState('chats')
   const [onlyWithComments, setOnlyWithComments] = useState(true)
   const [pagesPerGeo, setPagesPerGeo] = useState(1)
-  const [includeGlobal, setIncludeGlobal] = useState(false)
+  const [includeGlobal, setIncludeGlobal] = useState(true)
   const [aggregated, setAggregated] = useState(null)
   const [aggregateMinSubs, setAggregateMinSubs] = useState(1000)
   const [aggregating, setAggregating] = useState(false)
@@ -95,7 +99,16 @@ export default function WebScraperPanel() {
   const loadTgstatOptions = async () => {
     try {
       const { data } = await parserAPI.webScrapeTgstatOptions()
-      setTgstatOptions(data)
+      // Бэк теперь отдаёт {countries, targets, ...}. На случай если бэк
+      // ещё старый (отдаёт languages) — мапим в countries для совместимости.
+      const countries = data.countries || data.languages || []
+      setTgstatOptions({
+        countries,
+        targets: data.targets || [
+          { key: 'chats',    label: '💬 Чаты с комментами' },
+          { key: 'channels', label: '📢 Каналы (рейтинг)' },
+        ],
+      })
     } catch (e) { console.error(e) }
   }
 
@@ -118,11 +131,12 @@ export default function WebScraperPanel() {
     return () => stopPolling()
   }, [])
 
-  // Сколько URL будет сгенерировано в режиме TGStat — для preview
+  // Сколько URL будет сгенерировано — для preview.
+  // Логика: 1 URL на страну + 1 URL глобальный (если включён), × pages.
   const tgstatUrlsCount = (() => {
-    const langs = selectedLangs.length || (includeGlobal ? 1 : 0)
-    const cats = selectedCats.length || 1
-    return langs * cats * Math.max(1, pagesPerGeo)
+    let base = selectedCountries.length
+    if (includeGlobal || base === 0) base += 1
+    return base * Math.max(1, pagesPerGeo)
   })()
 
   // ── handlers ────────────────────────────────────────────────────
@@ -146,15 +160,15 @@ export default function WebScraperPanel() {
     try {
       let resp
       if (mode === 'tgstat') {
-        if (selectedLangs.length === 0 && selectedCats.length === 0 && !includeGlobal) {
-          showToast('Выбери хотя бы одну страну, категорию или вкл. глобальный', 'err')
+        if (selectedCountries.length === 0 && !includeGlobal) {
+          showToast('Выбери хотя бы одну страну или вкл. глобальный', 'err')
           setStarting(false)
           return
         }
         resp = await parserAPI.webScrapeTgstatStart({
           proxies,
-          languages: selectedLangs,
-          categories: selectedCats,
+          countries: selectedCountries,
+          target: tgstatTarget,
           only_with_comments: onlyWithComments,
           pages_per_geo: pagesPerGeo,
           include_global: includeGlobal,
@@ -313,84 +327,83 @@ export default function WebScraperPanel() {
         </div>
       </Card>
 
-      {/* TGStat mode controls */}
+      {/* TGStat: тип цели — каналы или чаты-с-комментами */}
       {mode === 'tgstat' && (
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
-          <Card style={{ padding: 14 }}>
-            <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-2)', marginBottom: 8 }}>
-              🌍 Страны / языки ({selectedLangs.length})
-              <button
-                onClick={() => setSelectedLangs([])}
-                style={{ float: 'right', background: 'none', border: 'none', color: 'var(--text-3)', cursor: 'pointer', fontSize: 11 }}
-              >Очистить</button>
-            </div>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 4, maxHeight: 260, overflowY: 'auto' }}>
-              {tgstatOptions.languages.map(l => {
-                const on = selectedLangs.includes(l.code)
-                return (
-                  <button
-                    key={l.code}
-                    onClick={() => toggle(selectedLangs, setSelectedLangs)(l.code)}
-                    disabled={isRunning}
-                    style={{
-                      display: 'flex', alignItems: 'center', gap: 6,
-                      padding: '6px 9px', borderRadius: 6,
-                      border: `1px solid ${on ? 'var(--violet)' : 'var(--border)'}`,
-                      background: on ? 'rgba(139, 92, 246, 0.12)' : 'var(--bg)',
-                      color: on ? 'var(--text)' : 'var(--text-2)',
-                      cursor: isRunning ? 'not-allowed' : 'pointer',
-                      fontSize: 11, textAlign: 'left',
-                    }}
-                  >
-                    <span>{l.flag}</span>
-                    <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                      {l.label}
-                    </span>
-                    <code style={{ fontSize: 10, opacity: 0.6 }}>{l.code}</code>
-                  </button>
-                )
-              })}
-            </div>
-            <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8, fontSize: 11, color: 'var(--text-2)' }}>
-              <input type="checkbox" checked={includeGlobal} disabled={isRunning}
-                onChange={e => setIncludeGlobal(e.target.checked)} />
-              + Глобальный рейтинг (без языка)
-            </label>
-          </Card>
+        <Card style={{ padding: 14 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-2)', marginBottom: 8 }}>
+            Что собираем
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            {[
+              { key: 'chats',    label: '💬 Чаты с комментами', desc: 'Discussion-группы. Тут можно писать комменты под постами.' },
+              { key: 'channels', label: '📢 Каналы (рейтинг)',  desc: 'Обычный рейтинг каналов. Большинство БЕЗ комментов.' },
+            ].map(t => {
+              const on = tgstatTarget === t.key
+              return (
+                <button
+                  key={t.key}
+                  onClick={() => setTgstatTarget(t.key)}
+                  disabled={isRunning}
+                  style={{
+                    flex: 1, padding: '10px 12px', borderRadius: 8,
+                    cursor: isRunning ? 'not-allowed' : 'pointer', textAlign: 'left',
+                    background: on ? 'rgba(139, 92, 246, 0.15)' : 'var(--bg)',
+                    border: `1px solid ${on ? 'var(--violet)' : 'var(--border)'}`,
+                    color: on ? 'var(--text)' : 'var(--text-2)',
+                  }}
+                >
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>{t.label}</div>
+                  <div style={{ fontSize: 10, opacity: 0.75, marginTop: 2 }}>{t.desc}</div>
+                </button>
+              )
+            })}
+          </div>
+        </Card>
+      )}
 
-          <Card style={{ padding: 14 }}>
-            <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-2)', marginBottom: 8 }}>
-              📂 Категории ({selectedCats.length || 'все'})
-              <button
-                onClick={() => setSelectedCats([])}
-                style={{ float: 'right', background: 'none', border: 'none', color: 'var(--text-3)', cursor: 'pointer', fontSize: 11 }}
-              >Очистить</button>
-            </div>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 4, maxHeight: 260, overflowY: 'auto' }}>
-              {tgstatOptions.categories.map(c => {
-                const on = selectedCats.includes(c.code)
-                return (
-                  <button
-                    key={c.code}
-                    onClick={() => toggle(selectedCats, setSelectedCats)(c.code)}
-                    disabled={isRunning}
-                    style={{
-                      padding: '6px 9px', borderRadius: 6,
-                      border: `1px solid ${on ? 'var(--violet)' : 'var(--border)'}`,
-                      background: on ? 'rgba(139, 92, 246, 0.12)' : 'var(--bg)',
-                      color: on ? 'var(--text)' : 'var(--text-2)',
-                      cursor: isRunning ? 'not-allowed' : 'pointer',
-                      fontSize: 11, textAlign: 'left',
-                    }}
-                  >{c.label}</button>
-                )
-              })}
-            </div>
-            <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 6 }}>
-              Пусто = все категории на странице рейтинга
-            </div>
-          </Card>
-        </div>
+      {/* TGStat: страны */}
+      {mode === 'tgstat' && (
+        <Card style={{ padding: 14 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-2)', marginBottom: 8 }}>
+            🌍 Страны ({selectedCountries.length || 'не указаны'})
+            <button
+              onClick={() => setSelectedCountries([])}
+              style={{ float: 'right', background: 'none', border: 'none', color: 'var(--text-3)', cursor: 'pointer', fontSize: 11 }}
+            >Очистить</button>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 4, maxHeight: 200, overflowY: 'auto' }}>
+            {(tgstatOptions.countries || []).map(c => {
+              const on = selectedCountries.includes(c.code)
+              return (
+                <button
+                  key={c.code}
+                  onClick={() => toggle(selectedCountries, setSelectedCountries)(c.code)}
+                  disabled={isRunning}
+                  style={{
+                    display: 'flex', alignItems: 'center', gap: 6,
+                    padding: '6px 9px', borderRadius: 6,
+                    border: `1px solid ${on ? 'var(--violet)' : 'var(--border)'}`,
+                    background: on ? 'rgba(139, 92, 246, 0.12)' : 'var(--bg)',
+                    color: on ? 'var(--text)' : 'var(--text-2)',
+                    cursor: isRunning ? 'not-allowed' : 'pointer',
+                    fontSize: 11, textAlign: 'left',
+                  }}
+                >
+                  <span>{c.flag}</span>
+                  <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {c.label}
+                  </span>
+                  <code style={{ fontSize: 10, opacity: 0.6 }}>{c.code}</code>
+                </button>
+              )
+            })}
+          </div>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8, fontSize: 11, color: 'var(--text-2)' }}>
+            <input type="checkbox" checked={includeGlobal} disabled={isRunning}
+              onChange={e => setIncludeGlobal(e.target.checked)} />
+            + Глобальный рейтинг (без фильтра по стране)
+          </label>
+        </Card>
       )}
 
       {/* TGStat filters */}

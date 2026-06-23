@@ -177,16 +177,31 @@ _JS_EXTRACT_CARDS = r"""
         if (!isNaN(p)) position = p;
       }
 
+      // ── linked_channel_guess для чатов ────────────────────
+      // Если это чат (/chat/@xxx) — типичная конвенция Telegram:
+      // канал = @ИМЯ, его linked discussion = @ИМЯ_chat / _comments /
+      // _discussion / _talk. Срезаем суффикс — это наш кандидат
+      // канала под которым можно писать комменты.
+      let linked_channel_guess = null;
+      if (isChatHref) {
+        const bare = username.replace(/^@/, '');
+        const m = bare.match(/^(.+?)(_chat|_comments|_discussion|_talk|_room|_open|_group|chat)$/i);
+        if (m && m[1].length >= 3) {
+          linked_channel_guess = '@' + m[1];
+        }
+      }
+
       seen.add(username);
       out.push({
-        username: username,           // c "@"
+        username: username,           // c "@" — сам чат/канал на tgstat
         title: title || null,
         subscribers: subscribers,
-        has_comments: !!has_comments,
+        has_comments: !!has_comments || isChatHref,   // для чатов всегда true
         category: category,
         verified: verified,
         position: position,
         kind: isChatHref ? 'chat' : 'channel',
+        linked_channel_guess: linked_channel_guess,
       });
     } catch (e) {
       // Пропускаем битую карточку, не валим весь extract
