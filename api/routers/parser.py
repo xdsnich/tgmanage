@@ -1264,7 +1264,10 @@ def _ws_jsonl_path(user_id: int, job_id: str) -> _Path:
 
 class WebScrapeStartRequest(BaseModel):
     urls: list[str]
-    proxies: list[str]
+    proxies: list[str] = []
+    # Если pasted-список пуст и use_db_proxies=True — берём из БД юзера.
+    use_db_proxies: bool = True
+    only_valid_proxies: bool = True
     # Все опции необязательны — есть безопасные дефолты в Celery-таске
     max_workers: Optional[int] = 3
     max_retries: Optional[int] = 3
@@ -1282,20 +1285,35 @@ class WebScrapeStartRequest(BaseModel):
 async def web_scrape_start(
     body: WebScrapeStartRequest,
     current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """Запускает Celery-таск Camoufox-скрейпинга. Возвращает job_id."""
+    from models.proxy import Proxy
+
     urls = [u.strip() for u in body.urls if u and u.strip()]
     proxies = [p.strip() for p in body.proxies if p and p.strip()]
+    proxies_source = "manual" if proxies else "db"
+
+    if not proxies and body.use_db_proxies:
+        q = select(Proxy).where(Proxy.user_id == current_user.id)
+        if body.only_valid_proxies:
+            q = q.where(Proxy.is_valid == True)
+        for p in (await db.execute(q)).scalars().all():
+            scheme = p.protocol.value if hasattr(p.protocol, "value") else str(p.protocol)
+            if p.login and p.password:
+                proxies.append(f"{scheme}://{p.login}:{p.password}@{p.host}:{p.port}")
+            else:
+                proxies.append(f"{scheme}://{p.host}:{p.port}")
 
     if not urls:
         raise HTTPException(status_code=400, detail="urls пустой")
-    if not proxies:
-        raise HTTPException(status_code=400, detail="proxies пустой")
     if len(proxies) < 3:
-        # Меньше 3 узлов = нет смысла в cooldown'е, сразу упрёмся
         raise HTTPException(
             status_code=400,
-            detail=f"Минимум 3 прокси для скрейпинга (передано {len(proxies)})",
+            detail=(
+                f"Минимум 3 прокси (найдено {len(proxies)}, источник={proxies_source}). "
+                "Добавь прокси в проект или вставь их вручную."
+            ),
         )
 
     job_id = _uuid.uuid4().hex
@@ -1341,6 +1359,7 @@ async def web_scrape_start(
         "task_id": task.id,
         "urls_total": len(urls),
         "proxies_total": len(proxies),
+        "proxies_source": proxies_source,
         "status": "queued",
     }
 
@@ -1445,7 +1464,12 @@ async def web_scrape_tgstat_options(current_user: User = Depends(get_current_use
 
 
 class WebScrapeTgstatRequest(BaseModel):
-    proxies: list[str]
+    # Если pasted_proxies пустой — берём ВСЕ валидные прокси юзера из БД.
+    # use_db_proxies=True (дефолт) принудительно использует БД и игнорит
+    # paste. Это удобно когда у юзера уже есть пул в проге.
+    proxies: list[str] = []             # legacy: ручной paste
+    use_db_proxies: bool = True
+    only_valid_proxies: bool = True     # отфильтровать невалидные (is_valid=False)
     languages: list[str] = []           # legacy, не используется
     categories: list[str] = []          # legacy, не используется
     countries: list[str] = []           # ISO-2 коды (RU, UA, KZ...) или пусто = глобально
@@ -1470,15 +1494,42 @@ class WebScrapeTgstatRequest(BaseModel):
 async def web_scrape_tgstat_start(
     body: WebScrapeTgstatRequest,
     current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
-    """Запуск Camoufox-скрейпинга TGStat по выбранным гео/категориям."""
+    """Запуск Camoufox-скрейпинга TGStat по выбранным гео/таргету."""
     from utils.web_scraper import build_urls
+    from models.proxy import Proxy
 
-    proxies = [p.strip() for p in body.proxies if p and p.strip()]
+    # ── Сборка прокси-пула ─────────────────────────────────────
+    # Приоритет:
+    #   1. Если pasted proxies non-empty → используем их (ручной paste)
+    #   2. Иначе если use_db_proxies → берём из БД
+    proxies: list[str] = []
+    proxies_source = "manual"
+
+    pasted = [p.strip() for p in body.proxies if p and p.strip()]
+    if pasted:
+        proxies = pasted
+    elif body.use_db_proxies:
+        proxies_source = "db"
+        q = select(Proxy).where(Proxy.user_id == current_user.id)
+        if body.only_valid_proxies:
+            q = q.where(Proxy.is_valid == True)
+        db_proxies = (await db.execute(q)).scalars().all()
+        for p in db_proxies:
+            scheme = p.protocol.value if hasattr(p.protocol, "value") else str(p.protocol)
+            if p.login and p.password:
+                proxies.append(f"{scheme}://{p.login}:{p.password}@{p.host}:{p.port}")
+            else:
+                proxies.append(f"{scheme}://{p.host}:{p.port}")
+
     if len(proxies) < 3:
         raise HTTPException(
             status_code=400,
-            detail=f"Минимум 3 прокси (передано {len(proxies)})",
+            detail=(
+                f"Минимум 3 прокси (найдено {len(proxies)}, источник={proxies_source}). "
+                "Добавь прокси в проект или вставь их вручную."
+            ),
         )
 
     # Если фронт прислал старое поле "languages" вместо нового "countries" —
@@ -1545,6 +1596,7 @@ async def web_scrape_tgstat_start(
         "task_id": task.id,
         "urls_total": len(urls),
         "proxies_total": len(proxies),
+        "proxies_source": proxies_source,
         "preview_urls": urls[:5],
         "status": "queued",
     }

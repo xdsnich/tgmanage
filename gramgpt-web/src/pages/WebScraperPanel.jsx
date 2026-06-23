@@ -9,13 +9,15 @@
  *      (title/meta/h1/body[:5000]).
  */
 import { useEffect, useRef, useState } from 'react'
-import { parserAPI } from '../services/api'
+import { parserAPI, proxiesAPI } from '../services/api'
 import { Button, Card } from '../components/ui'
 
 export default function WebScraperPanel() {
   // ── Общие настройки ──────────────────────────────────────────────
   const [mode, setMode] = useState('tgstat')         // 'tgstat' | 'universal'
   const [proxiesText, setProxiesText] = useState('')
+  const [useDbProxies, setUseDbProxies] = useState(true)
+  const [dbProxiesCount, setDbProxiesCount] = useState({ total: 0, valid: 0 })
   const [showAdvanced, setShowAdvanced] = useState(false)
 
   // Параметры скрейпера
@@ -125,9 +127,19 @@ export default function WebScraperPanel() {
     }
   }
 
+  const loadDbProxiesCount = async () => {
+    try {
+      const { data } = await proxiesAPI.list()
+      const arr = Array.isArray(data) ? data : (data?.items || [])
+      const valid = arr.filter(p => p.is_valid !== false).length
+      setDbProxiesCount({ total: arr.length, valid })
+    } catch (e) { console.error(e) }
+  }
+
   useEffect(() => {
     loadJobs()
     loadTgstatOptions()
+    loadDbProxiesCount()
     return () => stopPolling()
   }, [])
 
@@ -142,13 +154,20 @@ export default function WebScraperPanel() {
   // ── handlers ────────────────────────────────────────────────────
 
   const handleStart = async () => {
-    if (proxies.length < 3) {
-      showToast(`Минимум 3 прокси (введено ${proxies.length})`, 'err')
+    // Считаем сколько прокси реально пойдёт в задачу
+    const effectivePoolSize = useDbProxies ? dbProxiesCount.valid : proxies.length
+    if (effectivePoolSize < 3) {
+      showToast(
+        useDbProxies
+          ? `В пуле валидных прокси: ${effectivePoolSize}. Минимум 3 — добавь в проект.`
+          : `Введено только ${proxies.length} прокси, минимум 3.`,
+        'err'
+      )
       return
     }
-    if (proxies.length < 10) {
+    if (effectivePoolSize < 10) {
       const ok = confirm(
-        `Введено только ${proxies.length} прокси. Архитектура рассчитана на 34 узла.\n\n` +
+        `В пуле только ${effectivePoolSize} прокси. Архитектура рассчитана на 34 узла.\n\n` +
         `С меньшим пулом cooldown будет давить — узлы быстро уйдут в простой.\n\n` +
         `Продолжить?`
       )
@@ -166,7 +185,8 @@ export default function WebScraperPanel() {
           return
         }
         resp = await parserAPI.webScrapeTgstatStart({
-          proxies,
+          proxies: useDbProxies ? [] : proxies,
+          use_db_proxies: useDbProxies,
           countries: selectedCountries,
           target: tgstatTarget,
           only_with_comments: onlyWithComments,
@@ -188,7 +208,9 @@ export default function WebScraperPanel() {
           return
         }
         resp = await parserAPI.webScrapeStart({
-          urls, proxies,
+          urls,
+          proxies: useDbProxies ? [] : proxies,
+          use_db_proxies: useDbProxies,
           max_workers: maxWorkers,
           max_retries: maxRetries,
           page_timeout_sec: pageTimeout,
@@ -447,27 +469,68 @@ export default function WebScraperPanel() {
 
       {/* Proxies */}
       <Card style={{ padding: 14 }}>
-        <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-3)', marginBottom: 8, display: 'flex', justifyContent: 'space-between' }}>
-          <span>Прокси-узлы ({proxies.length})</span>
-          <span style={{ color: proxies.length >= 34 ? 'var(--green)' : proxies.length >= 10 ? '#eab308' : 'var(--red)' }}>
-            {proxies.length >= 34 ? '✓ оптимально' : proxies.length >= 10 ? '⚠ мало для cooldown' : '⚠ риск блока'}
-          </span>
+        <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+          {[
+            { key: true,  label: '🗃 Из проекта',      desc: `${dbProxiesCount.valid} валидных из ${dbProxiesCount.total} в БД` },
+            { key: false, label: '✍️ Вставить вручную', desc: 'по строке: http/https/socks5://...' },
+          ].map(o => {
+            const on = useDbProxies === o.key
+            return (
+              <button key={String(o.key)} onClick={() => setUseDbProxies(o.key)} disabled={isRunning}
+                style={{
+                  flex: 1, padding: '10px 12px', borderRadius: 8, textAlign: 'left',
+                  cursor: isRunning ? 'not-allowed' : 'pointer',
+                  background: on ? 'rgba(139, 92, 246, 0.15)' : 'var(--bg)',
+                  border: `1px solid ${on ? 'var(--violet)' : 'var(--border)'}`,
+                  color: on ? 'var(--text)' : 'var(--text-2)',
+                }}>
+                <div style={{ fontSize: 13, fontWeight: 600 }}>{o.label}</div>
+                <div style={{ fontSize: 10, opacity: 0.75, marginTop: 2 }}>{o.desc}</div>
+              </button>
+            )
+          })}
         </div>
-        <textarea
-          value={proxiesText}
-          onChange={e => setProxiesText(e.target.value)}
-          disabled={isRunning}
-          placeholder={'http://user:pass@1.2.3.4:8080\nsocks5://user:pass@1.2.3.5:1080\n…'}
-          style={{
-            width: '100%', minHeight: 140, padding: 10, borderRadius: 8,
-            border: '1px solid var(--border)', background: 'var(--bg)',
-            color: 'var(--text)', fontFamily: 'monospace', fontSize: 12,
-            resize: 'vertical',
-          }}
-        />
-        <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 6 }}>
-          Поддержка: http / https / socks5 · одна строка = один прокси
-        </div>
+
+        {useDbProxies ? (
+          <div style={{
+            padding: 12, borderRadius: 8, background: 'var(--bg)',
+            border: '1px solid var(--border)', fontSize: 12, color: 'var(--text-2)',
+          }}>
+            Будут использованы <strong>{dbProxiesCount.valid}</strong> валидных прокси из твоего пула.
+            {' '}
+            <span style={{ color: dbProxiesCount.valid >= 34 ? 'var(--green)' : dbProxiesCount.valid >= 10 ? '#eab308' : 'var(--red)' }}>
+              {dbProxiesCount.valid >= 34 ? '✓ оптимально' : dbProxiesCount.valid >= 10 ? '⚠ мало для cooldown' : '⚠ риск блока — добавь прокси'}
+            </span>
+            <button onClick={loadDbProxiesCount} style={{
+              float: 'right', background: 'none', border: 'none', color: 'var(--text-3)',
+              cursor: 'pointer', fontSize: 11,
+            }}>↻ обновить</button>
+          </div>
+        ) : (
+          <>
+            <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-3)', marginBottom: 6, display: 'flex', justifyContent: 'space-between' }}>
+              <span>Прокси из формы ({proxies.length})</span>
+              <span style={{ color: proxies.length >= 34 ? 'var(--green)' : proxies.length >= 10 ? '#eab308' : 'var(--red)' }}>
+                {proxies.length >= 34 ? '✓ оптимально' : proxies.length >= 10 ? '⚠ мало' : '⚠ риск блока'}
+              </span>
+            </div>
+            <textarea
+              value={proxiesText}
+              onChange={e => setProxiesText(e.target.value)}
+              disabled={isRunning}
+              placeholder={'http://user:pass@1.2.3.4:8080\nsocks5://user:pass@1.2.3.5:1080\n…'}
+              style={{
+                width: '100%', minHeight: 140, padding: 10, borderRadius: 8,
+                border: '1px solid var(--border)', background: 'var(--bg)',
+                color: 'var(--text)', fontFamily: 'monospace', fontSize: 12,
+                resize: 'vertical',
+              }}
+            />
+            <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 6 }}>
+              Поддержка: http / https / socks5 · одна строка = один прокси
+            </div>
+          </>
+        )}
       </Card>
 
       {/* Advanced */}
