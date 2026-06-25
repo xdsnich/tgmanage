@@ -259,7 +259,7 @@ export default function WebScraperPanel() {
 
   const handleDownloadCSV = () => {
     if (!aggregated?.channels?.length) return
-    const headers = ['username', 'title', 'subscribers', 'has_comments', 'category', 'verified', 'language']
+    const headers = ['username', 'title', 'subscribers', 'discussion_chat', 'category', 'verified']
     const rows = aggregated.channels.map(c =>
       headers.map(h => {
         const v = c[h]
@@ -357,8 +357,10 @@ export default function WebScraperPanel() {
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
             {[
-              { key: 'chats',    label: '💬 Чаты с комментами', desc: 'Discussion-группы. Тут можно писать комменты под постами.' },
-              { key: 'channels', label: '📢 Каналы (рейтинг)',  desc: 'Обычный рейтинг каналов. Большинство БЕЗ комментов.' },
+              { key: 'chats',    label: '📢 Каналы с открытыми комментами',
+                desc: 'Берём с TGStat рейтинг discussion-групп → каждой эвристически сопоставляем канал. Это и есть каналы где можно писать в комменты.' },
+              { key: 'channels', label: '📋 Все каналы (рейтинг)',
+                desc: 'Просто рейтинг каналов. Большинство БЕЗ открытых комментов.' },
             ].map(t => {
               const on = tgstatTarget === t.key
               return (
@@ -642,11 +644,11 @@ export default function WebScraperPanel() {
       {/* Aggregated TGStat results */}
       {aggregated && (
         <Card style={{ padding: 14 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
             <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>
-              📊 Найдено каналов: {aggregated.channels_count}
+              📊 Каналов с открытыми комментами: {aggregated.channels_count}
               <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--text-3)', marginLeft: 10 }}>
-                из {aggregated.rows_read} срезов
+                из {aggregated.rows_read} срезов{aggregated.skipped_no_guess ? `, пропущено ${aggregated.skipped_no_guess} чатов без угаданного канала` : ''}
               </span>
             </div>
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -675,8 +677,8 @@ export default function WebScraperPanel() {
               <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
                 <thead style={{ position: 'sticky', top: 0, background: 'var(--bg-2)', zIndex: 1 }}>
                   <tr>
-                    <Th>#</Th><Th>Username</Th><Th>Название</Th>
-                    <Th>Подписчики</Th><Th>Комменты</Th><Th>Категория</Th><Th>Lang</Th>
+                    <Th>#</Th><Th>Канал</Th><Th>Название</Th>
+                    <Th>Подписчики</Th><Th>Discussion-чат</Th><Th>Категория</Th>
                   </tr>
                 </thead>
                 <tbody>
@@ -692,9 +694,15 @@ export default function WebScraperPanel() {
                       </Td>
                       <Td>{c.title || '—'}</Td>
                       <Td>{(c.subscribers || 0).toLocaleString('ru-RU')}</Td>
-                      <Td>{c.has_comments ? '💬' : '—'}</Td>
+                      <Td muted>
+                        {c.discussion_chat ? (
+                          <a href={`https://t.me/${c.discussion_chat.replace('@','')}`} target="_blank" rel="noreferrer"
+                            style={{ color: 'var(--text-3)', textDecoration: 'none' }}>
+                            {c.discussion_chat}
+                          </a>
+                        ) : '—'}
+                      </Td>
                       <Td muted>{c.category || '—'}</Td>
-                      <Td muted>{c.language || '—'}</Td>
                     </tr>
                   ))}
                 </tbody>

@@ -1610,9 +1610,22 @@ async def web_scrape_tgstat_aggregate(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Агрегирует все каналы из JSONL job'а в один плоский список.
-    Дедуп по @username (если канал встретился в нескольких срезах).
-    Для UI "вот что я нашёл" — без скачивания файла.
+    Агрегирует JSONL job'а в плоский список КАНАЛОВ с открытыми
+    комментами.
+
+    Что внутри JSONL: для каждой страницы /ratings/chats записан
+    массив "карточек" (на самом деле — чатов = discussion-групп).
+    У каждой карточки extractor проставил linked_channel_guess —
+    угаданный @username канала к которому привязан этот чат
+    (например @cryptobomb_chat → @cryptobomb).
+
+    Логика агрегации:
+      1. Карточка с linked_channel_guess → запись о канале
+         (chat info уезжает в discussion_chat поле)
+      2. Карточка БЕЗ linked_channel_guess (kind=channel) → если
+         has_comments true, всё равно показываем как канал
+      3. Дедуп по @channel (lowercase). При коллизии — оставляем
+         с большим subscribers.
     """
     path = _ws_jsonl_path(current_user.id, job_id)
     if not path.exists():
@@ -1620,6 +1633,7 @@ async def web_scrape_tgstat_aggregate(
 
     channels: dict[str, dict] = {}
     rows_read = 0
+    skipped_no_guess = 0
     try:
         with path.open("r", encoding="utf-8") as f:
             for line in f:
@@ -1634,24 +1648,48 @@ async def web_scrape_tgstat_aggregate(
                 data = rec.get("data") or {}
                 geo = data.get("geo") or {}
                 for ch in (data.get("channels") or []):
-                    uname = (ch.get("username") or "").lstrip("@").lower()
-                    if not uname:
+                    raw_username = (ch.get("username") or "").lstrip("@")
+                    if not raw_username:
                         continue
+
+                    # Угадываем канал к которому привязан этот чат:
+                    # 1. linked_channel_guess (эвристика по имени)
+                    # 2. Если это уже kind=channel и has_comments — берём сам
+                    kind = (ch.get("kind") or "").lower()
+                    guess = (ch.get("linked_channel_guess") or "").lstrip("@")
+
+                    if kind == "chat" and guess:
+                        channel_username = guess
+                        chat_username = raw_username
+                    elif kind == "channel" and ch.get("has_comments"):
+                        channel_username = raw_username
+                        chat_username = None
+                    elif kind == "chat" and not guess:
+                        # Чат без распознанного канала — пропускаем
+                        # (юзер ищет именно каналы)
+                        skipped_no_guess += 1
+                        continue
+                    else:
+                        continue
+
                     if only_with_comments and not ch.get("has_comments"):
                         continue
                     if min_subscribers and (ch.get("subscribers") or 0) < min_subscribers:
                         continue
+
                     # Дедуп — оставляем запись с большим subscribers
-                    prev = channels.get(uname)
+                    key = channel_username.lower()
+                    prev = channels.get(key)
                     if prev and (prev.get("subscribers") or 0) >= (ch.get("subscribers") or 0):
                         continue
-                    channels[uname] = {
-                        "username": "@" + uname,
+                    channels[key] = {
+                        "username": "@" + channel_username,
                         "title": ch.get("title"),
                         "subscribers": ch.get("subscribers"),
-                        "has_comments": bool(ch.get("has_comments")),
+                        "has_comments": True,
                         "category": ch.get("category"),
                         "verified": bool(ch.get("verified")),
+                        "discussion_chat": ("@" + chat_username) if chat_username else None,
                         "language": geo.get("lang"),
                         "source_url": geo.get("source_url"),
                     }
@@ -1664,4 +1702,5 @@ async def web_scrape_tgstat_aggregate(
         "rows_read": rows_read,
         "channels_count": len(items),
         "channels": items,
+        "skipped_no_guess": skipped_no_guess,
     }
