@@ -1264,18 +1264,75 @@ async def detect_tdata(
 
         print(f"📦 Session ID: {session_id}, аккаунтов: {len(detected)}")
 
-        return {
-            "session_id": session_id,
-            "accounts": [{
+        # Вспомогательная функция, чтобы вытащить имя папки-родителя
+        def get_folder_name(tdata_folder):
+            from pathlib import Path
+            p = Path(tdata_folder)
+            # Если сама папка называется "tdata", берём имя её родителя (например "38099...")
+            name = p.parent.name if p.name.lower() == 'tdata' else p.name
+            # Если имя состоит только из цифр, добавляем плюсик для красоты
+            if name.isdigit():
+                return "+" + name
+            return name
+
+        # (Вставляем перед финальным return в функции detect_tdata)
+
+        def get_clean_phone_from_folder(tdata_folder):
+            from pathlib import Path
+            import re
+            p = Path(tdata_folder)
+            # Берем имя родителя, если текущая папка "tdata"
+            name = p.parent.name if p.name.lower() == 'tdata' else p.name
+            # Вырезаем суффиксы типа _tdata, -tdata, tdata
+            clean_name = re.sub(r'[-_ ]?tdata', '', name, flags=re.IGNORECASE).strip()
+            # Если остались только цифры, добавляем "+" для формата БД
+            if clean_name.isdigit():
+                return "+" + clean_name
+            return clean_name
+
+        from models.account import TelegramAccount
+        from models.proxy import Proxy
+
+        final_accounts = []
+        for a in detected:
+            phone_hint = get_clean_phone_from_folder(a["tdata_folder"])
+            proxy_str = ""
+
+            # Ищем аккаунт в базе по номеру телефона
+            if phone_hint.startswith("+"):
+                existing_acc_r = await db.execute(
+                    select(TelegramAccount).where(
+                        TelegramAccount.phone == phone_hint,
+                        TelegramAccount.user_id == current_user.id
+                    )
+                )
+                existing_acc = existing_acc_r.scalar_one_or_none()
+
+                # Если аккаунт есть и у него привязан прокси, достаем его данные
+                if existing_acc and existing_acc.proxy_id:
+                    proxy_r = await db.execute(
+                        select(Proxy).where(Proxy.id == existing_acc.proxy_id)
+                    )
+                    proxy = proxy_r.scalar_one_or_none()
+                    if proxy:
+                        # Формируем строку ip:port:login:password
+                        login_part = f":{proxy.login or ''}:{proxy.password or ''}" if proxy.login else ""
+                        proxy_str = f"{proxy.host}:{proxy.port}{login_part}"
+
+            final_accounts.append({
                 "index": a["index"],
                 "tg_user_id": a["tg_user_id"],
                 "name": a["first_name"],
                 "first_name": a["first_name"],
                 "dc_id": a["dc_id"],
-                # Backward compat для старого фронта:
-                "phone": str(a["tg_user_id"]) if a["tg_user_id"] else "",
+                "phone": phone_hint,            # Отдаем чистый номер
+                "proxy_string": proxy_str,      # Отдаем найденный прокси
                 "username": "",
-            } for a in detected],
+            })
+
+        return {
+            "session_id": session_id,
+            "accounts": final_accounts,
             "total": len(detected),
         }
 

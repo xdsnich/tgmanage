@@ -157,14 +157,14 @@ export default function ProxiesPage() {
     setSaving(false)
   }
 
-  const valid     = proxies.filter(p => p.is_valid === true).length
-  const invalid   = proxies.filter(p => p.is_valid === false).length
+  const valid = proxies.filter(p => p.is_valid === true).length
+  const invalid = proxies.filter(p => p.is_valid === false).length
   const unchecked = proxies.filter(p => p.is_valid === null).length
-  const expired   = proxies.filter(p => p.expires_at && new Date(p.expires_at) < new Date()).length
+  const expired = proxies.filter(p => p.expires_at && new Date(p.expires_at) < new Date()).length
 
   const DAY_PRESETS = [
-    { d: 0,  label: '∞' },
-    { d: 7,  label: '7д' },
+    { d: 0, label: '∞' },
+    { d: 7, label: '7д' },
     { d: 14, label: '14д' },
     { d: 30, label: '30д' },
     { d: 60, label: '60д' },
@@ -257,9 +257,9 @@ export default function ProxiesPage() {
 
                 {/* Статус */}
                 <div>
-                  {p.is_valid === true  && <Badge color="green">✓ OK</Badge>}
+                  {p.is_valid === true && <Badge color="green">✓ OK</Badge>}
                   {p.is_valid === false && <Badge color="red">✗ Нет</Badge>}
-                  {p.is_valid === null  && <Badge color="default">?</Badge>}
+                  {p.is_valid === null && <Badge color="default">?</Badge>}
                 </div>
 
                 <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6 }}>
@@ -361,6 +361,38 @@ export default function ProxiesPage() {
       {/* ── Edit Modal ── */}
       <Modal open={editModal} onClose={() => setEditModal(false)} title="Редактировать прокси" width={480}>
         <form onSubmit={handleSaveEdit} style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          
+          {/* ── Быстрое изменение одной строкой ── */}
+          <div>
+            <label style={{ fontSize: 11, color: 'var(--violet)', fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>
+              ⚡ Быстрое изменение (одной строкой)
+            </label>
+            <input
+              type="text"
+              placeholder="136.234.222.154:64510:user:pass"
+              onChange={e => {
+                const parsed = parseProxyLine(e.target.value)
+                // Обновляем editForm, если парсер успешно разобрал строку
+                if (parsed) setEditForm(prev => ({ ...prev, ...parsed }))
+              }}
+              style={{
+                width: '100%', padding: '10px 14px',
+                background: 'rgba(124,77,255,0.08)',
+                border: '1px solid rgba(124,77,255,0.35)',
+                borderRadius: 'var(--radius-sm)', color: 'var(--text)',
+                fontSize: 13, outline: 'none',
+                fontFamily: 'var(--font-mono)',
+                boxSizing: 'border-box',
+              }}
+            />
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: 'var(--text-3)', fontSize: 10, letterSpacing: '0.1em' }}>
+            <div style={{ flex: 1, height: 1, background: 'var(--border)' }} />
+            ИЛИ ИЗМЕНИТЕ ВРУЧНУЮ
+            <div style={{ flex: 1, height: 1, background: 'var(--border)' }} />
+          </div>
+
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 100px', gap: 10 }}>
             <Input label="Host" value={editForm.host} onChange={e => setEditForm(d => ({ ...d, host: e.target.value }))} placeholder="1.2.3.4" required />
             <Input label="Port" value={editForm.port} onChange={e => setEditForm(d => ({ ...d, port: e.target.value }))} placeholder="1080" type="number" required />
@@ -376,17 +408,20 @@ export default function ProxiesPage() {
               <option value="http">HTTP</option>
             </select>
           </div>
+          
           <DayPicker
             label={editProxy?.expires_at ? `Продлить срок (сейчас: до ${new Date(editProxy.expires_at).toLocaleDateString('ru')})` : 'Установить срок'}
             value={editForm.duration_days}
             onChange={d => setEditForm(f => ({ ...f, duration_days: d }))}
             presets={DAY_PRESETS}
           />
+          
           {editForm.duration_days === 0 && editProxy?.expires_at && (
             <div style={{ fontSize: 11, color: 'var(--text-3)', padding: '6px 10px', background: 'rgba(255,180,0,0.06)', borderRadius: 8, borderLeft: '3px solid rgba(255,180,0,0.3)' }}>
               ⚠️ Если оставить ∞ — существующий срок ({new Date(editProxy.expires_at).toLocaleDateString('ru')}) сохранится
             </div>
           )}
+          
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
             <Button variant="ghost" type="button" onClick={() => setEditModal(false)}>Отмена</Button>
             <Button variant="primary" type="submit" loading={saving}>Сохранить</Button>
@@ -401,7 +436,7 @@ function DayPicker({ label, value, onChange, presets }) {
   return (
     <div>
       <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>{label}</label>
-      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
         {presets.map(p => (
           <button key={p.d} type="button" onClick={() => onChange(p.d)} style={{
             padding: '6px 14px', borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer', transition: 'all 0.15s',
@@ -410,6 +445,21 @@ function DayPicker({ label, value, onChange, presets }) {
             color: value === p.d ? '#00c2b2' : 'var(--text-2)',
           }}>{p.label}</button>
         ))}
+        {/* Поле для ввода своего значения */}
+        <input
+          type="number"
+          placeholder="Свой срок..."
+          value={value === 0 ? '' : value}
+          onChange={(e) => {
+            const val = parseInt(e.target.value, 10);
+            onChange(isNaN(val) || val < 0 ? 0 : val);
+          }}
+          style={{
+            width: '110px', padding: '6px 10px', background: 'var(--bg-3)',
+            border: '1px solid var(--border)', borderRadius: 8,
+            color: 'var(--text)', fontSize: 12, outline: 'none'
+          }}
+        />
       </div>
       {value > 0 && (
         <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 6 }}>
