@@ -358,13 +358,15 @@ async def _run(user_id: int, job_id: str, urls: list[str],
                 checkpoint_path=jsonl_stage2,
                 extractor=tgstat_channel_detail_extractor,
                 max_workers=int(options.get("max_workers", 3)),
-                max_retries=2,
-                page_timeout_sec=float(options.get("page_timeout_sec", 45.0)),
-                # Stage 2 — короче cooldown, потому что каждый прокси
-                # уже использовался на Stage 1, нужен меньший лаг между
-                # запросами а не "trust score recovery"
-                cooldown_min_sec=int(options.get("stage2_cooldown_min_sec", 120)),
-                cooldown_max_sec=int(options.get("stage2_cooldown_max_sec", 180)),
+                # На детальных страницах TGStat нет смысла делать 3+ retry —
+                # если канал реально за CF challenge и таймаутит, 2 retry
+                # уже доказали что страница не отдаст контент быстро.
+                max_retries=int(options.get("stage2_max_retries", 1)),
+                # Поднимаем page_timeout — крупные каналы за Cloudflare
+                # отдают 60-90 сек.
+                page_timeout_sec=float(options.get("stage2_page_timeout_sec", 60.0)),
+                cooldown_min_sec=int(options.get("stage2_cooldown_min_sec", 60)),
+                cooldown_max_sec=int(options.get("stage2_cooldown_max_sec", 120)),
                 node_rotation_min_sec=5.0,
                 node_rotation_max_sec=15.0,
                 progress_callback=progress_cb,

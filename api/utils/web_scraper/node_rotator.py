@@ -91,12 +91,14 @@ class NodeRotator:
             f"cooldown={cooldown_min_sec}-{cooldown_max_sec}с"
         )
 
-    async def acquire(self, wait_timeout: float = 600.0) -> ProxyNode:
+    async def acquire(self, wait_timeout: float = 180.0) -> ProxyNode:
         """
         Возвращает следующий доступный узел и захватывает его per-node lock.
 
-        Если все в cooldown или заняты — ждёт. Если все занят и истёк
-        wait_timeout — кидает TimeoutError.
+        Если все в cooldown или заняты — ждёт. Если все заняты и истёк
+        wait_timeout (default 3 мин) — кидает TimeoutError. Раньше было
+        10 мин — слишком долго, юзер в UI не понимал почему висит.
+        Теперь воркер быстрее уходит с ошибкой и таск finalize'ится.
 
         ВАЖНО: вызывающий обязан вызвать mark_success/mark_failed,
         иначе узел останется залоченным.
