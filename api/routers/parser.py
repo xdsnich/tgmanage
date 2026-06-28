@@ -1615,99 +1615,71 @@ async def web_scrape_tgstat_aggregate(
     only_with_comments: bool = Query(True),
     min_subscribers: int = Query(0),
     current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """
-    Агрегирует JSONL job'а в плоский список КАНАЛОВ с открытыми
-    комментами.
+    Отдаёт список найденных каналов для job'a.
 
-    Что внутри JSONL: для каждой страницы /ratings/chats записан
-    массив "карточек" (на самом деле — чатов = discussion-групп).
-    У каждой карточки extractor проставил linked_channel_guess —
-    угаданный @username канала к которому привязан этот чат
-    (например @cryptobomb_chat → @cryptobomb).
-
-    Логика агрегации:
-      1. Карточка с linked_channel_guess → запись о канале
-         (chat info уезжает в discussion_chat поле)
-      2. Карточка БЕЗ linked_channel_guess (kind=channel) → если
-         has_comments true, всё равно показываем как канал
-      3. Дедуп по @channel (lowercase). При коллизии — оставляем
-         с большим subscribers.
+    Источник истины:
+      1. ParsedChannel БД по search_query=tgstat_web:{job_id} —
+         это результат 2-stage pipeline (Stage 1 rating + Stage 2
+         проверка детальной страницы). Только каналы с реально
+         подтверждённым linked_chat сюда попали.
+      2. Stage 2 JSONL читается для метаданных (linked_chat_username)
+         потому что в ParsedChannel мы это поле не сохраняем.
     """
-    path = _ws_jsonl_path(current_user.id, job_id)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Результаты ещё не записаны")
+    # Каналы из БД
+    rows = (await db.execute(
+        select(ParsedChannel).where(
+            ParsedChannel.user_id == current_user.id,
+            ParsedChannel.search_query == f"tgstat_web:{job_id}",
+        )
+    )).scalars().all()
 
-    channels: dict[str, dict] = {}
-    rows_read = 0
-    skipped_no_guess = 0
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = _json.loads(line)
-                except Exception:
-                    continue
-                rows_read += 1
-                data = rec.get("data") or {}
-                geo = data.get("geo") or {}
-                for ch in (data.get("channels") or []):
-                    raw_username = (ch.get("username") or "").lstrip("@")
-                    if not raw_username:
+    # linked_chat из Stage 2 JSONL (для UI колонки discussion-чат)
+    linked_chat_by_user: dict[str, str] = {}
+    stage2_path = _ws_jsonl_path(current_user.id, job_id).parent / f"{job_id}.stage2.jsonl"
+    if stage2_path.exists():
+        try:
+            with stage2_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        rec = _json.loads(line)
+                    except Exception:
                         continue
+                    if not rec.get("success"):
+                        continue
+                    data = rec.get("data") or {}
+                    u = (data.get("channel_username") or "").lstrip("@").lower()
+                    chat = data.get("linked_chat_username")
+                    if u and chat:
+                        linked_chat_by_user[u] = chat
+        except Exception:
+            pass
 
-                    # Угадываем канал к которому привязан этот чат:
-                    # 1. linked_channel_guess (эвристика по имени)
-                    # 2. Если это уже kind=channel и has_comments — берём сам
-                    kind = (ch.get("kind") or "").lower()
-                    guess = (ch.get("linked_channel_guess") or "").lstrip("@")
-
-                    if kind == "chat" and guess:
-                        channel_username = guess
-                        chat_username = raw_username
-                    elif kind == "channel" and ch.get("has_comments"):
-                        channel_username = raw_username
-                        chat_username = None
-                    elif kind == "chat" and not guess:
-                        # Чат без распознанного канала — пропускаем
-                        # (юзер ищет именно каналы)
-                        skipped_no_guess += 1
-                        continue
-                    else:
-                        continue
-
-                    if only_with_comments and not ch.get("has_comments"):
-                        continue
-                    if min_subscribers and (ch.get("subscribers") or 0) < min_subscribers:
-                        continue
-
-                    # Дедуп — оставляем запись с большим subscribers
-                    key = channel_username.lower()
-                    prev = channels.get(key)
-                    if prev and (prev.get("subscribers") or 0) >= (ch.get("subscribers") or 0):
-                        continue
-                    channels[key] = {
-                        "username": "@" + channel_username,
-                        "title": ch.get("title"),
-                        "subscribers": ch.get("subscribers"),
-                        "has_comments": True,
-                        "category": ch.get("category"),
-                        "verified": bool(ch.get("verified")),
-                        "discussion_chat": ("@" + chat_username) if chat_username else None,
-                        "language": geo.get("lang"),
-                        "source_url": geo.get("source_url"),
-                    }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Не смог прочитать JSONL: {e}")
-
-    items = sorted(channels.values(), key=lambda x: x.get("subscribers") or 0, reverse=True)
+    out = []
+    for r in rows:
+        if only_with_comments and not r.has_comments:
+            continue
+        if min_subscribers and (r.subscribers or 0) < min_subscribers:
+            continue
+        u = (r.username or "").lstrip("@")
+        out.append({
+            "username": "@" + u,
+            "title": r.title,
+            "subscribers": r.subscribers,
+            "has_comments": bool(r.has_comments),
+            "category": None,
+            "verified": False,
+            "discussion_chat": linked_chat_by_user.get(u.lower()),
+            "language": r.language,
+            "source_url": f"https://tgstat.com/channel/@{u}",
+        })
+    out.sort(key=lambda x: x.get("subscribers") or 0, reverse=True)
     return {
         "job_id": job_id,
-        "rows_read": rows_read,
-        "channels_count": len(items),
-        "channels": items,
-        "skipped_no_guess": skipped_no_guess,
+        "rows_read": len(rows),
+        "channels_count": len(out),
+        "channels": out,
+        "skipped_no_guess": 0,
     }

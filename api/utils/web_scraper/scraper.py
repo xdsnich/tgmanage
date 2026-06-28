@@ -192,6 +192,23 @@ class WebScraper:
             for i in range(self.max_workers)
         ]
 
+        # Watchdog: раз в 2 сек проверяет cancel_check. Если юзер нажал
+        # "Стоп" — отменяем все таски воркеров не дожидаясь конца URL.
+        # Без этого "стоп" работал только между URL'ами и юзер мог ждать
+        # до 90 сек (page_timeout) пока воркер закончит текущий goto().
+        async def _cancel_watchdog():
+            while True:
+                await asyncio.sleep(2.0)
+                if self.cancel_check():
+                    logger.info("[scraper] cancel_check=True — force cancel воркеров")
+                    for w in workers:
+                        if not w.done():
+                            w.cancel()
+                    return
+                if all(w.done() for w in workers):
+                    return
+        watchdog = asyncio.create_task(_cancel_watchdog(), name="scraper-cancel-watchdog")
+
         try:
             await queue.join()
         except asyncio.CancelledError:
@@ -203,7 +220,8 @@ class WebScraper:
             # поэтому отменяем их явно.
             for w in workers:
                 w.cancel()
-            await asyncio.gather(*workers, return_exceptions=True)
+            watchdog.cancel()
+            await asyncio.gather(*workers, watchdog, return_exceptions=True)
             await self._report_progress(reason="finished")
 
         logger.info(f"[scraper] Готово: {self.stats.snapshot()}")

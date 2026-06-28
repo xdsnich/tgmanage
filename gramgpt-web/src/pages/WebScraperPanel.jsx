@@ -268,7 +268,10 @@ export default function WebScraperPanel() {
   }
 
   const handleDownloadCSV = () => {
-    if (!aggregated?.channels?.length) return
+    if (!aggregated?.channels?.length) {
+      showToast('Нечего скачивать — таблица пуста', 'err')
+      return
+    }
     const headers = ['username', 'title', 'subscribers', 'discussion_chat', 'category', 'verified']
     const rows = aggregated.channels.map(c =>
       headers.map(h => {
@@ -284,8 +287,12 @@ export default function WebScraperPanel() {
     const a = document.createElement('a')
     a.href = url
     a.download = `tgstat_channels_${jobId?.slice(0, 8) || 'export'}.csv`
+    // Без appendChild в некоторых браузерах (Firefox) click() ничего не делает
+    document.body.appendChild(a)
     a.click()
-    URL.revokeObjectURL(url)
+    document.body.removeChild(a)
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+    showToast(`Скачано ${aggregated.channels.length} каналов в CSV`)
   }
 
   const toggle = (arr, setter) => (code) => {
