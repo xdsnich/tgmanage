@@ -393,14 +393,19 @@ async def _run(user_id: int, job_id: str, urls: list[str],
         # ── Сохранение в БД ───────────────────────────────────
         # UPSERT по (user_id, username): если канал уже был — обновим
         # subscribers/title, has_comments=True. Если не было — создадим.
+        #
+        # ВАЖНО: используем utils.db_pool.async_session (NullPool), а
+        # НЕ database.AsyncSessionLocal (pool_size=10). Иначе долгая
+        # DB-операция в Celery-таске занимает соединения из общего пула
+        # uvicorn'а → все API возвращают 500. Bug fix.
         if saved_channels:
             try:
                 from sqlalchemy import select
-                from database import AsyncSessionLocal
+                from utils.db_pool import async_session as TaskSession
                 from models.parsed_channel import ParsedChannel
                 from datetime import datetime as _dt
 
-                async with AsyncSessionLocal() as db:
+                async with TaskSession() as db:
                     for ch in saved_channels:
                         u = ch["username"]
                         if not u:
