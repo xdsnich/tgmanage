@@ -116,13 +116,22 @@ export default function WebScraperPanel() {
   }
 
   const loadAggregate = async (id, minSubs = aggregateMinSubs) => {
+    // Guard: без job_id бэк отдаст 422 (job_id required). Бывает когда
+    // юзер кликает "Пересчитать" после reload страницы — стейт jobId
+    // пропал, а кнопка "Пересчитать" ещё видна.
+    if (!id) {
+      showToast('Нет активного job_id — запусти скрейпинг или выбери из истории', 'err')
+      return
+    }
     setAggregating(true)
     try {
       const { data } = await parserAPI.webScrapeTgstatAggregate(id, onlyWithComments, minSubs)
       setAggregated(data)
     } catch (e) {
       console.error(e)
-      showToast('Агрегация не удалась', 'err')
+      const detail = e?.response?.data?.detail
+      const msg = typeof detail === 'string' ? detail : 'Агрегация не удалась'
+      showToast(msg, 'err')
     } finally {
       setAggregating(false)
     }
