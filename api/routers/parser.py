@@ -1478,6 +1478,10 @@ class WebScrapeTgstatRequest(BaseModel):
     only_with_comments: bool = True
     pages_per_geo: int = 1              # сколько страниц с каждого среза
     include_global: bool = False        # добавлять глобальный URL (без country)
+    # Сколько кандидатов проверить во 2-м проходе (детальные страницы).
+    # 0 = без лимита. Влияет на ВРЕМЯ: каждый кандидат это 1 HTTP запрос
+    # к /channel/@xxx с 60-120 сек cooldown между прокси.
+    max_channels: int = 30
 
     max_workers: Optional[int] = 3
     max_retries: Optional[int] = 3
@@ -1564,6 +1568,8 @@ async def web_scrape_tgstat_start(
         "node_rotation_min_sec": float(body.node_rotation_min_sec or 15.0),
         "node_rotation_max_sec": float(body.node_rotation_max_sec or 35.0),
         "page_locale": body.page_locale or "en-US",
+        # Лимит кандидатов на проверку во 2-м проходе. 0 = весь Stage 1.
+        "stage2_limit": max(0, min(int(body.max_channels or 0), 500)),
         "camoufox": {
             "humanize": bool(body.humanize),
             "headless": bool(body.headless),
