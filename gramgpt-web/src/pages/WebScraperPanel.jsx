@@ -569,7 +569,8 @@ export default function WebScraperPanel() {
       {/* Action row */}
       <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
         {!isRunning ? (
-          <Button variant="primary" onClick={handleStart} disabled={starting || proxies.length < 3}>
+          <Button variant="primary" onClick={handleStart}
+            disabled={starting || (useDbProxies ? dbProxiesCount.valid < 3 : proxies.length < 3)}>
             {starting ? '⏳ Запуск...' : '🚀 Запустить скрейпинг'}
           </Button>
         ) : (

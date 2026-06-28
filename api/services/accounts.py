@@ -29,6 +29,32 @@ async def get_accounts(db: AsyncSession, user_id: int) -> list[TelegramAccount]:
         .order_by(TelegramAccount.added_at.desc())
     )
     accounts = result.scalars().all()
+
+    # Активная кампания комментинга для акка (если есть).
+    # Берём все active-кампании юзера, разворачиваем account_ids в обратный
+    # map acc_id -> campaign_meta. Если на акк висит несколько активных —
+    # берём самую новую (по started_at/created_at).
+    active_campaign_by_acc: dict[int, dict] = {}
+    try:
+        from models.campaign import Campaign, CampaignStatus
+        camps = (await db.execute(
+            select(Campaign)
+            .where(Campaign.user_id == user_id, Campaign.status == CampaignStatus.active)
+            .order_by(Campaign.started_at.desc().nullslast(), Campaign.id.desc())
+        )).scalars().all()
+        for c in camps:
+            ids = c.account_ids or []
+            for acc_id in ids:
+                # Первая встретившаяся = самая свежая (sort выше)
+                if acc_id not in active_campaign_by_acc:
+                    active_campaign_by_acc[acc_id] = {
+                        "id": c.id,
+                        "name": c.name,
+                    }
+    except Exception:
+        # Не валим список акков если что-то с campaigns не так
+        pass
+
     # Прокидываем гео прокси в самые «плоские» поля, чтобы AccountOut
     # подобрал их без property-плясок (Pydantic from_attributes так умеет)
     for a in accounts:
@@ -37,6 +63,8 @@ async def get_accounts(db: AsyncSession, user_id: int) -> list[TelegramAccount]:
         a.proxy_country_code = p.country_code if p else None
         a.proxy_city         = p.city if p else None
         a.proxy_host         = f"{p.host}:{p.port}" if p else None
+        # Активная кампания на этом аккаунте (или None)
+        a.active_campaign = active_campaign_by_acc.get(a.id)
     return accounts
 
 

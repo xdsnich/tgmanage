@@ -57,6 +57,8 @@ class AccountOut(BaseModel):
     last_checked:    Optional[datetime]
     error:           Optional[str]
     api_app_id:  Optional[int] = None
+    # Активная commenting-кампания на акке: {"id": int, "name": str} или None
+    active_campaign: Optional[dict] = None
 
     model_config = {"from_attributes": True}
 

@@ -89,8 +89,40 @@ export default function CommentingPage() {
   const [detailModal, setDetailModal]       = useState(false)
   const [channelModal, setChannelModal]     = useState(false)
   const [subscribeModal, setSubscribeModal] = useState(false)
+  const [editModal, setEditModal]           = useState(false)
+  const [editForm, setEditForm]             = useState({ id: null, name: '', account_ids: [] })
+  const [editOnlyAlive, setEditOnlyAlive]   = useState(true)
+  const [editSaving, setEditSaving]         = useState(false)
   const [saving, setSaving]                 = useState(false)
   const [toast, setToast]                   = useState(null)
+
+  const openEdit = (c) => {
+    setEditForm({
+      id: c.id,
+      name: c.name || '',
+      account_ids: Array.isArray(c.account_ids) ? [...c.account_ids] : [],
+    })
+    setEditModal(true)
+  }
+
+  const handleEditSave = async () => {
+    if (!editForm.id) return
+    if (!editForm.name.trim()) { alert('Имя не может быть пустым'); return }
+    setEditSaving(true)
+    try {
+      await commentingAPI.update(editForm.id, {
+        name: editForm.name.trim(),
+        account_ids: editForm.account_ids,
+      })
+      setEditModal(false)
+      showToast('Кампания обновлена')
+      await load()
+    } catch (e) {
+      alert('Ошибка: ' + (e.response?.data?.detail || e.message))
+    } finally {
+      setEditSaving(false)
+    }
+  }
 
   // Subscribe
   const [subscribeTasks, setSubscribeTasks] = useState([])
@@ -515,6 +547,7 @@ export default function CommentingPage() {
                             <Button variant="danger" size="sm" onClick={() => handleAction(c.id, 'stop')}>⏹ Стоп</Button>
                           </>
                         )}
+                        <Button variant="ghost" size="sm" onClick={() => openEdit(c)} title="Переименовать / сменить аккаунты">✎</Button>
                         <Button variant="ghost" size="sm" onClick={() => handleAction(c.id, 'delete')}>✕</Button>
                       </div>
                     </div>
@@ -663,6 +696,59 @@ export default function CommentingPage() {
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
             <Button variant="ghost" onClick={() => setCreateModal(false)}>Отмена</Button>
             <Button variant="primary" loading={saving} disabled={!form.name} onClick={handleCreate}>Создать</Button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* ── Edit Campaign Modal (название + аккаунты) ─── */}
+      <Modal open={editModal} onClose={() => setEditModal(false)} title="✎ Редактировать кампанию" width={580}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14, maxHeight: '70vh', overflow: 'auto' }}>
+          <Input label="Название" value={editForm.name}
+            onChange={e => setEditForm(f => ({ ...f, name: e.target.value }))}
+            placeholder="Крипто-комментинг" />
+
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+              <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+                Аккаунты ({editForm.account_ids.length} / {(editOnlyAlive ? accounts.filter(a => a.status === 'active') : accounts).length})
+              </label>
+              <label style={{ fontSize: 11, color: 'var(--text-2)', display: 'flex', alignItems: 'center', gap: 5, cursor: 'pointer' }}>
+                <input type="checkbox" checked={editOnlyAlive} onChange={e => setEditOnlyAlive(e.target.checked)} />
+                Только живые
+              </label>
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, maxHeight: 200, overflowY: 'auto' }}>
+              {(editOnlyAlive ? accounts.filter(a => a.status === 'active') : accounts).map(a => {
+                const on = editForm.account_ids.includes(a.id)
+                return (
+                  <button key={a.id}
+                    onClick={() => setEditForm(f => ({
+                      ...f,
+                      account_ids: on
+                        ? f.account_ids.filter(x => x !== a.id)
+                        : [...f.account_ids, a.id]
+                    }))}
+                    style={{
+                      padding: '6px 12px', borderRadius: 8, fontSize: 12, cursor: 'pointer', transition: 'all 0.15s',
+                      background: on ? 'rgba(124,77,255,0.2)' : 'var(--bg-3)',
+                      border: `1px solid ${on ? 'rgba(124,77,255,0.4)' : 'var(--border)'}`,
+                      color: on ? 'var(--violet)' : 'var(--text-2)',
+                    }}>{a.first_name || a.phone}</button>
+                )
+              })}
+              {(editOnlyAlive ? accounts.filter(a => a.status === 'active') : accounts).length === 0 && (
+                <div style={{ fontSize: 12, color: 'var(--text-3)' }}>Нет аккаунтов</div>
+              )}
+            </div>
+          </div>
+
+          <div style={{ padding: 10, borderRadius: 8, background: 'rgba(255,180,0,0.08)', border: '1px solid rgba(255,180,0,0.2)', fontSize: 11, color: 'var(--text-2)' }}>
+            Каналы кампании редактируй прямо в её карточке: кнопки <strong>📺 Каналы</strong> / <strong>+ Добавить</strong>.
+          </div>
+
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+            <Button variant="ghost" onClick={() => setEditModal(false)} disabled={editSaving}>Отмена</Button>
+            <Button variant="primary" onClick={handleEditSave} loading={editSaving}>Сохранить</Button>
           </div>
         </div>
       </Modal>

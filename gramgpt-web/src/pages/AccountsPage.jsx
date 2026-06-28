@@ -543,10 +543,24 @@ export default function AccountsPage() {
               padding: '14px 20px', alignItems: 'center',
               borderBottom: i < filtered.length - 1 ? '1px solid var(--border)' : 'none',
               transition: 'background 0.1s', cursor: 'pointer',
-              background: selectedIds.has(acc.id) ? 'rgba(124,77,255,0.06)' : 'transparent',
+              // Активная кампания → лёгкая зелёная подложка + узкая полоса слева
+              background: selectedIds.has(acc.id)
+                ? 'rgba(124,77,255,0.06)'
+                : acc.active_campaign ? 'rgba(61,214,140,0.05)' : 'transparent',
+              boxShadow: acc.active_campaign && !selectedIds.has(acc.id)
+                ? 'inset 3px 0 0 0 var(--green)' : 'none',
             }}
-              onMouseEnter={e => { if (!selectedIds.has(acc.id)) e.currentTarget.style.background = 'rgba(255,255,255,0.02)' }}
-              onMouseLeave={e => { e.currentTarget.style.background = selectedIds.has(acc.id) ? 'rgba(124,77,255,0.06)' : 'transparent' }}>
+              onMouseEnter={e => {
+                if (!selectedIds.has(acc.id)) {
+                  e.currentTarget.style.background = acc.active_campaign
+                    ? 'rgba(61,214,140,0.10)' : 'rgba(255,255,255,0.02)'
+                }
+              }}
+              onMouseLeave={e => {
+                e.currentTarget.style.background = selectedIds.has(acc.id)
+                  ? 'rgba(124,77,255,0.06)'
+                  : acc.active_campaign ? 'rgba(61,214,140,0.05)' : 'transparent'
+              }}>
               {/* Checkbox */}
               <input type="checkbox"
                 checked={selectedIds.has(acc.id)}
@@ -563,8 +577,21 @@ export default function AccountsPage() {
                   fontSize: 12, fontWeight: 700, color: 'var(--violet)',
                 }}>{acc.first_name?.[0]?.toUpperCase() || '?'}</div>
                 <div>
-                  <div style={{ fontWeight: 600, fontSize: 13 }}>
+                  <div style={{ fontWeight: 600, fontSize: 13, display: 'flex', alignItems: 'center', gap: 6 }}>
                     {acc.first_name || 'Без имени'} {acc.last_name || ''}
+                    {acc.active_campaign && (
+                      <span
+                        title={`Активная кампания: ${acc.active_campaign.name}`}
+                        onClick={e => { e.stopPropagation(); navigate('/commenting') }}
+                        style={{
+                          fontSize: 10, padding: '2px 7px', borderRadius: 8,
+                          background: 'rgba(61,214,140,0.15)', color: 'var(--green)',
+                          border: '1px solid rgba(61,214,140,0.3)', cursor: 'pointer',
+                          maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                        }}>
+                        📣 {acc.active_campaign.name}
+                      </span>
+                    )}
                   </div>
                   {acc.username && <div style={{ fontSize: 10, color: 'var(--text-3)' }}>@{acc.username}</div>}
                 </div>
