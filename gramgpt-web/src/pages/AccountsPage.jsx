@@ -589,7 +589,7 @@ export default function AccountsPage() {
                           border: '1px solid rgba(61,214,140,0.3)', cursor: 'pointer',
                           maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                         }}>
-                        📣 {acc.active_campaign.name}
+                        {acc.active_campaign.name}
                       </span>
                     )}
                   </div>
