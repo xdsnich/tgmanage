@@ -54,13 +54,31 @@ def _jsonl_path(user_id: int, job_id: str) -> Path:
 # ── Helpers ─────────────────────────────────────────────────────────
 
 def _run_async(coro):
-    """sync→async bridge. Celery threads + asyncio = свой loop на task."""
-    loop = asyncio.new_event_loop()
+    """sync→async bridge. Celery threads + asyncio = свой loop на task.
+
+    ВАЖНО для Windows: используем ProactorEventLoop, а не SelectorEventLoop.
+    Camoufox/Playwright запускает Firefox-binary через subprocess —
+    SelectorEventLoop на Windows кидает NotImplementedError в
+    _make_subprocess_transport. По умолчанию asyncio.new_event_loop() в
+    треде Celery даёт SelectorEventLoop → весь скрейпер падает с
+    "NotImplementedError" глубоко внутри Playwright transport.
+
+    asyncio.run() работает потому что на Windows он сам ставит правильный
+    policy, но мы здесь не можем его юзать — у нас один таск = один новый
+    loop в треде, иначе run() конфликтует с другими тасками.
+    """
+    if sys.platform == "win32":
+        loop = asyncio.ProactorEventLoop()
+    else:
+        loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         return loop.run_until_complete(coro)
     finally:
-        loop.close()
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 
 # ── Universal page extractor ────────────────────────────────────────
