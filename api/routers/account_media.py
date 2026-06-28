@@ -220,19 +220,33 @@ async def clear_media(
 async def bulk_upload_media(
     account_ids: str = Form(...),     # CSV: "1,2,3" — multipart не любит JSON arrays
     files: List[UploadFile] = File(...),
+    # Режим распределения файлов между акками:
+    #   "all"    — каждый акк получает ВСЕ загруженные файлы (старое поведение)
+    #   "random" — каждый акк получает случайное подмножество из загруженных
+    #              (см. random_min/random_max — диапазон сколько штук на акка)
+    distribution: str = Form("random"),
+    random_min: int = Form(1),
+    random_max: int = Form(3),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Загрузить ОДИН И ТОТ ЖЕ набор фото в папки нескольких аккаунтов.
+    Загрузить пачку фото в папки нескольких аккаунтов.
 
-    Пример: загрузил 10 фото, указал account_ids="48,51,52,53,..." — каждое
-    фото скопируется в папку каждого из аккаунтов с уникальным uuid-именем.
-    Полезно при онбординге 400 аккаунтов: один раз готовишь пак фоток и
-    раскидываешь на всех.
+    distribution='random' (по умолчанию):
+        Каждый акк получает random.randint(random_min, random_max) файлов,
+        случайно выбранных из общего пула. Используется когда юзер хочет
+        чтобы у акков были разные аватарки (не все одинаковые) — это
+        снижает риск что Telegram свяжет их в кластер по одинаковым фото.
 
-    Все аккаунты должны принадлежать текущему юзеру (проверяется одним SQL).
+    distribution='all':
+        Каждый акк получает ВСЕ файлы (старое поведение, для совместимости).
+
+    Эта endpoint НЕ подключается к Telegram — это файловая операция,
+    раскладывает файлы в локальные папки. Реальная установка аватарок
+    делается уже warmup-движком, у которого свой IP-throttle + stagger.
     """
+    import random
     try:
         acc_ids = [int(x.strip()) for x in account_ids.split(",") if x.strip()]
     except ValueError:
@@ -279,12 +293,30 @@ async def bulk_upload_media(
             "message": "Все файлы отклонены, ничего не сохранено",
         }
 
+    # ── Распределение файлов между аккаунтами ──────────────────
+    mode = (distribution or "random").lower()
+    if mode not in ("random", "all"):
+        mode = "random"
+
+    # Защита: random_min/max должны быть в адекватном диапазоне
+    pool_size = len(bytes_per_file)
+    if mode == "random":
+        rmin = max(1, min(int(random_min), pool_size))
+        rmax = max(rmin, min(int(random_max), pool_size))
+
     # Раскидываем по папкам
     per_account_stats = []
     for acc_id in acc_ids:
         target = _account_dir(acc_id)
+        if mode == "all":
+            files_for_acc = bytes_per_file
+        else:
+            # random: для каждого акка свой случайный subset
+            n = random.randint(rmin, rmax)
+            files_for_acc = random.sample(bytes_per_file, n)
+
         saved = 0
-        for ext, content, _orig_name in bytes_per_file:
+        for ext, content, _orig_name in files_for_acc:
             unique_name = f"{uuid.uuid4().hex[:12]}{ext}"
             try:
                 (target / unique_name).write_bytes(content)
@@ -294,13 +326,19 @@ async def bulk_upload_media(
         per_account_stats.append({"account_id": acc_id, "saved": saved})
 
     total_saved = sum(s["saved"] for s in per_account_stats)
+    summary_msg = (
+        f"Раскидано {total_saved} файлов в {len(acc_ids)} папок "
+        f"(режим: {mode}"
+        f"{f', {rmin}-{rmax} фото/акк' if mode == 'random' else ''})"
+    )
     return {
         "accounts_count": len(acc_ids),
-        "files_saved_per_account": len(bytes_per_file),
+        "files_uploaded": pool_size,
         "total_saved": total_saved,
+        "distribution_mode": mode,
         "rejected_files": rejected_files,
         "per_account": per_account_stats,
-        "message": f"Скопировано {len(bytes_per_file)} фото в {len(acc_ids)} папок (итого {total_saved} файлов)",
+        "message": summary_msg,
     }
 
 

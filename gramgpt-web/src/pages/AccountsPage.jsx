@@ -24,6 +24,9 @@ export default function AccountsPage() {
   const [bulkMediaModal, setBulkMediaModal] = useState(false)
   const [bulkMediaFiles, setBulkMediaFiles] = useState([])
   const [bulkUploading, setBulkUploading] = useState(false)
+  const [bulkDist, setBulkDist] = useState('random')   // 'random' | 'all'
+  const [bulkRandomMin, setBulkRandomMin] = useState(1)
+  const [bulkRandomMax, setBulkRandomMax] = useState(3)
   const bulkFileInputRef = useRef(null)
 
   const toggleSelect = (id) => setSelectedIds(s => {
@@ -46,6 +49,9 @@ export default function AccountsPage() {
     try {
       const fd = new FormData()
       bulkMediaFiles.forEach(f => fd.append('files', f))
+      fd.append('distribution', bulkDist)
+      fd.append('random_min', String(bulkRandomMin))
+      fd.append('random_max', String(bulkRandomMax))
       const { data } = await accountMediaAPI.bulkUpload([...selectedIds], fd)
       alert(data.message)
       setBulkMediaModal(false)
@@ -1579,9 +1585,8 @@ export default function AccountsPage() {
         title={`📸 Фото для ${selectedIds.size} аккаунтов`} width={500}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
           <div style={{ padding: '10px 12px', background: 'rgba(124,77,255,0.06)', border: '1px solid rgba(124,77,255,0.15)', borderRadius: 8, fontSize: 12, color: 'var(--text-2)', lineHeight: 1.6 }}>
-            Каждое выбранное фото будет скопировано в папку <b>каждого</b> из {selectedIds.size} аккаунтов
-            (с уникальными именами, не перезаписывая существующие).
-            Во время прогрева/комментинга акк случайно постит одно фото из своей папки в сториз.
+            Файлы складываются в локальные папки аккаунтов — <b>Telegram не дёргается</b>.
+            Сами аватарки/сториз ставятся прогревом из этой папки (там уже есть IP-throttle и stagger).
           </div>
 
           <div onClick={() => bulkFileInputRef.current?.click()}
@@ -1626,16 +1631,65 @@ export default function AccountsPage() {
             </div>
           )}
 
-          <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
-            Каждый акк получит {bulkMediaFiles.length} новых фото. Всего файлов будет создано: {bulkMediaFiles.length * selectedIds.size}.
-          </div>
+          {/* Режим распределения */}
+          {bulkMediaFiles.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <div style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+                Как распределить
+              </div>
+              <div style={{ display: 'flex', gap: 8 }}>
+                {[
+                  { key: 'random', label: '🎲 Случайно', desc: 'каждому акк — свой рандомный набор (рекомендуется)' },
+                  { key: 'all',    label: '📋 Всем одинаково', desc: 'каждый акк получит все фото' },
+                ].map(o => {
+                  const on = bulkDist === o.key
+                  return (
+                    <button key={o.key} onClick={() => setBulkDist(o.key)} style={{
+                      flex: 1, padding: '8px 10px', borderRadius: 8, cursor: 'pointer', textAlign: 'left',
+                      background: on ? 'rgba(124,77,255,0.15)' : 'var(--bg-3)',
+                      border: `1px solid ${on ? 'rgba(124,77,255,0.4)' : 'var(--border)'}`,
+                      color: on ? 'var(--text)' : 'var(--text-2)',
+                    }}>
+                      <div style={{ fontSize: 12, fontWeight: 600 }}>{o.label}</div>
+                      <div style={{ fontSize: 10, opacity: 0.75, marginTop: 2 }}>{o.desc}</div>
+                    </button>
+                  )
+                })}
+              </div>
+
+              {bulkDist === 'random' && (
+                <div style={{ display: 'flex', gap: 10, alignItems: 'flex-end' }}>
+                  <div style={{ flex: 1 }}>
+                    <label style={{ fontSize: 11, color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>Мин. фото/акк</label>
+                    <input type="number" value={bulkRandomMin}
+                      min={1} max={bulkMediaFiles.length}
+                      onChange={e => setBulkRandomMin(Math.max(1, Math.min(parseInt(e.target.value || '1'), bulkMediaFiles.length)))}
+                      style={{ width: '100%', padding: '6px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--bg-3)', color: 'var(--text)', fontSize: 12 }} />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <label style={{ fontSize: 11, color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>Макс. фото/акк</label>
+                    <input type="number" value={bulkRandomMax}
+                      min={bulkRandomMin} max={bulkMediaFiles.length}
+                      onChange={e => setBulkRandomMax(Math.max(bulkRandomMin, Math.min(parseInt(e.target.value || '1'), bulkMediaFiles.length)))}
+                      style={{ width: '100%', padding: '6px 10px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--bg-3)', color: 'var(--text)', fontSize: 12 }} />
+                  </div>
+                </div>
+              )}
+
+              <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
+                {bulkDist === 'all'
+                  ? `Каждый акк получит ${bulkMediaFiles.length} фото. Итого ${bulkMediaFiles.length * selectedIds.size} файлов.`
+                  : `Каждый акк получит случайно ${bulkRandomMin}-${bulkRandomMax} фото из ${bulkMediaFiles.length}. Ожидаемо ~${Math.round((bulkRandomMin + bulkRandomMax) / 2 * selectedIds.size)} файлов.`}
+              </div>
+            </div>
+          )}
 
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
             <Button variant="ghost" onClick={() => setBulkMediaModal(false)}>Отмена</Button>
             <Button variant="primary" loading={bulkUploading}
               disabled={bulkMediaFiles.length === 0 || selectedIds.size === 0}
               onClick={handleBulkUpload}>
-              📤 Загрузить во все папки
+              📤 Распределить
             </Button>
           </div>
         </div>
