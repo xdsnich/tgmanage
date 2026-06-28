@@ -913,6 +913,7 @@ def _classify_source_sql():
     # всё остальное → search (telegram)
     return case(
         (func.coalesce(ParsedChannel.search_query, '').like('similar:%'), 'similar'),
+        (func.coalesce(ParsedChannel.search_query, '').like('tgstat_web:%'), 'tgstat_web'),
         (func.coalesce(ParsedChannel.search_query, '') == 'import', 'import'),
         else_='search',
     )
@@ -1473,7 +1474,7 @@ class WebScrapeTgstatRequest(BaseModel):
     languages: list[str] = []           # legacy, не используется
     categories: list[str] = []          # legacy, не используется
     countries: list[str] = []           # ISO-2 коды (RU, UA, KZ...) или пусто = глобально
-    target: str = "chats"               # "chats" (по умолчанию — с комментами) | "channels"
+    target: str = "channels"            # дефолт: каналы (потом фильтр через детали)
     only_with_comments: bool = True
     pages_per_geo: int = 1              # сколько страниц с каждого среза
     include_global: bool = False        # добавлять глобальный URL (без country)

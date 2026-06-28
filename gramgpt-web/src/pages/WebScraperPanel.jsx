@@ -36,9 +36,10 @@ export default function WebScraperPanel() {
   // Раньше было selectedLangs — теперь это страны (ISO-2: RU, UA, KZ…).
   // Дефолт пуст = глобальный рейтинг.
   const [selectedCountries, setSelectedCountries] = useState([])
-  // target: 'chats' (по умолчанию — discussion-группы, где можно писать
-  // комменты) ИЛИ 'channels' (обычный рейтинг каналов).
-  const [tgstatTarget, setTgstatTarget] = useState('chats')
+  // target: 'channels' (рейтинг каналов; Stage 2 проверит linked-chat и
+  // оставит только каналы с открытыми комментами) ИЛИ 'chats'
+  // (рейтинг discussion-групп напрямую).
+  const [tgstatTarget, setTgstatTarget] = useState('channels')
   const [onlyWithComments, setOnlyWithComments] = useState(true)
   const [pagesPerGeo, setPagesPerGeo] = useState(1)
   const [includeGlobal, setIncludeGlobal] = useState(true)
@@ -357,10 +358,10 @@ export default function WebScraperPanel() {
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
             {[
-              { key: 'chats',    label: '📢 Каналы с открытыми комментами',
-                desc: 'Берём с TGStat рейтинг discussion-групп → каждой эвристически сопоставляем канал. Это и есть каналы где можно писать в комменты.' },
-              { key: 'channels', label: '📋 Все каналы (рейтинг)',
-                desc: 'Просто рейтинг каналов. Большинство БЕЗ открытых комментов.' },
+              { key: 'channels', label: '📢 Каналы с открытыми комментами',
+                desc: 'Берём рейтинг каналов TGStat → для каждого открываем детальную страницу → оставляем только тех у кого есть linked discussion chat (= можно писать комменты под постами).' },
+              { key: 'chats',    label: '📋 Discussion-чаты (рейтинг)',
+                desc: 'Рейтинг публичных чатов как они есть на TGStat. Без фильтра по linked-чанналу.' },
             ].map(t => {
               const on = tgstatTarget === t.key
               return (

@@ -107,11 +107,10 @@ def build_urls(
         languages, categories — TGStat не поддерживает такие фильтры
         в URL. URL вида /{lang}/channels/category/{cat} возвращают 404.
     """
-    # Если юзер хочет "только с комментариями" — это значит чаты
-    # (а не каналы). Переключаем target.
-    if only_with_comments and target == "channels":
-        target = "chats"
-
+    # only_with_comments больше НЕ переключает target. Сама фильтрация
+    # «канал с открытыми комментами» делается во 2-м проходе пайплайна
+    # (Celery таск открывает /channel/@xxx для каждого и проверяет
+    # есть ли linked_chat). Здесь только генерируем rating URLs.
     base_path = "/ratings/chats" if target == "chats" else "/ratings/channels"
 
     countries_list = [c.upper() for c in (countries or [])]
