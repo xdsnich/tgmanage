@@ -1375,6 +1375,20 @@ async def _execute_plan_session(plan_id: int):
                             err = str(e)
                             logger.warning(f"[plan][{phone}]   [{action_num}/{len(actions)}] ❌ {action.get('type')}: {err[:80]}")
 
+                            # Дублируем как ошибку аккаунта в AccountErrorLog
+                            try:
+                                from utils.account_errors import log_account_error_async
+                                await log_account_error_async(
+                                    db=db, account_id=acc.id, user_id=acc.user_id,
+                                    source=plan_source, exc=e,
+                                    message=f"action={action.get('type')}: {err[:300]}",
+                                    proxy_id=getattr(acc, "proxy_id", None),
+                                    campaign_id=plan_campaign_id,
+                                    warmup_task_id=plan.warmup_task_id,
+                                )
+                            except Exception:
+                                pass
+
                             if "FLOOD_WAIT" in err:
                                 import re as _re
                                 wait = int(_re.search(r"(\d+)", err).group(1)) if _re.search(r"(\d+)", err) else 60
@@ -1396,6 +1410,18 @@ async def _execute_plan_session(plan_id: int):
                     await _safe_log(db, task_id=log_task_id, account_id=acc.id, action="error",
                                      detail=f"Ошибка сессии: {str(e)[:200]}", success=False,
                                      source=plan_source, campaign_id=plan_campaign_id)
+                    try:
+                        from utils.account_errors import log_account_error_async
+                        await log_account_error_async(
+                            db=db, account_id=acc.id, user_id=acc.user_id,
+                            source=plan_source, exc=e,
+                            message=f"Ошибка сессии: {str(e)[:300]}",
+                            proxy_id=getattr(acc, "proxy_id", None),
+                            campaign_id=plan_campaign_id,
+                            warmup_task_id=plan.warmup_task_id,
+                        )
+                    except Exception:
+                        pass
                 finally:
                     # Защищаем от NameError если client не успел создаться
                     # (например, exception до make_telethon_client) И от

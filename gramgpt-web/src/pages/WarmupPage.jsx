@@ -2,6 +2,7 @@ import { useEffect, useState, useRef } from 'react'
 import { warmupAPI, accountsAPI, commentingAPI, serviceCredentialsAPI } from '../services/api'
 import { Card, Button, Input, Modal, Badge, Spinner, Empty } from '../components/ui'
 import { useAutoRefresh } from '../hooks/useAutoRefresh'
+import AccountErrorsPanel from '../components/AccountErrorsPanel'
 
 const MODE_INFO = {
   careful: { label: '🐢 Осторожный', desc: 'Мало действий, большие паузы', color: '#3dd68c' },
@@ -16,6 +17,7 @@ export default function WarmupPage() {
   const [loading, setLoading] = useState(true)
   const [createModal, setCreateModal] = useState(false)
   const [logsModal, setLogsModal] = useState(false)
+  const [errorsModal, setErrorsModal] = useState(false)
   const [selectedTask, setSelectedTask] = useState(null)
   const [channelsModal, setChannelsModal] = useState(false)
   const [chText, setChText] = useState('')
@@ -459,6 +461,7 @@ export default function WarmupPage() {
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           {idleCount > 0 && <Button variant="ghost" onClick={handleStartAll}>▶ Запустить все ({idleCount})</Button>}
+          <Button variant="ghost" onClick={() => setErrorsModal(true)}>🐞 Ошибки аккаунтов</Button>
           <Button variant="primary" onClick={() => setCreateModal(true)}>+ Новый прогрев</Button>
         </div>
       </div>
@@ -1073,6 +1076,12 @@ export default function WarmupPage() {
           )}
         </Modal>
       )}
+
+      {/* ══ Errors Modal ══ */}
+      <Modal open={errorsModal} onClose={() => setErrorsModal(false)}
+             title="🐞 Ошибки аккаунтов — прогрев" width={920}>
+        <AccountErrorsPanel sourceFilter="warmup" />
+      </Modal>
     </div>
   )
 }

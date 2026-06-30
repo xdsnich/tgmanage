@@ -227,6 +227,94 @@ async def get_filters(current_user: User = Depends(get_current_user), db: AsyncS
     categories = sorted(set(r[1] for r in rows if r[1]))
     return {"geos": geos, "categories": categories}
 
+@router.get("/errors")
+async def list_account_errors(
+    account_id: Optional[int] = None,
+    source: Optional[str] = None,
+    error_type: Optional[str] = None,
+    campaign_id: Optional[int] = None,
+    warmup_task_id: Optional[int] = None,
+    hours: int = 168,                  # за последние 7 дней по умолчанию
+    limit: int = 200,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Лог ошибок аккаунтов с фильтрами для UI вкладки."""
+    from datetime import datetime, timedelta
+    from models.account_error import AccountErrorLog
+
+    q = select(AccountErrorLog).where(AccountErrorLog.user_id == current_user.id)
+    if account_id:
+        q = q.where(AccountErrorLog.account_id == account_id)
+    if source:
+        q = q.where(AccountErrorLog.source == source)
+    if error_type:
+        q = q.where(AccountErrorLog.error_type == error_type)
+    if campaign_id:
+        q = q.where(AccountErrorLog.campaign_id == campaign_id)
+    if warmup_task_id:
+        q = q.where(AccountErrorLog.warmup_task_id == warmup_task_id)
+    if hours and hours > 0:
+        since = datetime.utcnow() - timedelta(hours=hours)
+        q = q.where(AccountErrorLog.created_at >= since)
+    q = q.order_by(AccountErrorLog.created_at.desc()).limit(max(1, min(limit, 1000)))
+
+    rows = (await db.execute(q)).scalars().all()
+    return [{
+        "id": r.id,
+        "account_id": r.account_id,
+        "source": r.source,
+        "error_type": r.error_type,
+        "message": r.message,
+        "context": r.context,
+        "proxy_id": r.proxy_id,
+        "campaign_id": r.campaign_id,
+        "warmup_task_id": r.warmup_task_id,
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+    } for r in rows]
+
+
+@router.get("/errors/summary")
+async def account_errors_summary(
+    hours: int = 24,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Группировка ошибок по аккаунту/типу для UI заголовка вкладки."""
+    from datetime import datetime, timedelta
+    from sqlalchemy import func as sql_func
+    from models.account_error import AccountErrorLog
+
+    since = datetime.utcnow() - timedelta(hours=max(1, hours))
+
+    # Всего ошибок + по типам
+    by_type = (await db.execute(
+        select(AccountErrorLog.error_type, sql_func.count())
+        .where(AccountErrorLog.user_id == current_user.id,
+               AccountErrorLog.created_at >= since)
+        .group_by(AccountErrorLog.error_type)
+        .order_by(sql_func.count().desc())
+    )).all()
+
+    # Топ-аккаунтов по числу ошибок
+    by_acc = (await db.execute(
+        select(AccountErrorLog.account_id, sql_func.count())
+        .where(AccountErrorLog.user_id == current_user.id,
+               AccountErrorLog.created_at >= since)
+        .group_by(AccountErrorLog.account_id)
+        .order_by(sql_func.count().desc())
+        .limit(20)
+    )).all()
+
+    total = sum(c for _, c in by_type)
+    return {
+        "hours": hours,
+        "total": total,
+        "by_type": [{"error_type": t or "Unknown", "count": c} for t, c in by_type],
+        "by_account": [{"account_id": a, "count": c} for a, c in by_acc],
+    }
+
+
 @router.get("/{account_id}", response_model=AccountOut)
 async def get_account(account_id: int, current_user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     return await acc_svc.get_account(db, account_id, current_user.id)

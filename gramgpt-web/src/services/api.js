@@ -113,6 +113,12 @@ export const accountsAPI = {
   get: (id) =>
     api.get(`/accounts/${id}`),
 
+  errors: (params = {}) =>
+    api.get('/accounts/errors', { params }),
+
+  errorsSummary: (hours = 24) =>
+    api.get('/accounts/errors/summary', { params: { hours } }),
+
   create: (phone, apiAppId = null, proxyId = null) =>
     api.post('/accounts/', { phone, api_app_id: apiAppId, proxy_id: proxyId }),
 

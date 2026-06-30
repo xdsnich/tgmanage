@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { commentingAPI, accountsAPI, parserAPI, subscribeAPI, warmupAPI, serviceCredentialsAPI } from '../services/api'
 import { Card, Button, Input, Modal, Badge, Spinner, Empty, StatCard } from '../components/ui'
+import AccountErrorsPanel from '../components/AccountErrorsPanel'
 import { useAutoRefresh } from '../hooks/useAutoRefresh'
 
 const TONES = [
@@ -90,6 +91,7 @@ export default function CommentingPage() {
   const [channelModal, setChannelModal]     = useState(false)
   const [subscribeModal, setSubscribeModal] = useState(false)
   const [editModal, setEditModal]           = useState(false)
+  const [errorsModal, setErrorsModal]       = useState(false)
   const [editForm, setEditForm]             = useState({ id: null, name: '', account_ids: [] })
   const [editOnlyAlive, setEditOnlyAlive]   = useState(true)
   const [editSaving, setEditSaving]         = useState(false)
@@ -378,7 +380,10 @@ export default function CommentingPage() {
           <h1 style={{ fontSize: 26, fontWeight: 800, letterSpacing: '-0.04em' }}>Кампании</h1>
           <p style={{ fontSize: 13, color: 'var(--text-3)', marginTop: 4 }}>{campaigns.length} кампаний</p>
         </div>
-        <Button variant="primary" onClick={() => setCreateModal(true)}>+ Создать кампанию</Button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <Button variant="ghost" onClick={() => setErrorsModal(true)}>🐞 Ошибки аккаунтов</Button>
+          <Button variant="primary" onClick={() => setCreateModal(true)}>+ Создать кампанию</Button>
+        </div>
       </div>
 
       {/* Main Tabs */}
@@ -1254,6 +1259,12 @@ export default function CommentingPage() {
             <Button variant="primary" loading={saving} onClick={handleAddChannels}>Добавить</Button>
           </div>
         </div>
+      </Modal>
+
+      {/* ══ Errors Modal ══ */}
+      <Modal open={errorsModal} onClose={() => setErrorsModal(false)}
+             title="🐞 Ошибки аккаунтов — комментинг" width={920}>
+        <AccountErrorsPanel sourceFilter="commenting" />
       </Modal>
     </div>
   )
