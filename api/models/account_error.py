@@ -15,6 +15,12 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from database import Base
 
+# КРИТИЧНО: импортируем зависимые модели ДО объявления своей,
+# иначе SQLAlchemy при create_all не найдёт telegram_accounts
+# (NoReferencedTableError: account_error_logs.account_id → telegram_accounts).
+from models import account as _acc_model  # noqa: F401
+from models import user as _user_model    # noqa: F401
+
 
 class AccountErrorLog(Base):
     __tablename__ = "account_error_logs"
