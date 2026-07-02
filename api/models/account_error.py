@@ -26,7 +26,7 @@ class AccountErrorLog(Base):
     __tablename__ = "account_error_logs"
 
     id:          Mapped[int]              = mapped_column(Integer, primary_key=True)
-    account_id:  Mapped[int]              = mapped_column(ForeignKey("telegram_accounts.id", ondelete="CASCADE"), nullable=False, index=True)
+    account_id:  Mapped[int]              = mapped_column(ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False, index=True)
     user_id:     Mapped[int]              = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
 
     # Откуда ошибка: warmup | commenting | parser | bulk | tg_auth |
