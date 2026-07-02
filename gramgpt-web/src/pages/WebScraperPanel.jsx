@@ -729,6 +729,23 @@ export default function WebScraperPanel() {
             </div>
           </div>
 
+          {aggregated.channels_count > 0 && (
+            <div style={{
+              padding: '8px 12px', borderRadius: 8, background: 'rgba(61,214,140,0.08)',
+              border: '1px solid rgba(61,214,140,0.25)', fontSize: 12, color: 'var(--text-2)',
+              marginBottom: 10, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10,
+            }}>
+              <span>
+                ✅ <b>{aggregated.channels_count}</b> канала сохранено в БД (только с открытыми комментами).
+                Их видно в списке парсера как канал с меткой <code style={{ background: 'var(--bg-3)', padding: '1px 5px', borderRadius: 3 }}>tgstat_web</code>.
+              </span>
+              <a href="/parser?source=tgstat_web" target="_blank" rel="noreferrer"
+                 style={{ color: 'var(--violet)', textDecoration: 'none', fontWeight: 600, whiteSpace: 'nowrap' }}>
+                Открыть список парсера →
+              </a>
+            </div>
+          )}
+
           {aggregated.channels.length === 0 ? (
             <div style={{ fontSize: 12, color: 'var(--text-3)', padding: 20, textAlign: 'center' }}>
               Каналы под фильтр не нашлись. Попробуй снять «только с комментами» или снизить min подписчиков.

@@ -173,6 +173,19 @@ class WebScraper:
         # Текущие URL обрабатываемые воркерами — для UI "в работе сейчас"
         self._in_flight: dict[int, str] = {}
         self._in_flight_lock = asyncio.Lock()
+        # Browser-crash recovery state
+        self._browser_crash_count: int = 0
+        self._browser_healthy: bool = True
+        self._restart_lock = asyncio.Lock()
+        # Circuit breaker: если N consecutive fails — форс-cancel
+        # чтобы не пожечь весь пул прокси на бесполезных retry.
+        self._consecutive_fails: int = 0
+        self._max_consecutive_fails: int = 20
+        self._force_stop: bool = False
+        # Оборачиваем внешний cancel_check чтобы также реагировать на
+        # circuit breaker
+        _external_cancel = self.cancel_check
+        self.cancel_check = lambda: self._force_stop or _external_cancel()
 
     # ── Context manager ──────────────────────────────────────────────
 
@@ -299,8 +312,20 @@ class WebScraper:
                 result = await self._process_url(worker_id, url)
                 if result.success:
                     self.stats.ok += 1
+                    self._consecutive_fails = 0
                 else:
                     self.stats.failed += 1
+                    self._consecutive_fails += 1
+                    # Circuit breaker: 20 подряд failed → TGStat нас
+                    # либо забанил, либо прокси-пул мёртв. Смысла жечь
+                    # оставшиеся URL нет — форсим завершение.
+                    if self._consecutive_fails >= self._max_consecutive_fails:
+                        logger.error(
+                            f"[worker-{worker_id}] 🛑 circuit breaker: "
+                            f"{self._consecutive_fails} fails подряд — "
+                            f"остальные URL пропускаем"
+                        )
+                        self._force_stop = True
 
                 # Запись в JSONL — атомарно под локом checkpoint'а
                 await self.checkpoint.save({
@@ -499,11 +524,67 @@ class WebScraper:
                 self.rotator.release(node)
                 raise
             except Exception as e:
-                # Сетевая ошибка, navigation error, проблема с прокси —
-                # cooldown потому что чаще всего это связано с IP.
                 err_str = f"{type(e).__name__}: {str(e)[:120]}"
-                await self.rotator.mark_failed(node, err_str)
                 last_error = err_str
+
+                # Детект краха браузера. Playwright/Camoufox после
+                # смерти Firefox бросает "Connection closed while
+                # reading from the driver" на КАЖДЫЙ new_context/
+                # new_page/goto. Без перезапуска все следующие URL
+                # мгновенно фейлятся с этой ошибкой (0 сек duration).
+                low = str(e).lower()
+                is_browser_crash = (
+                    "connection closed while reading from the driver" in low
+                    or "target page, context or browser has been closed" in low
+                    or "browser closed" in low
+                )
+                if is_browser_crash:
+                    # Прокси не виноват — не отправляем его в cooldown
+                    self.rotator.release(node)
+                    self._browser_crash_count += 1
+                    self._browser_healthy = False
+                    logger.error(
+                        f"[worker] browser crash #{self._browser_crash_count}: {err_str}"
+                    )
+                    # Слишком много крашей подряд (>3) — что-то с
+                    # ресурсами системы, force-stop чтоб не сжечь
+                    # ещё больше прокси.
+                    if self._browser_crash_count >= 3:
+                        logger.error(
+                            "[worker] 3+ browser crashes — force stop"
+                        )
+                        self._force_stop = True
+                        return ScrapeResult(
+                            url=url, success=False,
+                            error="browser crashed too many times",
+                            attempts=attempt,
+                            duration_sec=time.time() - start,
+                        )
+                    # Атомарный перезапуск: только один воркер делает
+                    # restart, остальные ждут пока он закончит.
+                    async with self._restart_lock:
+                        if not self._browser_healthy:
+                            try:
+                                await self.pool.restart()
+                                self._browser_healthy = True
+                            except Exception as re:
+                                logger.error(
+                                    f"[worker] restart failed: {re}"
+                                )
+                                self._force_stop = True
+                                return ScrapeResult(
+                                    url=url, success=False,
+                                    error=f"restart failed: {re}",
+                                    attempts=attempt,
+                                    duration_sec=time.time() - start,
+                                )
+                    # Retry этот же URL с другим прокси
+                    if attempt < self.max_retries:
+                        await backoff_delay(attempt)
+                    continue
+
+                # Обычная сетевая ошибка — прокси в cooldown
+                await self.rotator.mark_failed(node, err_str)
                 if attempt < self.max_retries:
                     await backoff_delay(attempt)
 

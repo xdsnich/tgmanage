@@ -89,6 +89,27 @@ class BrowserContextPool:
         self._started = False
         logger.info("[context_pool] Camoufox остановлен")
 
+    async def restart(self) -> None:
+        """
+        Перезапуск Camoufox после краха (Firefox died, "Connection
+        closed while reading from the driver"). Без этого все
+        последующие URL мгновенно фейлятся с той же ошибкой.
+        """
+        logger.warning("[context_pool] 🔄 Перезапуск Camoufox после краха")
+        try:
+            await self.stop()
+        except Exception as e:
+            logger.warning(f"[context_pool] restart: stop() ошибка: {e}")
+        # Небольшая пауза чтобы OS корректно закрыла процесс
+        import asyncio as _asyncio
+        await _asyncio.sleep(2.0)
+        try:
+            await self.start()
+            logger.info("[context_pool] ✅ Camoufox перезапущен")
+        except Exception as e:
+            logger.error(f"[context_pool] restart: start() failed: {e}")
+            raise
+
     @asynccontextmanager
     async def context_for(self, node):
         """
