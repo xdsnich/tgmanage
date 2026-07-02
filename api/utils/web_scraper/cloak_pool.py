@@ -76,7 +76,7 @@ class CloakProfilePool:
         cloak_kwargs: dict | None = None,
         page_locale: str = "en-US",
         idle_shutdown_sec: float = 300.0,
-        browser_version: str = "146",
+        browser_version: str | None = None,
     ):
         self.profiles_dir = Path(profiles_dir)
         self.rotation_min = float(node_rotation_min_sec)
@@ -86,10 +86,13 @@ class CloakProfilePool:
         self.cloak_kwargs = dict(cloak_kwargs or {})
         self.page_locale = page_locale
         self.idle_shutdown_sec = float(idle_shutdown_sec)
-        # Пинуем major-версию Chromium — 146 бесплатная навсегда. Если юзер
-        # передал browser_version через cloak_kwargs — уважим его выбор.
-        self.browser_version = str(
-            self.cloak_kwargs.pop("browser_version", browser_version) or browser_version
+        # Дефолт cloakbrowser сейчас — 146.0.7680.177.5, свободная ветка
+        # (Pro-ключ не нужен). Оставляем None → библиотека сама подставит.
+        # Если юзер явно передал версию через cloak_kwargs["browser_version"]
+        # или через параметр — уважим. ВАЖНО: нужен полный пин вида
+        # "146.0.7680.177.5", а не "146" — иначе ValueError.
+        self.browser_version = (
+            self.cloak_kwargs.pop("browser_version", None) or browser_version
         )
 
         # proxy_url -> {"ctx": BrowserContext, "last_use": ts, "profile_dir": Path}
@@ -122,11 +125,15 @@ class CloakProfilePool:
         # будет висеть под 30 сек. ensure_binary синхронный, поэтому
         # уводим в executor чтоб не блокировать event loop.
         try:
+            from cloakbrowser import ensure_binary as _ensure
+            # Передаём browser_version только если явно задан (иначе пусть
+            # библиотека возьмёт свой дефолт — сейчас 146.0.7680.177.5,
+            # свободная ветка).
+            kwargs = {}
+            if self.browser_version:
+                kwargs["browser_version"] = self.browser_version
             await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: __import__("cloakbrowser").ensure_binary(
-                    browser_version=self.browser_version
-                ),
+                None, lambda: _ensure(**kwargs)
             )
         except Exception as e:
             # Не фатал — при launch попытается снова
@@ -257,12 +264,13 @@ class CloakProfilePool:
             kw["proxy"] = proxy_url
             kw["locale"] = self.page_locale
             kw["user_data_dir"] = str(profile_dir)
-            kw["browser_version"] = self.browser_version
+            if self.browser_version:
+                kw["browser_version"] = self.browser_version
 
             logger.info(
                 f"[cloak_pool] launch profile {_profile_hash(proxy_url)} "
                 f"(headless={kw.get('headless')}, geoip={kw.get('geoip')}, "
-                f"humanize={kw.get('humanize')}, v{self.browser_version})"
+                f"humanize={kw.get('humanize')}, v={self.browser_version or 'default'})"
             )
             ctx = await launch_persistent_context_async(**kw)
             self._contexts[proxy_url] = {
@@ -317,7 +325,7 @@ class CloakProfilePool:
         return {
             "profiles_total": len(self._contexts),
             "profiles_dir": str(self.profiles_dir),
-            "browser_version": self.browser_version,
+            "browser_version": self.browser_version or "default",
             "profiles": [
                 {
                     "proxy_hash": _profile_hash(url),
