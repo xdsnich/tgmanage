@@ -228,10 +228,20 @@ class WebScraper:
         60 сек до page_timeout. После этого _process_url увидит
         "browser closed" ошибку — но крашрекавери НЕ будет запускать
         рестарт, потому что self._cancel_pool_closed=True.
+
+        Ограничиваем 10 секундами на всякий случай — если сам
+        Chromium subprocess уже мёртв, ctx.close() может висеть в
+        Playwright transport. Через 10с идём дальше — воркеры всё
+        равно уже отменены через w.cancel().
         """
         try:
-            await self.pool.stop()
+            await asyncio.wait_for(self.pool.stop(), timeout=10.0)
             logger.info("[scraper] emergency: pool closed, in-flight goto/new_context должны упасть")
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[scraper] emergency pool stop >10с — Playwright transport висит, "
+                "но воркеры уже отменены через w.cancel(), продолжаем"
+            )
         except Exception as e:
             logger.warning(f"[scraper] emergency pool stop error: {type(e).__name__}: {e}")
 
