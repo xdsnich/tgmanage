@@ -102,7 +102,7 @@ export default function WebScraperPanel() {
     if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
   }
 
-  const startPolling = (id) => {
+  const startPolling = (id, intervalMs = 2000) => {
     stopPolling()
     pollRef.current = setInterval(async () => {
       try {
@@ -110,6 +110,7 @@ export default function WebScraperPanel() {
         setProgress(data)
         if (['done', 'cancelled', 'error', 'unknown'].includes(data.status)) {
           stopPolling()
+          setStopping(false)
           if (data.status === 'done') {
             loadJobs()
             if (mode === 'tgstat') loadAggregate(id)
@@ -119,7 +120,7 @@ export default function WebScraperPanel() {
           try { localStorage.removeItem(LS_KEY) } catch {}
         }
       } catch (e) { console.error('progress poll', e) }
-    }, 2000)
+    }, intervalMs)
   }
 
   const loadJobs = async () => {
@@ -321,9 +322,17 @@ export default function WebScraperPanel() {
     setStopping(true)
     try {
       await parserAPI.webScrapeStop(jobId)
-      showToast('Сигнал отмены отправлен…', 'ok')
-    } catch (e) { showToast('Не удалось отменить', 'err') }
-    finally { setStopping(false) }
+      showToast('Сигнал отмены отправлен — жду подтверждения от воркера…', 'ok')
+      // Ускоряем поллинг до 1 сек, чтобы UI быстро отразил переход в
+      // "cancelled" (типично 2-5 сек: watchdog видит флаг → закрывает
+      // pool → воркеры отваливаются → run() finalize'ится → task
+      // публикует финальный snapshot).
+      // stopping-флаг снимется когда startPolling увидит терминальный статус.
+      startPolling(jobId, 1000)
+    } catch (e) {
+      showToast('Не удалось отменить', 'err')
+      setStopping(false)
+    }
   }
 
   const handleDownload = async (id) => {
@@ -707,6 +716,16 @@ export default function WebScraperPanel() {
           <div style={{ height: 8, borderRadius: 4, background: 'var(--bg-2)', overflow: 'hidden', marginBottom: 10 }}>
             <div style={{ height: '100%', width: `${pct}%`, background: statusColor, transition: 'width 0.4s ease' }} />
           </div>
+
+          {stopping && isRunning && (
+            <div style={{
+              padding: '8px 12px', marginBottom: 10, borderRadius: 6,
+              background: 'rgba(239, 68, 68, 0.15)', border: '1px solid rgba(239, 68, 68, 0.4)',
+              color: 'var(--red)', fontSize: 12, display: 'flex', alignItems: 'center', gap: 8,
+            }}>
+              <span>🛑 Останавливаю: жду пока воркеры отпустят прокси и запишут последние URL в JSONL. Обычно 2-5 сек.</span>
+            </div>
+          )}
 
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 8, marginBottom: 10 }}>
             <SmallStat label="✅ OK" value={ok} color="var(--green)" />

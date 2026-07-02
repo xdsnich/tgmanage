@@ -221,6 +221,20 @@ class WebScraper:
     async def __aexit__(self, *args):
         await self.pool.stop()
 
+    async def _emergency_pool_stop(self) -> None:
+        """
+        Вызывается watchdog'ом при cancel. Закрывает pool чтобы все
+        pending page.goto/new_context мгновенно упали, а не ждали
+        60 сек до page_timeout. После этого _process_url увидит
+        "browser closed" ошибку — но крашрекавери НЕ будет запускать
+        рестарт, потому что self._cancel_pool_closed=True.
+        """
+        try:
+            await self.pool.stop()
+            logger.info("[scraper] emergency: pool closed, in-flight goto/new_context должны упасть")
+        except Exception as e:
+            logger.warning(f"[scraper] emergency pool stop error: {type(e).__name__}: {e}")
+
     # ── Public API ───────────────────────────────────────────────────
 
     async def run(self, urls: list[str]) -> None:
@@ -253,18 +267,35 @@ class WebScraper:
             for i in range(self.max_workers)
         ]
 
-        # Watchdog: раз в 2 сек проверяет cancel_check. Если юзер нажал
-        # "Стоп" — отменяем все таски воркеров не дожидаясь конца URL.
-        # Без этого "стоп" работал только между URL'ами и юзер мог ждать
-        # до 90 сек (page_timeout) пока воркер закончит текущий goto().
+        # Watchdog: раз в 1 сек проверяет cancel_check. Если юзер нажал
+        # "Стоп" — форс-стопим:
+        #   1. отменяем task'и воркеров (asyncio.cancel)
+        #   2. ЗАКРЫВАЕМ browser pool — все in-flight page.goto()
+        #      мгновенно падают с "Connection closed while reading from
+        #      the driver". Иначе Playwright ждёт page_timeout (60 сек)
+        #      прежде чем реально освободиться на CancelledError, потому
+        #      что transport читает из subprocess pipe в блокирующем
+        #      режиме и CancelledError не пробивает этот read.
+        # Помечаем что закрытие сделано ПО КАНСЕЛУ, а не крах — чтобы
+        # _process_url не пытался восстановить браузер.
+        self._cancel_pool_closed: bool = False
         async def _cancel_watchdog():
             while True:
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(1.0)
                 if self.cancel_check():
-                    logger.info("[scraper] cancel_check=True — force cancel воркеров")
+                    logger.info(
+                        "[scraper] cancel_check=True — force cancel воркеров "
+                        "+ закрываю browser pool чтобы разблокировать goto()"
+                    )
                     for w in workers:
                         if not w.done():
                             w.cancel()
+                    # Фоном закрываем pool, не блокируя watchdog
+                    self._cancel_pool_closed = True
+                    asyncio.create_task(
+                        self._emergency_pool_stop(),
+                        name="scraper-emergency-pool-stop",
+                    )
                     return
                 if all(w.done() for w in workers):
                     return
@@ -438,12 +469,18 @@ class WebScraper:
                 break
 
             try:
-                node = await self.rotator.acquire(wait_timeout=600.0)
-            except asyncio.TimeoutError:
-                last_error = "no_available_node"
-                logger.error(
-                    f"[worker-{worker_id}] {url}: все узлы заняты/в cooldown >10мин"
+                node = await self.rotator.acquire(
+                    wait_timeout=600.0,
+                    cancel_check=self.cancel_check,
                 )
+            except asyncio.TimeoutError as _e:
+                if self.cancel_check():
+                    last_error = "cancelled"
+                else:
+                    last_error = "no_available_node"
+                    logger.error(
+                        f"[worker-{worker_id}] {url}: все узлы заняты/в cooldown >10мин"
+                    )
                 break
 
             proxy_label = NodeRotator._mask(node.url)
@@ -566,6 +603,20 @@ class WebScraper:
                 if is_browser_crash:
                     # Прокси не виноват — не отправляем его в cooldown
                     self.rotator.release(node)
+                    # Если pool закрыт по нашей же отмене (watchdog вызвал
+                    # emergency_pool_stop) — это НЕ крах, это cancel.
+                    # НЕ пытаемся рестартить браузер (иначе восстановим
+                    # то что сами специально закрыли), просто выходим.
+                    if getattr(self, "_cancel_pool_closed", False) or self.cancel_check():
+                        logger.info(
+                            f"[worker] browser closed по отмене — выход без retry"
+                        )
+                        return ScrapeResult(
+                            url=url, success=False,
+                            error="cancelled",
+                            attempts=attempt,
+                            duration_sec=time.time() - start,
+                        )
                     self._browser_crash_count += 1
                     self._browser_healthy = False
                     logger.error(

@@ -94,7 +94,7 @@ class NodeRotator:
             f"cooldown={cooldown_min_sec}-{cooldown_max_sec}с"
         )
 
-    async def acquire(self, wait_timeout: float = 180.0) -> ProxyNode:
+    async def acquire(self, wait_timeout: float = 180.0, cancel_check=None) -> ProxyNode:
         """
         Возвращает следующий доступный узел и захватывает его per-node lock.
 
@@ -103,11 +103,17 @@ class NodeRotator:
         10 мин — слишком долго, юзер в UI не понимал почему висит.
         Теперь воркер быстрее уходит с ошибкой и таск finalize'ится.
 
+        cancel_check: опциональный callable() -> bool. Если во время wait
+        возвращает True — прерываем как TimeoutError('cancelled'). Без
+        этого acquire мог висеть до wait_timeout игнорируя нажатие Стоп.
+
         ВАЖНО: вызывающий обязан вызвать mark_success/mark_failed,
         иначе узел останется залоченным.
         """
         deadline = time.time() + wait_timeout
         while True:
+            if cancel_check is not None and cancel_check():
+                raise asyncio.TimeoutError("cancelled during node wait")
             async with self._global_lock:
                 available = [n for n in self.nodes if not n.is_cooldown and not n.is_busy]
                 if available:

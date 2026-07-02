@@ -187,7 +187,10 @@ class CloakProfilePool:
                 closed_ok += 1
             except Exception as e:
                 closed_fail += 1
-                logger.warning(
+                # Часто это "Target page, context or browser has been closed" —
+                # ожидаемо когда emergency_pool_stop уже закрыл, или когда
+                # Chromium сам крахнул. Не тревожим warning'ом.
+                logger.debug(
                     f"[cloak_pool] ctx.close error for {_profile_hash(proxy_url)}: {e}"
                 )
         self._contexts.clear()
