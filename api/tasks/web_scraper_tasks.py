@@ -51,6 +51,143 @@ def _jsonl_path(user_id: int, job_id: str) -> Path:
     return _job_dir(user_id) / f"{job_id}.jsonl"
 
 
+def _log_dir(user_id: int) -> Path:
+    """Корень для per-job логов юзера. Отдельный файл на каждый job'ик —
+    юзер может скачать его с UI и прислать разработчику без риска утечки
+    других job'ов и без ковыряния в общем logs/celery.log."""
+    p = Path(API_DIR) / ".." / "logs" / "web_scraper" / str(user_id)
+    return p.resolve()
+
+
+def _log_path(user_id: int, job_id: str) -> Path:
+    return _log_dir(user_id) / f"{job_id}.log"
+
+
+def _setup_job_logger(user_id: int, job_id: str) -> tuple[logging.Handler | None, Path]:
+    """
+    Attach отдельный FileHandler на релевантные логгеры на время job'а.
+    Пишет DEBUG-уровень (максимум деталей) в logs/web_scraper/{user_id}/{job_id}.log —
+    независимо от глобального LOG_LEVEL. Только web_scraper и cloak_pool
+    события, ничего лишнего.
+
+    Возвращает (handler, path). Handler можно передать в _teardown_job_logger
+    в finally, чтобы он корректно detach'нулся и файл закрылся.
+    """
+    path = _log_path(user_id, job_id)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        h = logging.FileHandler(str(path), encoding="utf-8")
+        h.setLevel(logging.DEBUG)
+        h.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        # Прикрепляем к логгерам которые пишут скрейпер-события.
+        # Root не трогаем — иначе будут посторонние сообщения.
+        for name in (
+            "utils.web_scraper.scraper",
+            "utils.web_scraper.cloak_pool",
+            "utils.web_scraper.context_pool",
+            "utils.web_scraper.node_rotator",
+            "tasks.web_scraper_tasks",
+        ):
+            lg = logging.getLogger(name)
+            # DEBUG-messages от этих модулей должны доходить до нашего handler'а
+            if lg.level > logging.DEBUG or lg.level == logging.NOTSET:
+                lg.setLevel(logging.DEBUG)
+            lg.addHandler(h)
+        return h, path
+    except Exception as e:
+        logger.warning(f"[web_scraper] не удалось создать per-job log: {e}")
+        return None, path
+
+
+def _teardown_job_logger(h: logging.Handler | None) -> None:
+    if h is None:
+        return
+    for name in (
+        "utils.web_scraper.scraper",
+        "utils.web_scraper.cloak_pool",
+        "utils.web_scraper.context_pool",
+        "utils.web_scraper.node_rotator",
+        "tasks.web_scraper_tasks",
+    ):
+        try:
+            logging.getLogger(name).removeHandler(h)
+        except Exception:
+            pass
+    try:
+        h.flush()
+        h.close()
+    except Exception:
+        pass
+
+
+def _dump_env_diagnostics(
+    job_id: str, user_id: int, engine: str,
+    proxies_count: int, dropped_count: int, options: dict, urls_count: int,
+) -> None:
+    """Дампит окружение в per-job log при старте — самое важное для
+    отладки: версии Python/cloakbrowser/camoufox, путь к бинарнику,
+    выбранный движок, дефолты. Дальше по логу можно понять что сломалось."""
+    lines = [
+        "═" * 60,
+        f"WEB SCRAPER JOB START  user={user_id}  job={job_id}",
+        "═" * 60,
+        f"engine        : {engine}",
+        f"urls          : {urls_count}",
+        f"proxies       : {proxies_count} (dropped {dropped_count})",
+        f"python        : {sys.version.split()[0]}  {sys.platform}",
+    ]
+    try:
+        import platform as _plat
+        lines.append(f"os            : {_plat.platform()}")
+    except Exception:
+        pass
+    def _pkg_version(name: str) -> str:
+        # У camoufox __version__ — подмодуль, а не строка; у playwright
+        # вообще нет .__version__. Единый способ — importlib.metadata.
+        try:
+            from importlib.metadata import version, PackageNotFoundError
+            try:
+                return version(name)
+            except PackageNotFoundError:
+                return "не установлен"
+        except Exception as e:
+            return f"?({type(e).__name__})"
+
+    lines.append(f"cloakbrowser  : {_pkg_version('cloakbrowser')}")
+    try:
+        from cloakbrowser import CHROMIUM_VERSION as _cv, ensure_binary as _eb
+        bin_path = _eb() if engine == "cloak" else None
+        lines.append(f"chromium_ver  : {_cv}")
+        if bin_path:
+            sz = ""
+            try:
+                sz = f"  ({os.path.getsize(bin_path) / (1024*1024):.1f} MB)"
+            except Exception:
+                pass
+            lines.append(f"chromium_bin  : {bin_path}{sz}")
+    except ImportError:
+        pass
+    except Exception as e:
+        lines.append(f"chromium_bin  : (ошибка получения: {type(e).__name__}: {e})")
+    lines.append(f"camoufox      : {_pkg_version('camoufox')}")
+    lines.append(f"playwright    : {_pkg_version('playwright')}")
+    # Options — что реально запросили с фронта
+    lines.append("options       :")
+    for k in sorted(options.keys()):
+        v = options[k]
+        # Секьюр: если вдруг попадёт что-то с "password/token/key" — маскируем
+        vs = str(v)
+        if any(t in k.lower() for t in ("pass", "token", "secret", "key")) and len(vs) > 6:
+            vs = vs[:3] + "***" + vs[-2:]
+        lines.append(f"  {k} = {vs}")
+    lines.append("═" * 60)
+    for line in lines:
+        logger.info(line)
+
+
 # ── Helpers ─────────────────────────────────────────────────────────
 
 def _run_async(coro):
@@ -202,19 +339,56 @@ async def _run(user_id: int, job_id: str, urls: list[str],
 
     redis = get_redis()
 
-    # ── Выбор движка: camoufox (default) / cloak (persistent profiles) ─
-    engine = (options.get("engine") or "camoufox").lower()
-    if engine not in ("camoufox", "cloak"):
-        logger.warning(f"[web_scraper] неизвестный engine={engine}, fallback camoufox")
-        engine = "camoufox"
+    # ── Per-job log file: logs/web_scraper/{user_id}/{job_id}.log ─────
+    # Всё что пишется скрейпером во время этого job'а копится в отдельный
+    # файл. Юзер может скачать его с UI и прислать разработчику.
+    _job_log_handler, _job_log_path = _setup_job_logger(user_id, job_id)
+    _run_ok = False
+    try:
+        # ── Выбор движка: camoufox (default) / cloak (persistent profiles) ─
+        engine = (options.get("engine") or "camoufox").lower()
+        if engine not in ("camoufox", "cloak"):
+            logger.warning(f"[web_scraper] неизвестный engine={engine}, fallback camoufox")
+            engine = "camoufox"
 
-    # ── Фильтр прокси (socks5+auth несовместим с Camoufox) ─────
-    proxies, dropped_proxies = _filter_playwright_compatible(proxies, engine=engine)
-    if dropped_proxies:
-        logger.warning(
-            f"[web_scraper] отброшено {len(dropped_proxies)} прокси "
-            f"(socks5+auth не поддерживается Playwright/Camoufox)"
+        # ── Фильтр прокси (socks5+auth несовместим с Camoufox) ─────
+        proxies, dropped_proxies = _filter_playwright_compatible(proxies, engine=engine)
+        if dropped_proxies:
+            logger.warning(
+                f"[web_scraper] отброшено {len(dropped_proxies)} прокси "
+                f"(socks5+auth не поддерживается Playwright/Camoufox)"
+            )
+
+        # ── Env diagnostics — ПЕРВОЕ что попадает в лог ────────────
+        _dump_env_diagnostics(
+            job_id=job_id, user_id=user_id, engine=engine,
+            proxies_count=len(proxies), dropped_count=len(dropped_proxies),
+            options=options, urls_count=len(urls),
         )
+        _result = await __run_body(
+            user_id, job_id, urls, proxies, options, engine,
+            dropped_proxies, redis,
+        )
+        _run_ok = True
+        return _result
+    finally:
+        logger.info(
+            f"[web_scraper] job {job_id} finished (ok={_run_ok}), "
+            f"log saved to {_job_log_path}"
+        )
+        _teardown_job_logger(_job_log_handler)
+
+
+async def __run_body(
+    user_id: int, job_id: str, urls: list[str],
+    proxies: list[str], options: dict, engine: str,
+    dropped_proxies: list, redis,
+) -> dict:
+    """Тело _run без wrap'а с логгером — вынесено чтобы не увеличивать
+    отступ на весь файл. Логика идентична предыдущей версии, просто
+    engine и dropped_proxies уже вычислены снаружи."""
+    from utils.web_scraper import WebScraper, tgstat_channels_extractor
+    from utils.web_scraper.tgstat_channel_detail import tgstat_channel_detail_extractor
 
     # Выбор extractor'а по options.extractor
     extractor_name = (options.get("extractor") or "universal").lower()

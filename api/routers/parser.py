@@ -1422,6 +1422,32 @@ async def web_scrape_results(
     )
 
 
+@router.get("/web/scrape/log")
+async def web_scrape_log(
+    job_id: str = Query(...),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Скачивает per-job log с полной трассой скрейпера — env, movements
+    прокси, launch/restart браузера, ошибки. То что юзер должен прислать
+    разработчику при "у меня что-то сломалось".
+
+    Файл: logs/web_scraper/{user_id}/{job_id}.log
+    """
+    api_dir = _Path(__file__).resolve().parent.parent
+    path = (api_dir / ".." / "logs" / "web_scraper" / str(current_user.id) / f"{job_id}.log").resolve()
+    if not path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Лог не найден. Возможно job слишком старый или запускался до появления логирования.",
+        )
+    return _FileResponse(
+        str(path),
+        media_type="text/plain; charset=utf-8",
+        filename=f"web_scrape_{job_id}.log",
+    )
+
+
 @router.get("/web/scrape/jobs")
 async def web_scrape_list_jobs(current_user: User = Depends(get_current_user)):
     """

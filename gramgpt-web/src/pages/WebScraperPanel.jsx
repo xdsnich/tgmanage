@@ -339,6 +339,28 @@ export default function WebScraperPanel() {
     } catch (e) { showToast('Не удалось скачать JSONL', 'err') }
   }
 
+  const handleDownloadLog = async (id) => {
+    try {
+      const { data } = await parserAPI.webScrapeLog(id)
+      const blob = new Blob([data], { type: 'text/plain;charset=utf-8' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `web_scrape_${id.slice(0, 8)}.log`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      const status = e?.response?.status
+      if (status === 404) {
+        showToast('Лог не найден — job запускался до появления логирования', 'err')
+      } else {
+        showToast('Не удалось скачать лог', 'err')
+      }
+    }
+  }
+
   const handleDownloadCSV = () => {
     if (!aggregated?.channels?.length) {
       showToast('Нечего скачивать — таблица пуста', 'err')
@@ -714,9 +736,13 @@ export default function WebScraperPanel() {
           )}
 
           {isTerminal && jobId && (
-            <div style={{ marginTop: 12, display: 'flex', gap: 8 }}>
+            <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
               <Button variant="primary" onClick={() => handleDownload(jobId)}>
                 📥 Скачать JSONL
+              </Button>
+              <Button variant="secondary" onClick={() => handleDownloadLog(jobId)}
+                title="Полный лог этого запуска (env, launch, ошибки) — прислать при поломке">
+                📄 Скачать лог
               </Button>
               {mode === 'tgstat' && (
                 <Button variant="secondary" onClick={() => loadAggregate(jobId)} disabled={aggregating}>
@@ -854,6 +880,10 @@ export default function WebScraperPanel() {
                     title="Скачать сырой JSONL файл этого запуска"
                     style={{ background: 'var(--violet)', color: '#fff', border: 'none', padding: '4px 10px', borderRadius: 4, fontSize: 11, cursor: 'pointer' }}
                   >📥 JSONL</button>
+                  <button onClick={() => handleDownloadLog(j.job_id)}
+                    title="Полный лог этого запуска — прислать разработчику при поломке"
+                    style={{ background: 'var(--bg)', color: 'var(--text-2)', border: '1px solid var(--border)', padding: '4px 10px', borderRadius: 4, fontSize: 11, cursor: 'pointer' }}
+                  >📄 Лог</button>
                 </div>
               </div>
             ))}

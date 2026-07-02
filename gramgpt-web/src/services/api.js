@@ -427,6 +427,10 @@ export const parserAPI = {
     params: { job_id: jobId },
     responseType: 'blob',
   }),
+  webScrapeLog: (jobId) => api.get('/parser/web/scrape/log', {
+    params: { job_id: jobId },
+    responseType: 'blob',
+  }),
   webScrapeListJobs: () => api.get('/parser/web/scrape/jobs'),
 
   // ── TGStat preset (специальный режим под tgstat.com) ────────────

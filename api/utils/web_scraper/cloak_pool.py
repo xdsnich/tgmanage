@@ -145,10 +145,22 @@ class CloakProfilePool:
         self._idle_task = asyncio.create_task(
             self._idle_janitor(), name="cloak-idle-janitor"
         )
+        # Считаем сколько было запусков всего — для отладки крашей
+        self._launch_count_total = getattr(self, "_launch_count_total", 0)
+        self._restart_count_total = getattr(self, "_restart_count_total", 0)
+        # На случай если папка с профилями осталась с прошлых прогонов —
+        # покажем сколько «унаследовали».
+        existing = 0
+        try:
+            existing = sum(1 for _ in self.profiles_dir.iterdir() if _.is_dir())
+        except Exception:
+            pass
         logger.info(
             f"[cloak_pool] Готов. profiles_dir={self.profiles_dir} "
-            f"browser_version={self.browser_version} "
-            f"idle_shutdown={self.idle_shutdown_sec}с"
+            f"(на диске уже {existing} профилей от прошлых прогонов) "
+            f"browser_version={self.browser_version or 'default'} "
+            f"idle_shutdown={self.idle_shutdown_sec}с "
+            f"cloak_kwargs={dict((k, v) for k, v in self.cloak_kwargs.items() if k not in ('license_key',))}"
         )
 
     async def stop(self) -> None:
@@ -164,32 +176,47 @@ class CloakProfilePool:
                 pass
             self._idle_task = None
 
+        closed_ok = 0
+        closed_fail = 0
         for proxy_url, entry in list(self._contexts.items()):
             ctx = entry.get("ctx")
             if ctx is None:
                 continue
             try:
                 await ctx.close()
+                closed_ok += 1
             except Exception as e:
-                logger.debug(
+                closed_fail += 1
+                logger.warning(
                     f"[cloak_pool] ctx.close error for {_profile_hash(proxy_url)}: {e}"
                 )
         self._contexts.clear()
         self._launch_locks.clear()
         self._started = False
         self._closing = False
-        logger.info("[cloak_pool] Все профили закрыты")
+        logger.info(
+            f"[cloak_pool] Закрыто {closed_ok} профилей (ошибок при закрытии: {closed_fail})"
+        )
 
     async def restart(self) -> None:
         """Полный restart после краха Chromium. Диск с профилями сохраняется,
         следующее context_for() поднимет свежий контекст под тем же
         профилем — cookies и fingerprint останутся."""
-        logger.warning("[cloak_pool] 🔄 Полный рестарт пула после краха")
+        self._restart_count_total = getattr(self, "_restart_count_total", 0) + 1
+        n_before = len(self._contexts)
+        t0 = time.time()
+        logger.warning(
+            f"[cloak_pool] 🔄 Restart #{self._restart_count_total}: было "
+            f"{n_before} живых профилей"
+        )
         await self.stop()
         # Небольшая пауза чтобы OS корректно закрыла процессы
         await asyncio.sleep(2.0)
         await self.start()
-        logger.info("[cloak_pool] ✅ Пул перезапущен")
+        logger.info(
+            f"[cloak_pool] ✅ Restart готов за {time.time()-t0:.1f}с "
+            f"(профили на диске сохранились, cookies и fingerprint переживут)"
+        )
 
     # ── Main API ─────────────────────────────────────────────
 
@@ -267,12 +294,28 @@ class CloakProfilePool:
             if self.browser_version:
                 kw["browser_version"] = self.browser_version
 
+            first_visit = not any(profile_dir.iterdir()) if profile_dir.exists() else True
             logger.info(
                 f"[cloak_pool] launch profile {_profile_hash(proxy_url)} "
                 f"(headless={kw.get('headless')}, geoip={kw.get('geoip')}, "
-                f"humanize={kw.get('humanize')}, v={self.browser_version or 'default'})"
+                f"humanize={kw.get('humanize')}, v={self.browser_version or 'default'}, "
+                f"first_visit={first_visit})"
             )
-            ctx = await launch_persistent_context_async(**kw)
+            t0 = time.time()
+            try:
+                ctx = await launch_persistent_context_async(**kw)
+            except Exception as e:
+                logger.error(
+                    f"[cloak_pool] ❌ launch FAILED for {_profile_hash(proxy_url)} "
+                    f"после {time.time()-t0:.1f}с: {type(e).__name__}: {str(e)[:250]}"
+                )
+                raise
+            self._launch_count_total = getattr(self, "_launch_count_total", 0) + 1
+            logger.info(
+                f"[cloak_pool] ✓ launched profile {_profile_hash(proxy_url)} "
+                f"за {time.time()-t0:.1f}с "
+                f"(всего запусков в этой сессии: {self._launch_count_total})"
+            )
             self._contexts[proxy_url] = {
                 "ctx": ctx,
                 "last_use": time.time(),
@@ -314,8 +357,14 @@ class CloakProfilePool:
                     for url, e in self._contexts.items()
                     if e.get("last_use", 0) < cutoff
                 ]
-                for url in stale:
-                    await self._close_one(url)
+                if stale:
+                    logger.info(
+                        f"[cloak_pool] idle janitor: закрываю {len(stale)} "
+                        f"профилей (не использовались >{int(self.idle_shutdown_sec)}с). "
+                        f"Активных останется: {len(self._contexts) - len(stale)}"
+                    )
+                    for url in stale:
+                        await self._close_one(url)
         except asyncio.CancelledError:
             return
 
