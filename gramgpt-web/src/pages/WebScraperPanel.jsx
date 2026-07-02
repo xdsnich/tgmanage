@@ -54,7 +54,20 @@ export default function WebScraperPanel() {
   const [urlsText, setUrlsText] = useState('')
 
   // Job state
-  const [jobId, setJobId] = useState(null)
+  // jobId persistим в localStorage чтобы reload страницы не терял
+  // активный скрейп и юзер случайно не запустил второй параллельный
+  // (это палит нас перед TGStat).
+  const LS_KEY = 'web_scraper_active_job'
+  const [jobId, setJobIdRaw] = useState(() => {
+    try { return localStorage.getItem(LS_KEY) || null } catch { return null }
+  })
+  const setJobId = (v) => {
+    setJobIdRaw(v)
+    try {
+      if (v) localStorage.setItem(LS_KEY, v)
+      else localStorage.removeItem(LS_KEY)
+    } catch {}
+  }
   const [progress, setProgress] = useState(null)
   const [starting, setStarting] = useState(false)
   const [stopping, setStopping] = useState(false)
@@ -87,9 +100,11 @@ export default function WebScraperPanel() {
           stopPolling()
           if (data.status === 'done') {
             loadJobs()
-            // авто-агрегация для TGStat-jobs
             if (mode === 'tgstat') loadAggregate(id)
           }
+          // Терминальный статус — можно очистить localStorage чтобы
+          // следующий reload не тянул уже завершённое.
+          try { localStorage.removeItem(LS_KEY) } catch {}
         }
       } catch (e) { console.error('progress poll', e) }
     }, 2000)
@@ -149,11 +164,42 @@ export default function WebScraperPanel() {
     } catch (e) { console.error(e) }
   }
 
+  // Восстанавливаем активный job (если был при закрытии/reload).
+  // Спрашиваем прогресс у бэка — он его держит в Redis. Если job
+  // ещё running/queued/starting → показываем UI + возобновляем поллинг.
+  // Если done/error/cancelled → показываем финальный snapshot и
+  // очищаем localStorage чтобы следующий mount не вытягивал уже
+  // завершённое.
+  const rehydrateJob = async (id) => {
+    try {
+      const { data } = await parserAPI.webScrapeProgress(id)
+      if (!data || data.status === 'unknown') {
+        // Redis-ключ протух или job не найден — чистим
+        setJobId(null)
+        return
+      }
+      setProgress(data)
+      if (['queued', 'starting', 'running'].includes(data.status)) {
+        // Ещё живой — возобновляем поллинг
+        startPolling(id)
+        showToast('Восстановлен активный скрейп — идёт', 'ok')
+      } else if (data.status === 'done' && mode === 'tgstat') {
+        // Завершился пока страница была закрыта — сразу подгружаем каналы
+        loadAggregate(id)
+      }
+    } catch (e) {
+      console.error('rehydrate', e)
+      setJobId(null)
+    }
+  }
+
   useEffect(() => {
     loadJobs()
     loadTgstatOptions()
     loadDbProxiesCount()
+    if (jobId) rehydrateJob(jobId)
     return () => stopPolling()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // Сколько URL будет сгенерировано — для preview.
@@ -167,6 +213,20 @@ export default function WebScraperPanel() {
   // ── handlers ────────────────────────────────────────────────────
 
   const handleStart = async () => {
+    // Защита от двойного запуска. Если уже есть активный job с
+    // running/queued/starting статусом — предупреждаем. Второй параллельный
+    // скрейп через тот же пул прокси = удвоенная нагрузка на TGStat и
+    // повышенный риск WAF-блока.
+    const activeStatus = progress?.status
+    if (jobId && ['queued', 'starting', 'running'].includes(activeStatus)) {
+      const ok = confirm(
+        `Уже идёт скрейпинг job ${jobId.slice(0, 8)}… (статус: ${activeStatus}).\n\n` +
+        'Запуск второго параллельно НАГРУЖАЕТ TGStat через те же прокси\n' +
+        'и повышает шанс их блокировки.\n\n' +
+        'Точно запустить ещё один?'
+      )
+      if (!ok) return
+    }
     // Считаем сколько прокси реально пойдёт в задачу
     const effectivePoolSize = useDbProxies ? dbProxiesCount.valid : proxies.length
     if (effectivePoolSize < 3) {
@@ -744,11 +804,13 @@ export default function WebScraperPanel() {
                 </div>
                 <div style={{ display: 'flex', gap: 6 }}>
                   <button onClick={() => loadAggregate(j.job_id)}
-                    style={{ background: 'var(--bg)', color: 'var(--text-2)', border: '1px solid var(--border)', padding: '4px 8px', borderRadius: 4, fontSize: 11, cursor: 'pointer' }}
-                  >🔍</button>
+                    title="Показать найденные каналы из этого прошлого запуска (только просмотр, ничего не запускает)"
+                    style={{ background: 'var(--bg)', color: 'var(--text-2)', border: '1px solid var(--border)', padding: '4px 10px', borderRadius: 4, fontSize: 11, cursor: 'pointer' }}
+                  >🔍 Каналы</button>
                   <button onClick={() => handleDownload(j.job_id)}
+                    title="Скачать сырой JSONL файл этого запуска"
                     style={{ background: 'var(--violet)', color: '#fff', border: 'none', padding: '4px 10px', borderRadius: 4, fontSize: 11, cursor: 'pointer' }}
-                  >📥</button>
+                  >📥 JSONL</button>
                 </div>
               </div>
             ))}

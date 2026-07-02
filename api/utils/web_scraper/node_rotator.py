@@ -77,14 +77,17 @@ class NodeRotator:
     ):
         if not proxies:
             raise ValueError("Список прокси не может быть пустым")
-        self.nodes: list[ProxyNode] = [
-            ProxyNode(url=u.strip()) for u in proxies if u and u.strip()
-        ]
+        # Перемешиваем прокси-лист на инициализации. Иначе на каждом
+        # запуске скрейпера первый прокси всегда идёт первым — TGStat
+        # видит одну и ту же последовательность IP и может пометить
+        # это как ботовский паттерн.
+        _proxies = [u.strip() for u in proxies if u and u.strip()]
+        random.shuffle(_proxies)
+        self.nodes: list[ProxyNode] = [ProxyNode(url=u) for u in _proxies]
         if not self.nodes:
             raise ValueError("После фильтрации пустых строк прокси не осталось")
         self.cooldown_min_sec = cooldown_min_sec
         self.cooldown_max_sec = cooldown_max_sec
-        self._rr_index = 0
         self._global_lock = asyncio.Lock()
         logger.info(
             f"[rotator] Инициализировано {len(self.nodes)} узлов, "
@@ -108,10 +111,11 @@ class NodeRotator:
             async with self._global_lock:
                 available = [n for n in self.nodes if not n.is_cooldown and not n.is_busy]
                 if available:
-                    # Round-robin среди доступных. Индекс может выйти за длину
-                    # списка после фильтрации, потому считаем по модулю.
-                    self._rr_index = (self._rr_index + 1) % len(available)
-                    node = available[self._rr_index]
+                    # Случайный выбор из доступных вместо round-robin.
+                    # Раньше _rr_index давал фиксированный порядок → TGStat
+                    # видел один и тот же паттерн IP-ротации. random.choice
+                    # ломает предсказуемость.
+                    node = random.choice(available)
                     # acquire под global_lock'ом безопасен — мы только что
                     # проверили что lock свободен и никто другой не успеет
                     # его захватить пока мы держим global_lock.
