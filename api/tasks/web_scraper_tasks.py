@@ -281,6 +281,13 @@ async def _run(user_id: int, job_id: str, urls: list[str],
             cancel_check=cancel_check,
             camoufox_kwargs=camoufox_kwargs,
             page_locale=options.get("page_locale", "en-US"),
+            # Рандомизация "человеческого" плана
+            worker_start_stagger_max_sec=float(options.get("worker_start_stagger_max_sec", 45.0)),
+            break_probability=float(options.get("break_probability", 0.20)),
+            break_min_sec=float(options.get("break_min_sec", 60.0)),
+            break_max_sec=float(options.get("break_max_sec", 300.0)),
+            post_read_tail_min_sec=float(options.get("post_read_tail_min_sec", 0.0)),
+            post_read_tail_max_sec=float(options.get("post_read_tail_max_sec", 15.0)),
         )
     except Exception as e:
         logger.exception("[web_scraper] init failed")
@@ -373,6 +380,15 @@ async def _run(user_id: int, job_id: str, urls: list[str],
                 cancel_check=cancel_check,
                 camoufox_kwargs=camoufox_kwargs,
                 page_locale=options.get("page_locale", "en-US"),
+                # На Stage 2 ещё сильнее рандомизируем — детальных
+                # страниц много, если хотим "живого юзера" — надо
+                # чтоб не строчил одинаковыми задержками.
+                worker_start_stagger_max_sec=float(options.get("stage2_worker_start_stagger_max_sec", 30.0)),
+                break_probability=float(options.get("stage2_break_probability", 0.25)),
+                break_min_sec=float(options.get("stage2_break_min_sec", 45.0)),
+                break_max_sec=float(options.get("stage2_break_max_sec", 240.0)),
+                post_read_tail_min_sec=float(options.get("stage2_post_read_tail_min_sec", 2.0)),
+                post_read_tail_max_sec=float(options.get("stage2_post_read_tail_max_sec", 20.0)),
             )
             async with scraper2:
                 await scraper2.run(detail_urls)

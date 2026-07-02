@@ -118,6 +118,21 @@ class WebScraper:
         cancel_check: Optional[CancelFn] = None,
         camoufox_kwargs: Optional[dict] = None,
         page_locale: str = "en-US",
+        # ── Рандомизация "человеческого" поведения ────────────
+        # Стартовый разброс воркеров — 2-3-4 воркер стартуют не сразу,
+        # а с задержкой 0..N сек. Иначе WAF видит N синхронных запросов.
+        worker_start_stagger_max_sec: float = 45.0,
+        # После каждого URL воркер с вероятностью break_probability
+        # уходит "на перерыв" на break_min..break_max сек. Так
+        # эффективное число активных воркеров плавает во времени
+        # (0-2-5-3-1-4-...), а не константа 3.
+        break_probability: float = 0.20,
+        break_min_sec: float = 60.0,
+        break_max_sec: float = 300.0,
+        # Дополнительный "хвост" на странице после чтения — рандом.
+        # Реальный юзер полистал → задержался ещё немного → ушёл.
+        post_read_tail_min_sec: float = 0.0,
+        post_read_tail_max_sec: float = 15.0,
     ):
         if max_workers > 4:
             logger.warning(
@@ -133,6 +148,14 @@ class WebScraper:
         self.extractor = extractor
         self.progress_callback = progress_callback
         self.cancel_check = cancel_check or (lambda: False)
+
+        # Рандомизация "человеческого" поведения
+        self.worker_start_stagger_max_sec = float(worker_start_stagger_max_sec)
+        self.break_probability = max(0.0, min(1.0, float(break_probability)))
+        self.break_min_sec = float(break_min_sec)
+        self.break_max_sec = float(break_max_sec)
+        self.post_read_tail_min_sec = float(post_read_tail_min_sec)
+        self.post_read_tail_max_sec = float(post_read_tail_max_sec)
 
         self.rotator = NodeRotator(
             proxies=proxies,
@@ -234,7 +257,29 @@ class WebScraper:
         Завершается когда:
           - queue пустая и task_done() для всех вызван (cancel из run())
           - cancel_check() вернул True
+
+        Рандомизация "человеческого" поведения:
+          - Стартовый разброс: воркер #0 стартует сразу, #1,#2,... —
+            с задержкой uniform(0, worker_start_stagger_max_sec).
+            Иначе WAF видит N синхронных запросов.
+          - Random breaks: после каждого URL с вероятностью
+            break_probability уходим "на перерыв" 60-300 сек.
+            → эффективное число активных воркеров плавает во времени
+            (0-2-5-3-1-4-...), как будто живые люди заходят и уходят.
         """
+        # 1. Стартовый разброс — только для воркеров с id > 0
+        if worker_id > 0 and self.worker_start_stagger_max_sec > 0:
+            delay = random.uniform(0, self.worker_start_stagger_max_sec)
+            logger.info(
+                f"[worker-{worker_id}] стартовая задержка {delay:.1f}с"
+            )
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+            if self.cancel_check():
+                return
+
         logger.debug(f"[worker-{worker_id}] start")
         while True:
             if self.cancel_check():
@@ -300,6 +345,28 @@ class WebScraper:
                 async with self._in_flight_lock:
                     self._in_flight.pop(worker_id, None)
                 queue.task_done()
+
+            # Рандомный перерыв — эмулирует "пользователь ушёл на кофе".
+            # Каждый воркер сам решает — вероятность и длительность
+            # независимы, поэтому эффективное число активных воркеров
+            # плавает по времени (0-2-5-3-1-4-...) а не константа.
+            if self.break_probability > 0 and random.random() < self.break_probability:
+                dur = random.uniform(self.break_min_sec, self.break_max_sec)
+                logger.info(
+                    f"[worker-{worker_id}] 🛑 перерыв {dur:.0f}с "
+                    f"(эмуляция человека)"
+                )
+                # Спим кусочками чтоб cancel_check срабатывал быстро
+                slept = 0.0
+                while slept < dur:
+                    if self.cancel_check():
+                        return
+                    step = min(2.0, dur - slept)
+                    try:
+                        await asyncio.sleep(step)
+                    except asyncio.CancelledError:
+                        return
+                    slept += step
 
     # ── Per-URL processing with retries ──────────────────────────────
 
@@ -383,6 +450,21 @@ class WebScraper:
                         # исключение если структура страницы изменилась
                         # или WAF подсунул challenge page.
                         data = await self.extractor(page)
+
+                        # "Хвост" после чтения — реальный юзер полистал,
+                        # задержался ещё немного, потом ушёл. Без tail'а
+                        # мы отваливаемся ровно после скролла — заметный
+                        # ботовский паттерн.
+                        if self.post_read_tail_max_sec > 0:
+                            tail = random.uniform(
+                                self.post_read_tail_min_sec,
+                                self.post_read_tail_max_sec,
+                            )
+                            if tail > 0:
+                                try:
+                                    await asyncio.sleep(tail)
+                                except asyncio.CancelledError:
+                                    raise
 
                         try:
                             await page.close()
