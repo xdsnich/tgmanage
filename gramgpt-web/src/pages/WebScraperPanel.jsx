@@ -30,6 +30,18 @@ export default function WebScraperPanel() {
   const [rotationMax, setRotationMax] = useState(35)
   const [humanize, setHumanize] = useState(true)
   const [headless, setHeadless] = useState(true)
+  // Движок браузера. localStorage — чтобы выбор пережил F5.
+  //   camoufox — patched Firefox с fresh context per URL (текущий дефолт).
+  //   cloak    — CloakBrowser с persistent-профилем на каждый прокси
+  //              (fingerprint и cookies копятся между запусками).
+  const [engine, setEngine] = useState(() => {
+    try { return localStorage.getItem('web_scraper_engine') || 'camoufox' }
+    catch { return 'camoufox' }
+  })
+  const setEnginePersistent = (v) => {
+    setEngine(v)
+    try { localStorage.setItem('web_scraper_engine', v) } catch {}
+  }
 
   // TGStat режим
   const [tgstatOptions, setTgstatOptions] = useState({ countries: [], targets: [] })
@@ -269,7 +281,7 @@ export default function WebScraperPanel() {
           cooldown_max_sec: cooldownMax,
           node_rotation_min_sec: rotationMin,
           node_rotation_max_sec: rotationMax,
-          humanize, headless,
+          humanize, headless, engine,
         })
       } else {
         if (urls.length === 0) {
@@ -288,7 +300,7 @@ export default function WebScraperPanel() {
           cooldown_max_sec: cooldownMax,
           node_rotation_min_sec: rotationMin,
           node_rotation_max_sec: rotationMax,
-          humanize, headless,
+          humanize, headless, engine,
         })
       }
       const { data } = resp
@@ -613,13 +625,27 @@ export default function WebScraperPanel() {
             <NumField label="Ротация min (с)" value={rotationMin} onChange={setRotationMin} min={1} max={120} disabled={isRunning} />
             <NumField label="Ротация max (с)" value={rotationMax} onChange={setRotationMax} min={1} max={180} disabled={isRunning} />
             <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-              <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600 }}>Camoufox</label>
+              <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600 }}>Движок браузера</label>
+              <select
+                value={engine}
+                disabled={isRunning}
+                onChange={e => setEnginePersistent(e.target.value)}
+                style={{ padding: '4px 6px', fontSize: 12, background: 'var(--bg-2)', color: 'var(--text-1)', border: '1px solid var(--border)', borderRadius: 4 }}
+              >
+                <option value="camoufox">Camoufox (fresh ctx per URL)</option>
+                <option value="cloak">CloakBrowser (persistent profile per proxy)</option>
+              </select>
               <label style={{ fontSize: 12, color: 'var(--text-2)', display: 'flex', gap: 6, alignItems: 'center' }}>
                 <input type="checkbox" checked={humanize} disabled={isRunning} onChange={e => setHumanize(e.target.checked)} /> humanize
               </label>
               <label style={{ fontSize: 12, color: 'var(--text-2)', display: 'flex', gap: 6, alignItems: 'center' }}>
                 <input type="checkbox" checked={headless} disabled={isRunning} onChange={e => setHeadless(e.target.checked)} /> headless
               </label>
+              {engine === 'cloak' && (
+                <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 4, lineHeight: 1.3 }}>
+                  💡 Один прокси = один сохранённый профиль. Второй визит выглядит как возвращающийся юзер — меньше CF-челленджей.
+                </div>
+              )}
             </div>
           </div>
         )}

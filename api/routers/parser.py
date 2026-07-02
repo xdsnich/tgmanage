@@ -1280,6 +1280,10 @@ class WebScrapeStartRequest(BaseModel):
     page_locale: Optional[str] = "en-US"
     humanize: Optional[bool] = True
     headless: Optional[bool] = True
+    # camoufox = patched Firefox с fresh context per URL (быстрее старт, легковеснее)
+    # cloak    = CloakBrowser с persistent-профилем на каждый прокси
+    #            (fingerprint и cookies копятся → меньше CF-челленджей)
+    engine: Optional[str] = "camoufox"
 
 
 @router.post("/web/scrape/start")
@@ -1328,7 +1332,12 @@ async def web_scrape_start(
         "node_rotation_min_sec": float(body.node_rotation_min_sec or 15.0),
         "node_rotation_max_sec": float(body.node_rotation_max_sec or 35.0),
         "page_locale": body.page_locale or "en-US",
+        "engine": (body.engine or "camoufox").lower(),
         "camoufox": {
+            "humanize": bool(body.humanize),
+            "headless": bool(body.headless),
+        },
+        "cloak": {
             "humanize": bool(body.humanize),
             "headless": bool(body.headless),
         },
@@ -1493,6 +1502,7 @@ class WebScrapeTgstatRequest(BaseModel):
     page_locale: Optional[str] = "en-US"
     humanize: Optional[bool] = True
     headless: Optional[bool] = True
+    engine: Optional[str] = "camoufox"
 
 
 @router.post("/web/scrape/tgstat/start")
@@ -1570,7 +1580,12 @@ async def web_scrape_tgstat_start(
         "page_locale": body.page_locale or "en-US",
         # Лимит кандидатов на проверку во 2-м проходе. 0 = весь Stage 1.
         "stage2_limit": max(0, min(int(body.max_channels or 0), 500)),
+        "engine": (body.engine or "camoufox").lower(),
         "camoufox": {
+            "humanize": bool(body.humanize),
+            "headless": bool(body.headless),
+        },
+        "cloak": {
             "humanize": bool(body.humanize),
             "headless": bool(body.headless),
         },

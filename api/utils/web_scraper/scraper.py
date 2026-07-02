@@ -20,13 +20,15 @@ scraper.py — Главный orchestrator WebScraper.
 
 import asyncio
 import logging
+import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Literal, Optional
 
 from .node_rotator import NodeRotator, ProxyNode
 from .context_pool import BrowserContextPool
+from .cloak_pool import CloakProfilePool
 from .checkpoint import JSONLCheckpoint
 from .retry import backoff_delay
 from .ux_emulator import simulate_pre_read_session, micro_pause
@@ -118,6 +120,14 @@ class WebScraper:
         cancel_check: Optional[CancelFn] = None,
         camoufox_kwargs: Optional[dict] = None,
         page_locale: str = "en-US",
+        # ── Выбор движка браузера ─────────────────────────────
+        # camoufox — patched Firefox с fresh context на каждый URL (текущий дефолт).
+        # cloak    — CloakBrowser с persistent-профилем на каждый прокси.
+        #            Cookies и fingerprint сохраняются между запусками —
+        #            WAF видит "вернувшегося юзера", не первый визит.
+        engine: Literal["camoufox", "cloak"] = "camoufox",
+        cloak_kwargs: Optional[dict] = None,
+        profiles_dir: Optional[str | Path] = None,
         # ── Рандомизация "человеческого" поведения ────────────
         # Стартовый разброс воркеров — 2-3-4 воркер стартуют не сразу,
         # а с задержкой 0..N сек. Иначе WAF видит N синхронных запросов.
@@ -162,12 +172,27 @@ class WebScraper:
             cooldown_min_sec=cooldown_min_sec,
             cooldown_max_sec=cooldown_max_sec,
         )
-        self.pool = BrowserContextPool(
-            node_rotation_min_sec=node_rotation_min_sec,
-            node_rotation_max_sec=node_rotation_max_sec,
-            camoufox_kwargs=camoufox_kwargs or {},
-            page_locale=page_locale,
-        )
+        self.engine = engine
+        if engine == "cloak":
+            # По умолчанию — data/scraper_profiles/ рядом с data/web_scraper/.
+            # Один и тот же прокси во всех job'ах → один и тот же профиль:
+            # cookies и fingerprint копятся между запусками скрейпера.
+            if profiles_dir is None:
+                profiles_dir = Path(__file__).resolve().parents[3] / "data" / "scraper_profiles"
+            self.pool = CloakProfilePool(
+                profiles_dir=profiles_dir,
+                node_rotation_min_sec=node_rotation_min_sec,
+                node_rotation_max_sec=node_rotation_max_sec,
+                cloak_kwargs=cloak_kwargs or {},
+                page_locale=page_locale,
+            )
+        else:
+            self.pool = BrowserContextPool(
+                node_rotation_min_sec=node_rotation_min_sec,
+                node_rotation_max_sec=node_rotation_max_sec,
+                camoufox_kwargs=camoufox_kwargs or {},
+                page_locale=page_locale,
+            )
         self.checkpoint = JSONLCheckpoint(checkpoint_path, key_field="url")
         self.stats = ScraperStats()
         # Текущие URL обрабатываемые воркерами — для UI "в работе сейчас"

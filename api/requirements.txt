@@ -42,3 +42,10 @@ aiohttp==3.9.5
 # "Could not find a matching Constructor ID" — Telegram добавил новые типы
 # и нужно обновить эту версию. Команда: pip install -U telethon
 telethon>=1.36.0
+
+# Web scraper — движки браузера. Устанавливать вручную:
+#   Camoufox:     pip install -U 'camoufox[geoip]' && camoufox fetch
+#   CloakBrowser: pip install -U cloakbrowser  (бинарник качается лениво при первом launch)
+# Переключается в UI на странице «Веб-парсер». Playwright тянется как
+# транзитивная зависимость обоих движков.
+cloakbrowser>=0.1

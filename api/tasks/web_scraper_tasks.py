@@ -156,21 +156,26 @@ def run_web_scraper(self, user_id: int, job_id: str, urls: list[str],
     return _run_async(_run(user_id, job_id, urls, proxies, options))
 
 
-def _filter_playwright_compatible(proxies: list[str]) -> tuple[list[str], list[str]]:
+def _filter_playwright_compatible(proxies: list[str], engine: str = "camoufox") -> tuple[list[str], list[str]]:
     """
-    Возвращает (compatible, dropped) с описаниями.
-    Playwright/Camoufox НЕ поддерживает socks5+auth: при попытке создать
-    context с таким прокси падает с "Browser does not support socks5 proxy
-    authentication". Чтобы не занимать слоты пула и не плодить cooldown'ы,
-    отфильтровываем их заранее.
+    Возвращает (compatible, dropped).
 
-    Совместимые:
-      - http(s)://[user:pass@]host:port — всегда OK
-      - socks5://host:port (без auth) — OK
-    Несовместимые:
-      - socks5://user:pass@host:port — DROPPED
+    Camoufox (Firefox через Playwright new_context(proxy=...)) НЕ поддерживает
+    socks5+auth: при попытке создать context падает с "Browser does not support
+    socks5 proxy authentication". Отбрасываем такие заранее.
+
+    CloakBrowser (Chromium через launch_persistent_context_async(proxy=...))
+    внутри передаёт прокси через --proxy-server + Chrome обрабатывает креды
+    сам, поэтому socks5+auth работает нативно. Ничего не фильтруем.
+
+    Совместимые для camoufox:
+      - http(s)://[user:pass@]host:port
+      - socks5://host:port (без auth)
     """
     from urllib.parse import urlparse
+    if engine == "cloak":
+        return [u.strip() for u in proxies if u and u.strip()], []
+
     ok, dropped = [], []
     for u in proxies:
         u = (u or "").strip()
@@ -197,12 +202,18 @@ async def _run(user_id: int, job_id: str, urls: list[str],
 
     redis = get_redis()
 
-    # ── Фильтр прокси (socks5+auth не поддерживается Playwright) ──
-    proxies, dropped_proxies = _filter_playwright_compatible(proxies)
+    # ── Выбор движка: camoufox (default) / cloak (persistent profiles) ─
+    engine = (options.get("engine") or "camoufox").lower()
+    if engine not in ("camoufox", "cloak"):
+        logger.warning(f"[web_scraper] неизвестный engine={engine}, fallback camoufox")
+        engine = "camoufox"
+
+    # ── Фильтр прокси (socks5+auth несовместим с Camoufox) ─────
+    proxies, dropped_proxies = _filter_playwright_compatible(proxies, engine=engine)
     if dropped_proxies:
         logger.warning(
             f"[web_scraper] отброшено {len(dropped_proxies)} прокси "
-            f"(socks5+auth не поддерживается Playwright)"
+            f"(socks5+auth не поддерживается Playwright/Camoufox)"
         )
 
     # Выбор extractor'а по options.extractor
@@ -257,13 +268,18 @@ async def _run(user_id: int, job_id: str, urls: list[str],
     except Exception:
         pass
 
-    _publish_progress("starting", {"phase": "launching_camoufox"})
+    _publish_progress("starting", {"phase": f"launching_{engine}"})
 
     # ── Параметры WebScraper из options ──────────────────────────────
     camoufox_kwargs = options.get("camoufox") or {}
     # Безопасные дефолты для headless + стабильный fingerprint
     camoufox_kwargs.setdefault("humanize", True)
     camoufox_kwargs.setdefault("headless", True)
+
+    # Параметры CloakBrowser (при engine=cloak). geoip и humanize
+    # включены в самом пуле по дефолту — можно переопределить.
+    cloak_kwargs = options.get("cloak") or {}
+    cloak_kwargs.setdefault("headless", True)
 
     try:
         scraper = WebScraper(
@@ -281,6 +297,8 @@ async def _run(user_id: int, job_id: str, urls: list[str],
             cancel_check=cancel_check,
             camoufox_kwargs=camoufox_kwargs,
             page_locale=options.get("page_locale", "en-US"),
+            engine=engine,
+            cloak_kwargs=cloak_kwargs,
             # Рандомизация "человеческого" плана
             worker_start_stagger_max_sec=float(options.get("worker_start_stagger_max_sec", 45.0)),
             break_probability=float(options.get("break_probability", 0.20)),
@@ -417,6 +435,8 @@ async def _run(user_id: int, job_id: str, urls: list[str],
                 cancel_check=cancel_check,
                 camoufox_kwargs=camoufox_kwargs,
                 page_locale=options.get("page_locale", "en-US"),
+                engine=engine,
+                cloak_kwargs=cloak_kwargs,
                 # На Stage 2 ещё сильнее рандомизируем — детальных
                 # страниц много, если хотим "живого юзера" — надо
                 # чтоб не строчил одинаковыми задержками.
