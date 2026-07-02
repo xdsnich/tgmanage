@@ -48,6 +48,7 @@ from routers import diagnostics
 # Регистрируем модели чтобы create_all создал таблицы (модели,
 # которые ещё не подцепились через router-импорты).
 from models import account_error as _ae_model  # noqa: F401
+from models import tgstat_checked_channel as _tc_model  # noqa: F401
 # ── Lifespan (старт / стоп) ──────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):

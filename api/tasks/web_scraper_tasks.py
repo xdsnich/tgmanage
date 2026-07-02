@@ -348,7 +348,44 @@ async def _run(user_id: int, job_id: str, urls: list[str],
         except Exception as e:
             logger.warning(f"[web_scraper] не смог прочитать Stage 1 JSONL: {e}")
 
-        logger.info(f"[web_scraper] Stage 2: {len(candidate_usernames)} каналов на проверку")
+        logger.info(f"[web_scraper] Stage 2: {len(candidate_usernames)} кандидатов из Stage 1")
+
+        # ── Фильтр «уже проверенные» ─────────────────────────
+        # Юзер: спарсили 300 → потом захотел ещё 400. Без этого
+        # фильтра Stage 2 повторно проверит те же топовые каналы
+        # (они всегда в топе рейтинга). Пропускаем всё что уже
+        # проверялось за последние skip_recently_checked_days.
+        skip_days = int(options.get("skip_recently_checked_days", 30) or 0)
+        already_checked_low: set[str] = set()
+        if skip_days > 0 and candidate_usernames:
+            try:
+                from sqlalchemy import select
+                from datetime import datetime as _dt, timedelta as _td
+                from utils.db_pool import async_session as TaskSession
+                from models.tgstat_checked_channel import TgstatCheckedChannel
+
+                since = _dt.utcnow() - _td(days=skip_days)
+                async with TaskSession() as own_db:
+                    rows = (await own_db.execute(
+                        select(TgstatCheckedChannel.username).where(
+                            TgstatCheckedChannel.user_id == user_id,
+                            TgstatCheckedChannel.checked_at >= since,
+                        )
+                    )).all()
+                    already_checked_low = {r[0].lower() for r in rows}
+            except Exception as e:
+                logger.warning(f"[web_scraper] skip-recently-checked filter failed: {e}")
+
+        if already_checked_low:
+            before = len(candidate_usernames)
+            candidate_usernames = [
+                u for u in candidate_usernames if u.lower() not in already_checked_low
+            ]
+            skipped = before - len(candidate_usernames)
+            logger.info(
+                f"[web_scraper] Stage 2: пропущено {skipped} уже проверенных "
+                f"за последние {skip_days} дней, осталось {len(candidate_usernames)}"
+            )
 
         # Лимит из options (для теста / экономии прокси). 0 = без лимита.
         stage2_limit = int(options.get("stage2_limit", 0) or 0)
@@ -399,7 +436,11 @@ async def _run(user_id: int, job_id: str, urls: list[str],
             # к сохранению того что есть.
 
         # Парсим Stage 2 JSONL — собираем каналы с linked chat
+        # Также собираем ВСЕ проверенные (с комментами и без) для
+        # записи в TgstatCheckedChannel — чтобы следующий запуск не
+        # проверял их повторно.
         saved_channels = []
+        checked_records = []
         try:
             with jsonl_stage2.open("r", encoding="utf-8") as f:
                 for line in f:
@@ -411,10 +452,22 @@ async def _run(user_id: int, job_id: str, urls: list[str],
                         continue
                     data = rec.get("data") or {}
                     stage2_summary["channels_total"] += 1
-                    if data.get("has_open_comments"):
+
+                    u = (data.get("channel_username") or "").lstrip("@")
+                    if not u:
+                        continue
+                    has_c = bool(data.get("has_open_comments"))
+                    checked_records.append({
+                        "username": u,
+                        "has_comments": has_c,
+                        "linked_chat": (data.get("linked_chat_username") or "").lstrip("@") or None,
+                        "subscribers": int(data.get("subscribers") or 0),
+                        "title": (data.get("title") or "")[:250] or None,
+                    })
+                    if has_c:
                         stage2_summary["with_comments"] += 1
                         saved_channels.append({
-                            "username": (data.get("channel_username") or "").lstrip("@"),
+                            "username": u,
                             "title": data.get("title") or "",
                             "subscribers": int(data.get("subscribers") or 0),
                             "linked_chat": (data.get("linked_chat_username") or "").lstrip("@"),
@@ -425,6 +478,45 @@ async def _run(user_id: int, job_id: str, urls: list[str],
                         stage2_summary["without_comments"] += 1
         except Exception as e:
             logger.warning(f"[web_scraper] Stage 2 JSONL read error: {e}")
+
+        # ── Запись в TgstatCheckedChannel — ВСЕ проверенные ─
+        if checked_records:
+            try:
+                from sqlalchemy import select
+                from datetime import datetime as _dt2
+                from utils.db_pool import async_session as TaskSession
+                from models.tgstat_checked_channel import TgstatCheckedChannel
+
+                async with TaskSession() as own_db:
+                    for c in checked_records:
+                        existing = (await own_db.execute(
+                            select(TgstatCheckedChannel).where(
+                                TgstatCheckedChannel.user_id == user_id,
+                                TgstatCheckedChannel.username == c["username"],
+                            )
+                        )).scalar_one_or_none()
+                        if existing:
+                            existing.has_comments = c["has_comments"]
+                            existing.linked_chat = c["linked_chat"] or existing.linked_chat
+                            existing.subscribers = c["subscribers"] or existing.subscribers
+                            existing.title = c["title"] or existing.title
+                            existing.last_job_id = job_id
+                            existing.checked_at = _dt2.utcnow()
+                        else:
+                            own_db.add(TgstatCheckedChannel(
+                                user_id=user_id,
+                                username=c["username"],
+                                has_comments=c["has_comments"],
+                                linked_chat=c["linked_chat"],
+                                subscribers=c["subscribers"],
+                                title=c["title"],
+                                last_job_id=job_id,
+                                checked_at=_dt2.utcnow(),
+                            ))
+                    await own_db.commit()
+                stage2_summary["checked_total_saved"] = len(checked_records)
+            except Exception as e:
+                logger.warning(f"[web_scraper] TgstatCheckedChannel save failed: {e}")
 
         # ── Сохранение в БД ───────────────────────────────────
         # UPSERT по (user_id, username): если канал уже был — обновим
