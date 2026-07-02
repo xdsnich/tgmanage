@@ -1661,25 +1661,21 @@ async def web_scrape_tgstat_aggregate(
     """
     Отдаёт список найденных каналов для job'a.
 
-    Источник истины:
-      1. ParsedChannel БД по search_query=tgstat_web:{job_id} —
-         это результат 2-stage pipeline (Stage 1 rating + Stage 2
-         проверка детальной страницы). Только каналы с реально
-         подтверждённым linked_chat сюда попали.
-      2. Stage 2 JSONL читается для метаданных (linked_chat_username)
-         потому что в ParsedChannel мы это поле не сохраняем.
-    """
-    # Каналы из БД
-    rows = (await db.execute(
-        select(ParsedChannel).where(
-            ParsedChannel.user_id == current_user.id,
-            ParsedChannel.search_query == f"tgstat_web:{job_id}",
-        )
-    )).scalars().all()
+    Источник истины: {job_id}.stage2.jsonl — там per-URL детальные записи
+    Stage 2 (channel_username, has_open_comments, subscribers, title,
+    linked_chat_username, category, verified). JSONL is per-job by design,
+    поэтому корректно возвращает каналы даже для СТАРЫХ job'ов.
 
-    # linked_chat из Stage 2 JSONL (для UI колонки discussion-чат)
-    linked_chat_by_user: dict[str, str] = {}
+    Раньше читали из ParsedChannel по search_query=tgstat_web:{job_id} —
+    неверно: UPSERT в web_scraper_tasks.py перезаписывает search_query
+    при повторной находке того же канала другим job'ом. Клик 🔍 на
+    старый job'ик возвращал 0 каналов, хотя в JSONL они были.
+
+    Из БД подтягиваем language (в Stage 2 JSONL его нет).
+    """
     stage2_path = _ws_jsonl_path(current_user.id, job_id).parent / f"{job_id}.stage2.jsonl"
+
+    channels_data = []
     if stage2_path.exists():
         try:
             with stage2_path.open("r", encoding="utf-8") as f:
@@ -1691,36 +1687,84 @@ async def web_scrape_tgstat_aggregate(
                     if not rec.get("success"):
                         continue
                     data = rec.get("data") or {}
-                    u = (data.get("channel_username") or "").lstrip("@").lower()
-                    chat = data.get("linked_chat_username")
-                    if u and chat:
-                        linked_chat_by_user[u] = chat
-        except Exception:
-            pass
+                    u = (data.get("channel_username") or "").lstrip("@")
+                    if not u:
+                        continue
+                    has_c = bool(data.get("has_open_comments"))
+                    subs = int(data.get("subscribers") or 0)
+                    channels_data.append({
+                        "username": u,
+                        "title": (data.get("title") or "")[:250] or None,
+                        "subscribers": subs,
+                        "has_comments": has_c,
+                        "category": data.get("category"),
+                        "verified": bool(data.get("verified")),
+                        "discussion_chat": (data.get("linked_chat_username") or "").lstrip("@") or None,
+                    })
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                f"[aggregate] Stage 2 JSONL read error for {job_id}: {e}"
+            )
 
+    # Language подтягиваем из БД одним запросом по usernames
+    lang_by_user: dict[str, str | None] = {}
+    if channels_data:
+        usernames = [c["username"] for c in channels_data]
+        rows = (await db.execute(
+            select(ParsedChannel.username, ParsedChannel.language).where(
+                ParsedChannel.user_id == current_user.id,
+                ParsedChannel.username.in_(usernames),
+            )
+        )).all()
+        lang_by_user = {r[0].lstrip("@"): r[1] for r in rows}
+
+    # Fallback для старых job'ов (до появления Stage 2): читаем из БД
+    # по search_query. Аккуратно: это может вернуть уже "переприсвоенные"
+    # каналы, но лучше чем ничего.
+    if not channels_data:
+        rows_fallback = (await db.execute(
+            select(ParsedChannel).where(
+                ParsedChannel.user_id == current_user.id,
+                ParsedChannel.search_query == f"tgstat_web:{job_id}",
+            )
+        )).scalars().all()
+        for r in rows_fallback:
+            channels_data.append({
+                "username": (r.username or "").lstrip("@"),
+                "title": r.title,
+                "subscribers": r.subscribers or 0,
+                "has_comments": bool(r.has_comments),
+                "category": None,
+                "verified": False,
+                "discussion_chat": None,
+            })
+            lang_by_user.setdefault((r.username or "").lstrip("@"), r.language)
+
+    # Финальные фильтры + презентация
     out = []
-    for r in rows:
-        if only_with_comments and not r.has_comments:
+    for c in channels_data:
+        if only_with_comments and not c["has_comments"]:
             continue
-        if min_subscribers and (r.subscribers or 0) < min_subscribers:
+        if min_subscribers and c["subscribers"] < min_subscribers:
             continue
-        u = (r.username or "").lstrip("@")
+        u = c["username"]
         out.append({
             "username": "@" + u,
-            "title": r.title,
-            "subscribers": r.subscribers,
-            "has_comments": bool(r.has_comments),
-            "category": None,
-            "verified": False,
-            "discussion_chat": linked_chat_by_user.get(u.lower()),
-            "language": r.language,
+            "title": c["title"],
+            "subscribers": c["subscribers"],
+            "has_comments": c["has_comments"],
+            "category": c["category"],
+            "verified": c["verified"],
+            "discussion_chat": c["discussion_chat"],
+            "language": lang_by_user.get(u),
             "source_url": f"https://tgstat.com/channel/@{u}",
         })
     out.sort(key=lambda x: x.get("subscribers") or 0, reverse=True)
     return {
         "job_id": job_id,
-        "rows_read": len(rows),
+        "rows_read": len(channels_data),
         "channels_count": len(out),
         "channels": out,
+        "source": "stage2_jsonl" if stage2_path.exists() else "db_fallback",
         "skipped_no_guess": 0,
     }
