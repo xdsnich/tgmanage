@@ -508,7 +508,10 @@ async def __run_body(
     # /channel/@xxx и проверяем наличие linked discussion chat.
     # Только каналы с linked_chat сохраняем в БД.
     # ═══════════════════════════════════════════════════════════════
-    stage2_summary = {"channels_total": 0, "with_comments": 0, "without_comments": 0, "saved": 0}
+    stage2_summary = {
+        "channels_total": 0, "with_comments": 0, "without_comments": 0,
+        "saved": 0, "saved_new": 0, "saved_updated": 0,
+    }
     if do_stage2_channel_details and not cancel_check():
         _publish_progress("running", {
             **scraper.stats.snapshot(),
@@ -744,6 +747,7 @@ async def __run_body(
                             existing.has_comments = True
                             existing.last_verification = _dt.utcnow()
                             existing.search_query = f"tgstat_web:{job_id}"
+                            stage2_summary["saved_updated"] = stage2_summary.get("saved_updated", 0) + 1
                         else:
                             db.add(ParsedChannel(
                                 user_id=user_id,
@@ -757,6 +761,7 @@ async def __run_body(
                                 last_verification=_dt.utcnow(),
                                 added_at=_dt.utcnow(),
                             ))
+                            stage2_summary["saved_new"] = stage2_summary.get("saved_new", 0) + 1
                         stage2_summary["saved"] += 1
                     await db.commit()
             except Exception as e:

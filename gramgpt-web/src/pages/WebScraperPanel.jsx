@@ -816,6 +816,19 @@ export default function WebScraperPanel() {
             </div>
           )}
 
+          {/* Итог Stage 2: разбивка что реально попало в parsed_channels */}
+          {progress.stage2 && (progress.stage2.saved_new > 0 || progress.stage2.saved_updated > 0 || progress.stage2.saved > 0) && (
+            <div style={{
+              marginTop: 10, padding: '8px 12px', borderRadius: 6,
+              background: 'rgba(61,214,140,0.08)', border: '1px solid rgba(61,214,140,0.25)',
+              fontSize: 12, color: 'var(--text-2)', display: 'flex', gap: 14, flexWrap: 'wrap',
+            }}>
+              <span>💾 В БД: <b style={{ color: 'var(--green)' }}>+{progress.stage2.saved_new || 0}</b> новых</span>
+              <span>🔄 <b>{progress.stage2.saved_updated || 0}</b> обновлено (уже были)</span>
+              <span>📊 Всего с комментами: {progress.stage2.with_comments || 0} / без: {progress.stage2.without_comments || 0}</span>
+            </div>
+          )}
+
           {isTerminal && jobId && (
             <div style={{ marginTop: 12, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
               <Button variant="primary" onClick={() => handleDownload(jobId)}>
