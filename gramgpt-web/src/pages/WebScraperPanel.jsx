@@ -83,6 +83,10 @@ export default function WebScraperPanel() {
   const [progress, setProgress] = useState(null)
   const [starting, setStarting] = useState(false)
   const [stopping, setStopping] = useState(false)
+  // Момент клика Stop — чтобы через 10с показать «Force reset» если
+  // обычный Stop не сработал (task висит в старом коде).
+  const [stoppingSince, setStoppingSince] = useState(null)
+  const [stoppingElapsed, setStoppingElapsed] = useState(0)
   const [toast, setToast] = useState(null)
   const [jobs, setJobs] = useState([])
   const pollRef = useRef(null)
@@ -111,6 +115,7 @@ export default function WebScraperPanel() {
         if (['done', 'cancelled', 'error', 'unknown'].includes(data.status)) {
           stopPolling()
           setStopping(false)
+          setStoppingSince(null)
           if (data.status === 'done') {
             loadJobs()
             if (mode === 'tgstat') loadAggregate(id)
@@ -214,6 +219,14 @@ export default function WebScraperPanel() {
     return () => stopPolling()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Пока висит Stop — тикаем каждую секунду, чтобы UI мог показать
+  // "Force reset" через 10 сек ожидания.
+  useEffect(() => {
+    if (!stoppingSince) { setStoppingElapsed(0); return }
+    const t = setInterval(() => setStoppingElapsed(Math.floor((Date.now() - stoppingSince) / 1000)), 500)
+    return () => clearInterval(t)
+  }, [stoppingSince])
 
   // Сколько URL будет сгенерировано — для preview.
   // Логика: 1 URL на страну + 1 URL глобальный (если включён), × pages.
@@ -320,6 +333,7 @@ export default function WebScraperPanel() {
     if (!jobId) return
     if (!confirm('Остановить скрейпинг? Уже сделанные результаты сохранятся.')) return
     setStopping(true)
+    setStoppingSince(Date.now())
     try {
       await parserAPI.webScrapeStop(jobId)
       showToast('Сигнал отмены отправлен — жду подтверждения от воркера…', 'ok')
@@ -332,6 +346,39 @@ export default function WebScraperPanel() {
     } catch (e) {
       showToast('Не удалось отменить', 'err')
       setStopping(false)
+      setStoppingSince(null)
+    }
+  }
+
+  // Force-reset: жёстко убивает celery-таску (revoke terminate) и
+  // чистит Redis-ключи. UI сразу возвращается в чистое состояние.
+  // Нужно когда обычный Stop не помог — старый код в воркере, или
+  // Playwright застрял в transport read.
+  const handleForceReset = async (id) => {
+    const target = id || jobId
+    if (!target) return
+    const msg = 'Force reset: убить фоновую celery-таску и очистить UI.\n\n' +
+      'Уже сохранённые URL в JSONL останутся. Если таска запускалась ДО фикса — ' +
+      'она в фоне доработает пока не сделаешь stop_all.ps1, но UI очистится сразу.\n\nПродолжить?'
+    if (!confirm(msg)) return
+    try {
+      const { data } = await parserAPI.webScrapeReset(target)
+      showToast(
+        data?.revoked_task
+          ? '✅ Celery task убита + Redis очищен'
+          : '⚠️ Redis очищен, но task_id не найден (старый job) — сделай stop_all.ps1 чтобы точно прибить',
+        data?.revoked_task ? 'ok' : 'err',
+      )
+      stopPolling()
+      if (target === jobId) {
+        setJobId(null)
+        setProgress(null)
+        setStopping(false)
+        setStoppingSince(null)
+      }
+      loadJobs()
+    } catch (e) {
+      showToast('Не удалось сделать reset', 'err')
     }
   }
 
@@ -722,8 +769,23 @@ export default function WebScraperPanel() {
               padding: '8px 12px', marginBottom: 10, borderRadius: 6,
               background: 'rgba(239, 68, 68, 0.15)', border: '1px solid rgba(239, 68, 68, 0.4)',
               color: 'var(--red)', fontSize: 12, display: 'flex', alignItems: 'center', gap: 8,
+              flexWrap: 'wrap',
             }}>
-              <span>🛑 Останавливаю: жду пока воркеры отпустят прокси и запишут последние URL в JSONL. Обычно 2-5 сек.</span>
+              <span>🛑 Останавливаю ({stoppingElapsed}с)… обычно 2-5 сек.</span>
+              {stoppingElapsed >= 10 && (
+                <>
+                  <span style={{ opacity: 0.85 }}>
+                    Задача застряла (скорее всего запущена ДО фикса). Нужен force reset.
+                  </span>
+                  <button
+                    onClick={() => handleForceReset(jobId)}
+                    style={{
+                      background: 'var(--red)', color: '#fff', border: 'none',
+                      padding: '5px 12px', borderRadius: 5, fontSize: 12, fontWeight: 700, cursor: 'pointer',
+                    }}
+                  >🧹 Force reset</button>
+                </>
+              )}
             </div>
           )}
 
@@ -903,6 +965,10 @@ export default function WebScraperPanel() {
                     title="Полный лог этого запуска — прислать разработчику при поломке"
                     style={{ background: 'var(--bg)', color: 'var(--text-2)', border: '1px solid var(--border)', padding: '4px 10px', borderRadius: 4, fontSize: 11, cursor: 'pointer' }}
                   >📄 Лог</button>
+                  <button onClick={() => handleForceReset(j.job_id)}
+                    title="Force reset: убить фоновую celery-таску (если ещё бегает) + очистить Redis-статус этого job'а"
+                    style={{ background: 'var(--bg)', color: 'var(--red)', border: '1px solid rgba(239,68,68,0.5)', padding: '4px 10px', borderRadius: 4, fontSize: 11, cursor: 'pointer' }}
+                  >🧹 Reset</button>
                 </div>
               </div>
             ))}

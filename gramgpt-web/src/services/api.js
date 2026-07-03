@@ -423,6 +423,7 @@ export const parserAPI = {
   webScrapeStart: (data) => api.post('/parser/web/scrape/start', data, { timeout: 30000 }),
   webScrapeProgress: (jobId) => api.get('/parser/web/scrape/progress', { params: { job_id: jobId } }),
   webScrapeStop: (jobId) => api.post('/parser/web/scrape/stop', null, { params: { job_id: jobId } }),
+  webScrapeReset: (jobId) => api.post('/parser/web/scrape/reset', null, { params: { job_id: jobId } }),
   webScrapeResults: (jobId) => api.get('/parser/web/scrape/results', {
     params: { job_id: jobId },
     responseType: 'blob',

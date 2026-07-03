@@ -1258,6 +1258,12 @@ def _ws_cancel_key(user_id: int, job_id: str) -> str:
     return f"gramgpt:web_scraper:cancel:{user_id}:{job_id}"
 
 
+def _ws_task_id_key(user_id: int, job_id: str) -> str:
+    """Celery task_id для job'a. Нужен чтобы revoke(terminate=True) при
+    force-reset — иначе не знаем какой воркер убить."""
+    return f"gramgpt:web_scraper:task_id:{user_id}:{job_id}"
+
+
 def _ws_jsonl_path(user_id: int, job_id: str) -> _Path:
     api_dir = _Path(__file__).resolve().parent.parent
     return (api_dir / ".." / "data" / "web_scraper" / str(user_id) / f"{job_id}.jsonl").resolve()
@@ -1363,6 +1369,8 @@ async def web_scrape_start(
     }
     r.setex(_ws_progress_key(current_user.id, job_id), 86400,
             _json.dumps(initial, ensure_ascii=False))
+    # Сохраняем celery task_id — reset endpoint использует revoke(terminate=True)
+    r.setex(_ws_task_id_key(current_user.id, job_id), 86400, task.id)
 
     return {
         "job_id": job_id,
@@ -1404,6 +1412,65 @@ async def web_scrape_stop(
     r = _redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
     r.setex(_ws_cancel_key(current_user.id, job_id), 3600, "1")
     return {"status": "cancelling", "job_id": job_id}
+
+
+@router.post("/web/scrape/reset")
+async def web_scrape_reset(
+    job_id: str = Query(...),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Force-очистка зависшего job'а:
+      1. Ревокает Celery-таску через revoke(terminate=True) — SIGTERM в
+         воркер-тред. Убивает даже застрявший goto(). Требует чтобы
+         task_id был сохранён в Redis (для job'ов запущенных ДО этого
+         фикса task_id отсутствует — тогда просто чистим Redis-ключи,
+         фоновая таска умрёт при следующем stop_all.ps1).
+      2. Удаляет ключи progress, cancel, task_id из Redis — UI сразу
+         видит "unknown" статус и стряхивает jobId с localStorage.
+      3. JSONL на диске не трогается — уже собранное сохранено.
+
+    Endpoint для случая когда обычный Stop не помог (celery worker
+    завис в blocking pipe read из Chromium-subprocess, либо запущен
+    старый код без emergency_pool_stop).
+    """
+    import redis as _redis_lib
+    r = _redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    task_key = _ws_task_id_key(current_user.id, job_id)
+    revoked = False
+    task_id_bytes = r.get(task_key)
+    if task_id_bytes:
+        task_id = task_id_bytes.decode() if isinstance(task_id_bytes, bytes) else str(task_id_bytes)
+        try:
+            from celery_app import celery_app
+            # terminate=True → SIGTERM в тред-воркера, signal='SIGKILL' для
+            # решительной пришибки. На Windows Celery threads поддерживают
+            # только TERM (SIGKILL игнорится), но и того обычно хватает.
+            celery_app.control.revoke(task_id, terminate=True, signal="SIGTERM")
+            revoked = True
+            logging.getLogger(__name__).info(
+                f"[web_scrape_reset] revoked celery task {task_id} for job {job_id}"
+            )
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                f"[web_scrape_reset] revoke failed for {task_id}: {e}"
+            )
+    # В любом случае чистим Redis — UI перестанет видеть "running"
+    r.delete(
+        _ws_progress_key(current_user.id, job_id),
+        _ws_cancel_key(current_user.id, job_id),
+        task_key,
+    )
+    return {
+        "status": "reset",
+        "job_id": job_id,
+        "revoked_task": revoked,
+        "hint": (
+            "Если revoked=False — task_id не был сохранён (старый job). "
+            "UI очищен, но фоновая таска (если ещё живая) продолжит крутиться "
+            "до stop_all.ps1."
+        ),
+    }
 
 
 @router.get("/web/scrape/results")
@@ -1638,6 +1705,8 @@ async def web_scrape_tgstat_start(
     }
     r.setex(_ws_progress_key(current_user.id, job_id), 86400,
             _json.dumps(initial, ensure_ascii=False))
+    # Сохраняем celery task_id для reset endpoint (revoke terminate=True)
+    r.setex(_ws_task_id_key(current_user.id, job_id), 86400, task.id)
 
     return {
         "job_id": job_id,
