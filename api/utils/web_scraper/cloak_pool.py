@@ -255,16 +255,27 @@ class CloakProfilePool:
 
         ctx = await self._get_or_launch(proxy_url)
 
+        # Помечаем контекст как "в использовании" + освежаем last_use.
+        # Без этого idle_janitor мог закрыть context прямо во время
+        # обработки медленного URL (last_use оставалась старой пока
+        # воркер сидел в page.goto/evaluate), из-за чего worker получал
+        # "Target page, context or browser has been closed" mid-eval.
+        entry = self._contexts.get(proxy_url)
+        if entry is not None:
+            entry["in_use"] = entry.get("in_use", 0) + 1
+            entry["last_use"] = time.time()
+
         try:
             yield ctx
         finally:
             # НЕ закрываем ctx — в этом весь смысл пула. Только фиксируем
-            # время последнего использования.
+            # время последнего использования + освобождаем счётчик in_use.
             now = time.time()
             self._last_use_per_node[proxy_url] = now
             entry = self._contexts.get(proxy_url)
             if entry is not None:
                 entry["last_use"] = now
+                entry["in_use"] = max(0, entry.get("in_use", 1) - 1)
 
     # ── Internals ────────────────────────────────────────────
 
@@ -355,10 +366,13 @@ class CloakProfilePool:
                 if self._closing:
                     return
                 cutoff = time.time() - self.idle_shutdown_sec
+                # Гоняем только те что действительно idle И никто их не
+                # держит прямо сейчас. Иначе гонка: воркер сидит в
+                # медленном page.goto/evaluate, ctx закрывается на нём.
                 stale = [
                     url
                     for url, e in self._contexts.items()
-                    if e.get("last_use", 0) < cutoff
+                    if e.get("last_use", 0) < cutoff and e.get("in_use", 0) == 0
                 ]
                 if stale:
                     logger.info(
