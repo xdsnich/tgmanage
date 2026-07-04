@@ -411,6 +411,12 @@ async def __run_body(
     jsonl = _jsonl_path(user_id, job_id)
     jsonl.parent.mkdir(parents=True, exist_ok=True)
 
+    # stage2_target = сколько каналов юзер выставил в UI (options.stage2_limit).
+    # UI использует это как основной знаменатель progress bar'а с
+    # queued-фазы и до конца — иначе Stage 1 snapshot перебивает на
+    # total=1..8 (rating URL count) и показывает "0/1".
+    stage2_target = int(options.get("stage2_limit") or 0) or None
+
     # ── Progress callback: пишем snapshot в Redis ─────────────────────
     def _publish_progress(status: str, extra: dict | None = None):
         payload = {
@@ -419,6 +425,8 @@ async def __run_body(
             "urls_total": len(urls),
             "ts": int(time.time()),
         }
+        if stage2_target:
+            payload["stage2_target"] = stage2_target
         if extra:
             payload.update(extra)
         try:
