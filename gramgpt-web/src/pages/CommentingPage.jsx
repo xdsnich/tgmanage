@@ -3,6 +3,7 @@ import { commentingAPI, accountsAPI, parserAPI, subscribeAPI, warmupAPI, service
 import { Card, Button, Input, Modal, Badge, Spinner, Empty, StatCard } from '../components/ui'
 import AccountErrorsPanel from '../components/AccountErrorsPanel'
 import { useAutoRefresh } from '../hooks/useAutoRefresh'
+import useLocalStorageState from '../hooks/useLocalStorageState'
 
 const TONES = [
   { value: 'positive',   label: 'Позитивный',         icon: '😊' },
@@ -82,7 +83,7 @@ export default function CommentingPage() {
   const [campaigns, setCampaigns]           = useState([])
   const [accounts, setAccounts]             = useState([])
   const [loading, setLoading]               = useState(true)
-  const [tab, setTab]                       = useState('campaigns')
+  const [tab, setTab]                       = useLocalStorageState('commenting_active_tab', 'campaigns')
   const [logs, setLogs]                     = useState([])
   const [logsLoading, setLogsLoading]       = useState(false)
   const [selected, setSelected]             = useState(null)

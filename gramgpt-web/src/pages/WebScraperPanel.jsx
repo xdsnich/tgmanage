@@ -11,10 +11,11 @@
 import { useEffect, useRef, useState } from 'react'
 import { parserAPI, proxiesAPI } from '../services/api'
 import { Button, Card } from '../components/ui'
+import useLocalStorageState from '../hooks/useLocalStorageState'
 
 export default function WebScraperPanel() {
   // ── Общие настройки ──────────────────────────────────────────────
-  const [mode, setMode] = useState('tgstat')         // 'tgstat' | 'universal'
+  const [mode, setMode] = useLocalStorageState('web_scraper_mode', 'tgstat')  // 'tgstat' | 'universal'
   const [proxiesText, setProxiesText] = useState('')
   const [useDbProxies, setUseDbProxies] = useState(true)
   const [dbProxiesCount, setDbProxiesCount] = useState({ total: 0, valid: 0 })
@@ -34,14 +35,7 @@ export default function WebScraperPanel() {
   //   camoufox — patched Firefox с fresh context per URL (текущий дефолт).
   //   cloak    — CloakBrowser с persistent-профилем на каждый прокси
   //              (fingerprint и cookies копятся между запусками).
-  const [engine, setEngine] = useState(() => {
-    try { return localStorage.getItem('web_scraper_engine') || 'camoufox' }
-    catch { return 'camoufox' }
-  })
-  const setEnginePersistent = (v) => {
-    setEngine(v)
-    try { localStorage.setItem('web_scraper_engine', v) } catch {}
-  }
+  const [engine, setEngine] = useLocalStorageState('web_scraper_engine', 'camoufox')
 
   // TGStat режим
   const [tgstatOptions, setTgstatOptions] = useState({ countries: [], targets: [] })
@@ -751,7 +745,7 @@ export default function WebScraperPanel() {
               <select
                 value={engine}
                 disabled={isRunning}
-                onChange={e => setEnginePersistent(e.target.value)}
+                onChange={e => setEngine(e.target.value)}
                 style={{ padding: '4px 6px', fontSize: 12, background: 'var(--bg-2)', color: 'var(--text-1)', border: '1px solid var(--border)', borderRadius: 4 }}
               >
                 <option value="camoufox">Camoufox (fresh ctx per URL)</option>

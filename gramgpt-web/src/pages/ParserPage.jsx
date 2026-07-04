@@ -2,6 +2,7 @@ import { useEffect, useState, useRef } from 'react'
 import { accountsAPI, parserAPI } from '../services/api'
 import { Card, Button, Input, Modal, Badge, Spinner, Empty, StatCard } from '../components/ui'
 import { useAutoRefresh } from '../hooks/useAutoRefresh'
+import useLocalStorageState from '../hooks/useLocalStorageState'
 import ParserMetrics from './ParserMetrics'
 import WebScraperPanel from './WebScraperPanel'
 
@@ -97,7 +98,8 @@ export default function ParserPage() {
   }
 
   // Page tabs
-  const [pageTab, setPageTab] = useState('channels')
+  // pageTab персистится в localStorage — при F5 остаёмся на той же под-вкладке.
+  const [pageTab, setPageTab] = useLocalStorageState('parser_active_tab', 'channels')
 
   // Whitelist (pass-rate)
   const [whitelist, setWhitelist]         = useState([])
