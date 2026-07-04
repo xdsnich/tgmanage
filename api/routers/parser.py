@@ -1768,6 +1768,15 @@ async def web_scrape_tgstat_aggregate(
                         continue
                     data = rec.get("data") or {}
                     u = (data.get("channel_username") or "").lstrip("@")
+                    # Fallback: extractor часто не заполняет channel_username
+                    # для chat-based candidates, но URL мы знаем —
+                    # https://tgstat.com/channel/@X → достаём @X.
+                    if not u:
+                        url = rec.get("url") or ""
+                        marker = "/channel/@"
+                        idx = url.find(marker)
+                        if idx >= 0:
+                            u = url[idx + len(marker):].split("/")[0].split("?")[0].lstrip("@")
                     if not u:
                         continue
                     has_c = bool(data.get("has_open_comments"))
