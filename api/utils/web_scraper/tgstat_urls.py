@@ -1,28 +1,32 @@
 """
 tgstat_urls.py — генератор URL для TGStat.
 
-ВАЖНО: TGStat'овская реальная структура URL (проверена живо 2026-06-22):
+ВАЖНО (проверено 2026-07-03): TGStat использует ПОДДОМЕНЫ для стран, а
+не query-параметр. Country-picker с главной страницы ссылается на:
+  https://ir.tgstat.com/ratings/channels?sort=members   — Иран
+  https://in.tgstat.com/ratings/channels?sort=members   — Индия
+  https://tr.tgstat.com/ratings/channels?sort=members   — Турция
+  https://tgstat.ru/en/ratings/channels?sort=members    — Россия (спец-случай)
+  https://tgstat.com/ratings/channels                   — глобально
 
+  ❌ /ratings/channels?country=TR — параметр ИГНОРИРУЕТСЯ, возвращает глобал.
+     Все country-запросы отдают один и тот же топ ['@blumcrypto','@majors',
+     '@ProxyMTProto','@durov','@telegram']. Т.е. фильтр по стране через
+     query не работает (проверено 3-мя странами).
+
+Что ещё известно про URL структуру:
   ✅ /ratings/channels                  — глобальный рейтинг каналов
   ✅ /ratings/chats                     — рейтинг ЧАТОВ (discussion groups)
-                                          ← здесь и сидят чаты в которых можно писать
-  ✅ /ratings/chats?country=RU          — чаты по стране
   ✅ /channel/@username                 — детальная страница канала
   ✅ /channel/@username/N               — конкретный пост
-
-  ❌ /ratings/channels?sort=discussions — НЕ работает (404)
-  ❌ /channels/category/{cat}           — НЕ работает (404)
-  ❌ /{lang}/...                        — НЕ работает (404)
+  ✅ ?sort=members                      — сортировка по подписчикам
+  ❌ /ratings/channels?sort=discussions — не работает
+  ❌ /channels/category/{cat}           — не работает
 
 Что значит "канал с открытыми комментами":
   В Telegram комментарии под постом канала на самом деле пишутся в
   привязанный discussion group (чат). Если у канала есть linked chat —
-  значит на канале можно писать комменты. На TGStat этот discussion
-  group имеет отдельную страницу /chat/@xxx и попадает в /ratings/chats.
-
-  Поэтому самый прямой способ получить "каналы с комментами" =
-  взять рейтинг чатов и для каждого определить линкованный канал
-  (часто по конвенции имени: @xxx_chat → @xxx).
+  значит на канале можно писать комменты.
 """
 
 from typing import Iterable
@@ -30,28 +34,25 @@ from urllib.parse import urlencode
 
 
 # ── Гео ────────────────────────────────────────────────────────────
-# На TGStat используется ISO country code в верхнем регистре в параметре
-# ?country=XX. Проверено вживую: ?country=RU отдаёт 200.
+# ТОЛЬКО те страны, для которых у TGStat есть реально работающий
+# поддомен (проверено 2026-07-03 через country picker на tgstat.com).
+# Для остальных стран URL всё равно возвращает глобальный рейтинг.
+#
+# Особенности маппинга code → host:
+#   RU → tgstat.ru        (не ru.tgstat.com)
+#   UA → uk.tgstat.com    (UK, не ua — так у TGStat)
+#   KZ → kaz.tgstat.com   (3-буквенный, не kz)
 GEO_COUNTRIES: list[dict] = [
-    {"code": "RU", "label": "Russia",        "flag": "🇷🇺"},
-    {"code": "UA", "label": "Ukraine",       "flag": "🇺🇦"},
-    {"code": "BY", "label": "Belarus",       "flag": "🇧🇾"},
-    {"code": "KZ", "label": "Kazakhstan",    "flag": "🇰🇿"},
-    {"code": "UZ", "label": "Uzbekistan",    "flag": "🇺🇿"},
-    {"code": "AZ", "label": "Azerbaijan",    "flag": "🇦🇿"},
-    {"code": "DE", "label": "Germany",       "flag": "🇩🇪"},
-    {"code": "FR", "label": "France",        "flag": "🇫🇷"},
-    {"code": "ES", "label": "Spain",         "flag": "🇪🇸"},
-    {"code": "IT", "label": "Italy",         "flag": "🇮🇹"},
-    {"code": "PT", "label": "Portugal",      "flag": "🇵🇹"},
-    {"code": "PL", "label": "Poland",        "flag": "🇵🇱"},
-    {"code": "TR", "label": "Turkey",        "flag": "🇹🇷"},
-    {"code": "IN", "label": "India",         "flag": "🇮🇳"},
-    {"code": "ID", "label": "Indonesia",     "flag": "🇮🇩"},
-    {"code": "VN", "label": "Vietnam",       "flag": "🇻🇳"},
-    {"code": "US", "label": "USA",           "flag": "🇺🇸"},
-    {"code": "BR", "label": "Brazil",        "flag": "🇧🇷"},
-    {"code": "GB", "label": "United Kingdom","flag": "🇬🇧"},
+    {"code": "RU", "label": "Russia",       "flag": "🇷🇺"},
+    {"code": "UA", "label": "Ukraine",      "flag": "🇺🇦"},
+    {"code": "BY", "label": "Belarus",      "flag": "🇧🇾"},
+    {"code": "KZ", "label": "Kazakhstan",   "flag": "🇰🇿"},
+    {"code": "UZ", "label": "Uzbekistan",   "flag": "🇺🇿"},
+    {"code": "KG", "label": "Kyrgyzstan",   "flag": "🇰🇬"},
+    {"code": "IR", "label": "Iran",         "flag": "🇮🇷"},
+    {"code": "CN", "label": "China",        "flag": "🇨🇳"},
+    {"code": "IN", "label": "India",        "flag": "🇮🇳"},
+    {"code": "ET", "label": "Ethiopia",     "flag": "🇪🇹"},
 ]
 
 
@@ -71,6 +72,25 @@ GEO_LANGUAGES: list[dict] = GEO_COUNTRIES
 #   "channels" — обычный рейтинг каналов (/ratings/channels)
 #   "chats"    — рейтинг чатов = discussion groups (/ratings/chats)
 #                ← вот это и есть "каналы с открытыми комментами"
+
+
+def _country_host(cc: str) -> str:
+    """Возвращает host для страны на TGStat.
+
+    Спец-случаи взяты из country-picker'а на tgstat.com/ratings/channels:
+      RU  → tgstat.ru       (не ru.tgstat.com)
+      UA  → uk.tgstat.com   (uk, не ua)
+      KZ  → kaz.tgstat.com  (3-буквенный, не kz)
+    Все остальные — {cc.lower()}.tgstat.com.
+    """
+    cc = cc.upper()
+    if cc == "RU":
+        return "tgstat.ru"
+    if cc == "UA":
+        return "uk.tgstat.com"
+    if cc == "KZ":
+        return "kaz.tgstat.com"
+    return f"{cc.lower()}.tgstat.com"
 
 
 def build_urls(
@@ -122,12 +142,14 @@ def build_urls(
             seen.add(url)
             urls.append(url)
 
-    # 1. Глобальный (без country)
+    # 1. Глобальный (без country) — с главного tgstat.com
     if include_global or not countries_list:
         _add(f"https://tgstat.com{base_path}")
 
-    # 2. По странам
+    # 2. По странам — каждая страна на своём поддомене.
+    # ?sort=members — сортировка по подписчикам (как на country-picker'е)
     for cc in countries_list:
-        _add(f"https://tgstat.com{base_path}?{urlencode({'country': cc})}")
+        host = _country_host(cc)
+        _add(f"https://{host}{base_path}?sort=members")
 
     return urls
