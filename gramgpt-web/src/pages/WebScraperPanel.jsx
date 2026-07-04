@@ -42,6 +42,9 @@ export default function WebScraperPanel() {
   // Раньше было selectedLangs — теперь это страны (ISO-2: RU, UA, KZ…).
   // Дефолт пуст = глобальный рейтинг.
   const [selectedCountries, setSelectedCountries] = useState([])
+  // Категории TGStat (crypto, business, games, ...). Каждая = свой топ-100.
+  // Комбинируется с каждой страной / глобалом. Персистится в localStorage.
+  const [selectedCategories, setSelectedCategories] = useLocalStorageState('web_scraper_categories', [])
   // target: 'channels' (рейтинг каналов; Stage 2 проверит linked-chat и
   // оставит только каналы с открытыми комментами) ИЛИ 'chats'
   // (рейтинг discussion-групп напрямую).
@@ -255,11 +258,12 @@ export default function WebScraperPanel() {
   }, [liveLogLines])
 
   // Сколько URL будет сгенерировано — для preview.
-  // Логика: 1 URL на страну + 1 URL глобальный (если включён), × pages.
+  // Логика: 1 URL на страну + 1 URL глобальный (если включён), × N категорий (или 1 если нет).
   const tgstatUrlsCount = (() => {
     let base = selectedCountries.length
     if (includeGlobal || base === 0) base += 1
-    return base * Math.max(1, pagesPerGeo)
+    const catsMult = Math.max(1, selectedCategories.length)
+    return base * catsMult
   })()
 
   // ── handlers ────────────────────────────────────────────────────
@@ -309,6 +313,7 @@ export default function WebScraperPanel() {
           proxies: useDbProxies ? [] : proxies,
           use_db_proxies: useDbProxies,
           countries: selectedCountries,
+          categories: selectedCategories,
           target: 'channels',
           only_with_comments: true,
           pages_per_geo: 1,                  // 1 страница хватает на 100 кандидатов
@@ -658,6 +663,49 @@ export default function WebScraperPanel() {
                   color: 'var(--text-3)', cursor: 'pointer', fontSize: 11,
                 }}>
                 ✕ Очистить ({selectedCountries.length} выбрано) — взять глобальный топ
+              </button>
+            )}
+          </div>
+
+          {/* Категории — умножают кандидатов */}
+          <div style={{ marginTop: 12 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)', marginBottom: 4 }}>
+              3. Категории <span style={{ color: 'var(--text-3)', fontWeight: 400, fontSize: 11 }}>(опционально)</span>
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 8 }}>
+              Каждая категория = свой топ-100 каналов ({(tgstatOptions.categories || []).length} шт). Комбинируется со странами:
+              N категорий × M стран = N*M rating-страниц ≈ N*M*100 кандидатов.
+              Например, «crypto» + IR → до 100 иранских крипто-каналов. Пусто = общий рейтинг без категории.
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              {(tgstatOptions.categories || []).map(c => {
+                const on = selectedCategories.includes(c.slug)
+                return (
+                  <button key={c.slug}
+                    onClick={() => toggle(selectedCategories, setSelectedCategories)(c.slug)}
+                    disabled={isRunning}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 5,
+                      padding: '5px 9px', borderRadius: 16,
+                      border: `1px solid ${on ? 'var(--violet)' : 'var(--border)'}`,
+                      background: on ? 'rgba(139,92,246,0.12)' : 'var(--bg)',
+                      color: on ? 'var(--text)' : 'var(--text-2)',
+                      cursor: isRunning ? 'not-allowed' : 'pointer',
+                      fontSize: 11,
+                    }}>
+                    <span>{c.icon}</span>
+                    <span>{c.label}</span>
+                  </button>
+                )
+              })}
+            </div>
+            {selectedCategories.length > 0 && (
+              <button onClick={() => setSelectedCategories([])} disabled={isRunning}
+                style={{
+                  marginTop: 8, background: 'none', border: 'none',
+                  color: 'var(--text-3)', cursor: 'pointer', fontSize: 11,
+                }}>
+                ✕ Очистить ({selectedCategories.length} выбрано)
               </button>
             )}
           </div>

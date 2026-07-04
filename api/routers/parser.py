@@ -1584,12 +1584,12 @@ async def web_scrape_list_jobs(current_user: User = Depends(get_current_user)):
 
 @router.get("/web/scrape/tgstat/options")
 async def web_scrape_tgstat_options(current_user: User = Depends(get_current_user)):
-    """Справочник для UI: какие гео доступны на TGStat."""
+    """Справочник для UI: какие гео и категории доступны на TGStat."""
     from utils.web_scraper import GEO_COUNTRIES
+    from utils.web_scraper.tgstat_urls import GEO_CATEGORIES
     return {
-        # languages/categories — legacy, оставлены для совместимости со старым фронтом
-        "languages": GEO_COUNTRIES,
-        "categories": [],
+        "languages": GEO_COUNTRIES,   # legacy
+        "categories": GEO_CATEGORIES,
         "countries": GEO_COUNTRIES,
         "targets": [
             {"key": "channels", "label": "📢 Каналы (рейтинг)"},
@@ -1606,7 +1606,11 @@ class WebScrapeTgstatRequest(BaseModel):
     use_db_proxies: bool = True
     only_valid_proxies: bool = True     # отфильтровать невалидные (is_valid=False)
     languages: list[str] = []           # legacy, не используется
-    categories: list[str] = []          # legacy, не используется
+    # slugs категорий TGStat (crypto, business, games, ...). Если задано —
+    # каждая категория комбинируется с каждой страной (или global если
+    # стран нет). N категорий × M стран = N*M rating-URL'ов = ~N*M*100
+    # уникальных кандидатов.
+    categories: list[str] = []
     countries: list[str] = []           # ISO-2 коды (RU, UA, KZ...) или пусто = глобально
     target: str = "channels"            # дефолт: каналы (потом фильтр через детали)
     only_with_comments: bool = True
@@ -1684,6 +1688,7 @@ async def web_scrape_tgstat_start(
 
     urls = build_urls(
         countries=countries,
+        categories=body.categories,
         only_with_comments=body.only_with_comments,
         pages_per_geo=max(1, min(body.pages_per_geo, 10)),
         include_global=body.include_global or not countries,

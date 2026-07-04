@@ -56,10 +56,48 @@ GEO_COUNTRIES: list[dict] = [
 ]
 
 
-# Категории на TGStat сделаны как пользовательские "подборки" и
-# их URL'ы непредсказуемы. Поэтому фильтра по категории нет —
-# берём только страны и пагинацию.
-GEO_CATEGORIES: list[dict] = []   # legacy совместимость
+# Категории TGStat — /ratings/channels/{slug}?sort=members.
+# Проверено live 2026-07-04 через country-picker и дамп ссылок с
+# главной. Каждая категория = свой топ-100 (существенно разный).
+# Скрейп всех 40 категорий даёт до ~4000 уникальных кандидатов
+# только по глобальному tgstat.com. Плюс комбинации со странами.
+GEO_CATEGORIES: list[dict] = [
+    {"slug": "crypto",         "label": "Криптовалюты",       "icon": "💰"},
+    {"slug": "business",       "label": "Бизнес",              "icon": "💼"},
+    {"slug": "economics",      "label": "Экономика",           "icon": "📈"},
+    {"slug": "marketing",      "label": "Маркетинг",           "icon": "📣"},
+    {"slug": "career",         "label": "Карьера",             "icon": "💡"},
+    {"slug": "education",      "label": "Образование",         "icon": "🎓"},
+    {"slug": "edutainment",    "label": "Обучение и развитие", "icon": "🧠"},
+    {"slug": "courses",        "label": "Курсы",               "icon": "📚"},
+    {"slug": "books",          "label": "Книги",               "icon": "📖"},
+    {"slug": "language",       "label": "Языки",               "icon": "🗣️"},
+    {"slug": "tech",           "label": "Технологии",          "icon": "⚙️"},
+    {"slug": "apps",           "label": "Приложения",          "icon": "📱"},
+    {"slug": "games",          "label": "Игры",                "icon": "🎮"},
+    {"slug": "news",           "label": "Новости и СМИ",       "icon": "📰"},
+    {"slug": "politics",       "label": "Политика",            "icon": "🏛️"},
+    {"slug": "law",            "label": "Право",               "icon": "⚖️"},
+    {"slug": "medicine",       "label": "Медицина",            "icon": "🏥"},
+    {"slug": "health",         "label": "Здоровье",            "icon": "💪"},
+    {"slug": "beauty",         "label": "Красота",             "icon": "💄"},
+    {"slug": "food",           "label": "Еда",                 "icon": "🍔"},
+    {"slug": "travel",         "label": "Путешествия",         "icon": "✈️"},
+    {"slug": "nature",         "label": "Природа",             "icon": "🌳"},
+    {"slug": "sport",          "label": "Спорт",               "icon": "⚽"},
+    {"slug": "music",          "label": "Музыка",              "icon": "🎵"},
+    {"slug": "art",            "label": "Искусство",           "icon": "🎨"},
+    {"slug": "design",         "label": "Дизайн",              "icon": "🖌️"},
+    {"slug": "handmade",       "label": "Рукоделие",           "icon": "🧵"},
+    {"slug": "blogs",          "label": "Блоги",               "icon": "📝"},
+    {"slug": "psychology",     "label": "Психология",          "icon": "🧘"},
+    {"slug": "esoterics",      "label": "Эзотерика",           "icon": "🔮"},
+    {"slug": "entertainment",  "label": "Развлечения",         "icon": "🎉"},
+    {"slug": "instagram",      "label": "Instagram",           "icon": "📸"},
+    {"slug": "babies",         "label": "Дети",                "icon": "👶"},
+    {"slug": "construction",   "label": "Строительство",       "icon": "🏗️"},
+    {"slug": "gambling",       "label": "Азартные игры",       "icon": "🎰"},
+]   # legacy: возвращает [] у старых клиентов будет через отдельный API
 
 # Языки тоже не используются (на TGStat нет /{lang}/... URL'ов).
 # Поле оставлено чтобы старый фронт не падал на отсутствии ключа.
@@ -134,6 +172,7 @@ def build_urls(
     base_path = "/ratings/chats" if target == "chats" else "/ratings/channels"
 
     countries_list = [c.upper() for c in (countries or [])]
+    categories_list = [c.strip().lower() for c in (categories or []) if c and c.strip()]
     urls: list[str] = []
     seen: set[str] = set()
 
@@ -142,14 +181,29 @@ def build_urls(
             seen.add(url)
             urls.append(url)
 
+    def _paths_for_category(cat: str | None) -> str:
+        # /ratings/channels/{slug}?sort=members
+        # /ratings/chats — категорий не имеет, только базовый путь
+        if target == "chats" or not cat:
+            return base_path
+        return f"{base_path}/{cat}"
+
     # 1. Глобальный (без country) — с главного tgstat.com
     if include_global or not countries_list:
-        _add(f"https://tgstat.com{base_path}")
+        if categories_list:
+            for cat in categories_list:
+                _add(f"https://tgstat.com{_paths_for_category(cat)}?sort=members")
+        else:
+            _add(f"https://tgstat.com{base_path}")
 
     # 2. По странам — каждая страна на своём поддомене.
-    # ?sort=members — сортировка по подписчикам (как на country-picker'е)
+    # Категории комбинируются: {host}/ratings/channels/{cat}?sort=members
     for cc in countries_list:
         host = _country_host(cc)
-        _add(f"https://{host}{base_path}?sort=members")
+        if categories_list:
+            for cat in categories_list:
+                _add(f"https://{host}{_paths_for_category(cat)}?sort=members")
+        else:
+            _add(f"https://{host}{base_path}?sort=members")
 
     return urls

@@ -212,57 +212,38 @@ _JS_EXTRACT_CARDS = r"""
 """
 
 
-async def _expand_page(page: Any, max_loadmore_clicks: int = 8) -> None:
+async def _expand_page(page: Any, max_scroll_attempts: int = 2) -> None:
     """
-    Подгружает больше карточек: ищет кнопку "Показать ещё"/"Load more"
-    и кликает по ней до 8 раз с паузами. Параллельно скроллит — на
-    случай infinite scroll.
-    """
-    selectors = [
-        "button.lm-button", "button.btn-load-more", "a.load-more",
-        "button:has-text('Показать ещё')", "button:has-text('Загрузить ещё')",
-        "button:has-text('Load more')", "button:has-text('Показати ще')",
-        "a:has-text('Показать ещё')",
-    ]
-    for i in range(max_loadmore_clicks):
-        # Скроллим вниз чтобы триггернуть infinite scroll и сделать
-        # кнопку "Показать ещё" видимой
-        try:
-            await page.evaluate(
-                "window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'})"
-            )
-        except Exception:
-            break
-        await asyncio.sleep(random.uniform(1.5, 3.0))
+    ПРИМЕЧАНИЕ 2026-07-04: рейтинг-страницы TGStat статичны, максимум 100
+    карточек на URL (проверено 6 попыток скролла — счётчик так и остался
+    100). Поэтому убрал длинный цикл со скроллом+кликами «Показать ещё»
+    — тратим ~30 сек впустую.
 
-        # Пробуем нажать "Показать ещё"
-        clicked = False
-        for sel in selectors:
+    Оставил 2 пробных скролла на случай если конкретная категория
+    подгружает мало-мальски, плюс если TGStat вернёт кнопку типа
+    «Показать ещё» — жмём один раз. Больше кандидатов надо через
+    ДРУГИЕ URL (категория или страна), не через infinite scroll.
+    """
+    load_more_selectors = [
+        "button.lm-button", "button.btn-load-more", "a.load-more",
+        "button:has-text('Показать ещё')", "button:has-text('Load more')",
+    ]
+    for _ in range(max_scroll_attempts):
+        try:
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:
+            return
+        await asyncio.sleep(random.uniform(0.8, 1.5))
+        # Один шанс кликнуть кнопку если она есть
+        for sel in load_more_selectors:
             try:
                 btn = page.locator(sel).first
-                if await btn.count() > 0 and await btn.is_visible(timeout=500):
-                    await btn.click(timeout=2000)
-                    clicked = True
-                    await asyncio.sleep(random.uniform(2.0, 4.5))
+                if await btn.count() > 0 and await btn.is_visible(timeout=300):
+                    await btn.click(timeout=1500)
+                    await asyncio.sleep(random.uniform(1.5, 2.5))
                     break
             except Exception:
                 continue
-        if not clicked:
-            # Кнопок нет — возможно infinite scroll сам подгружает.
-            # Если новых карточек после скролла не появилось — выходим.
-            try:
-                count = await page.evaluate(
-                    "document.querySelectorAll('a[href*=\"/channel/@\"], a[href*=\"/chat/@\"]').length"
-                )
-                if i > 0 and count == _expand_page._last_count:
-                    break
-                _expand_page._last_count = count
-            except Exception:
-                break
-
-
-# Атрибут на функции — чтобы не таскать состояние через nonlocal
-_expand_page._last_count = 0
 
 
 async def _dismiss_banners(page: Any) -> None:
