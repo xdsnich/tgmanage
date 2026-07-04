@@ -518,7 +518,12 @@ async def __run_body(
             "phase": "stage2_channel_details",
         })
 
-        # Собираем уникальные @username каналов из Stage 1 JSONL
+        # Собираем уникальные @username каналов из Stage 1 JSONL.
+        # Для kind=channel — прямо username.
+        # Для kind=chat — linked_channel_guess (типа @foo_chat → @foo);
+        # это позволяет target=chats работать так же как target=channels,
+        # с тем преимуществом что чаты по определению имеют комменты =>
+        # каждый Stage 2 верификатор гарантированно найдёт discussion group.
         candidate_usernames = []
         seen = set()
         try:
@@ -532,8 +537,20 @@ async def __run_body(
                         continue
                     data = rec.get("data") or {}
                     for ch in (data.get("channels") or []):
-                        u = (ch.get("username") or "").lstrip("@")
-                        if not u or ch.get("kind") != "channel":
+                        kind = ch.get("kind")
+                        if kind == "channel":
+                            u = (ch.get("username") or "").lstrip("@")
+                        elif kind == "chat":
+                            # Сначала пробуем linked_channel_guess (типа
+                            # @foo_chat → @foo). Если гесса нет (иранские
+                            # чаты без суффикса, например @melbet_gift) —
+                            # используем сам username чата: часто это и
+                            # есть канал с открытыми комментами.
+                            guess = (ch.get("linked_channel_guess") or "").lstrip("@")
+                            u = guess or (ch.get("username") or "").lstrip("@")
+                        else:
+                            continue
+                        if not u:
                             continue
                         low = u.lower()
                         if low in seen:
