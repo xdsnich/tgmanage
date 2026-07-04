@@ -450,8 +450,14 @@ export default function WebScraperPanel() {
   }
 
   // ── derived progress ───────────────────────────────────────────
-
-  const total = progress?.urls_total || progress?.total || 0
+  // total: приоритет — progress.total (= current-stage total из
+  // scraper.stats.snapshot). Он обновляется на каждой стадии:
+  //   Stage 1: total = кол-во rating-URL (1-8)
+  //   Stage 2: total = кол-во candidate channels (до max_channels/stage2_limit,
+  //            обычно 100-200)
+  // urls_total из initial payload — фолбэк на pre-run фазу, когда
+  // scraper ещё не отчитался (status=queued/starting).
+  const total = progress?.total || progress?.urls_total || 0
   const done = progress?.done || 0
   const ok = progress?.ok || 0
   const failed = progress?.failed || 0

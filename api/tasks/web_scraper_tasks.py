@@ -641,6 +641,18 @@ async def __run_body(
                 post_read_tail_min_sec=float(options.get("stage2_post_read_tail_min_sec", 2.0)),
                 post_read_tail_max_sec=float(options.get("stage2_post_read_tail_max_sec", 20.0)),
             )
+            # Сбрасываем прогресс-счётчики перед Stage 2 чтобы UI показывал
+            # "0/N" где N = кол-во кандидатов, а не наследовал Stage 1
+            # snapshot (было "1/1 100%" пока scraper2 не начнёт репорт'ить).
+            _publish_progress("running", {
+                "phase": "stage2_channel_details",
+                "total": len(detail_urls),
+                "pending": len(detail_urls),
+                "done": 0, "ok": 0, "failed": 0, "skipped": 0,
+                "elapsed_sec": 0,
+                "in_flight": {},
+                "current_url": "",
+            })
             async with scraper2:
                 await scraper2.run(detail_urls)
         except Exception as e:
