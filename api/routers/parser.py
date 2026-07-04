@@ -1489,6 +1489,38 @@ async def web_scrape_results(
     )
 
 
+@router.get("/web/scrape/log-tail")
+async def web_scrape_log_tail(
+    job_id: str = Query(...),
+    lines: int = Query(30, ge=1, le=500),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Возвращает последние N строк из per-job лога — для live viewer в UI.
+    Дёшево (memory-efficient tail через seek), 3-сек polling из UI ok.
+    """
+    api_dir = _Path(__file__).resolve().parent.parent
+    path = (api_dir / ".." / "logs" / "web_scraper" / str(current_user.id) / f"{job_id}.log").resolve()
+    if not path.exists():
+        return {"lines": [], "size_bytes": 0, "exists": False}
+    # Простой tail — читаем последние ~lines*250 байт (типичная строка 100-200 chars)
+    size = path.stat().st_size
+    read_size = min(size, lines * 400)
+    with path.open("rb") as f:
+        f.seek(max(0, size - read_size))
+        chunk = f.read()
+    try:
+        text = chunk.decode("utf-8", errors="replace")
+    except Exception:
+        text = str(chunk)
+    all_lines = text.splitlines()
+    return {
+        "lines": all_lines[-lines:],
+        "size_bytes": size,
+        "exists": True,
+    }
+
+
 @router.get("/web/scrape/log")
 async def web_scrape_log(
     job_id: str = Query(...),

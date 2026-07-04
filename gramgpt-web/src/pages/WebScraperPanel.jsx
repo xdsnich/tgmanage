@@ -87,6 +87,10 @@ export default function WebScraperPanel() {
   const [stoppingElapsed, setStoppingElapsed] = useState(0)
   const [toast, setToast] = useState(null)
   const [jobs, setJobs] = useState([])
+  // Live log viewer — по кнопке разворачиваем, поллим /log-tail раз в 3с
+  const [liveLogOpen, setLiveLogOpen] = useLocalStorageState('web_scraper_live_log_open', false)
+  const [liveLogLines, setLiveLogLines] = useState([])
+  const liveLogRef = useRef(null)
   const pollRef = useRef(null)
 
   // ── helpers ─────────────────────────────────────────────────────
@@ -225,6 +229,30 @@ export default function WebScraperPanel() {
     const t = setInterval(() => setStoppingElapsed(Math.floor((Date.now() - stoppingSince) / 1000)), 500)
     return () => clearInterval(t)
   }, [stoppingSince])
+
+  // Live-log polling: если раскрыто И job активен — поллим /log-tail
+  // каждые 3 сек. При приходе новых строк автоскролл вниз.
+  useEffect(() => {
+    if (!liveLogOpen || !jobId) return
+    let stopped = false
+    const fetchTail = async () => {
+      try {
+        const { data } = await parserAPI.webScrapeLogTail(jobId, 40)
+        if (stopped) return
+        setLiveLogLines(data?.lines || [])
+      } catch (e) { /* silent */ }
+    }
+    fetchTail()
+    const t = setInterval(fetchTail, 3000)
+    return () => { stopped = true; clearInterval(t) }
+  }, [liveLogOpen, jobId])
+
+  // Автоскролл вниз при новых строках
+  useEffect(() => {
+    if (liveLogRef.current) {
+      liveLogRef.current.scrollTop = liveLogRef.current.scrollHeight
+    }
+  }, [liveLogLines])
 
   // Сколько URL будет сгенерировано — для preview.
   // Логика: 1 URL на страну + 1 URL глобальный (если включён), × pages.
@@ -841,6 +869,69 @@ export default function WebScraperPanel() {
             </div>
           )}
 
+          {/* Live workers — что каждый воркер сейчас делает */}
+          {progress.in_flight && Object.keys(progress.in_flight).length > 0 && isRunning && (
+            <div style={{ marginTop: 10, padding: '8px 12px', borderRadius: 6,
+              background: 'rgba(139,92,246,0.06)', border: '1px solid rgba(139,92,246,0.15)' }}>
+              <div style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, marginBottom: 6 }}>
+                👷 Воркеры сейчас:
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                {Object.entries(progress.in_flight).map(([wid, url]) => (
+                  <div key={wid} style={{ fontSize: 11, color: 'var(--text-2)', fontFamily: 'monospace',
+                    display: 'flex', gap: 8, alignItems: 'center' }}>
+                    <span style={{ background: 'var(--violet)', color: '#fff', padding: '1px 6px',
+                      borderRadius: 3, fontSize: 10, fontWeight: 700 }}>#{wid}</span>
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+                      {url && url.length > 80 ? `…${url.slice(-80)}` : url}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Live log tail — toggle кнопка */}
+          {jobId && (isRunning || isTerminal) && (
+            <div style={{ marginTop: 10 }}>
+              <button onClick={() => setLiveLogOpen(v => !v)}
+                style={{
+                  background: liveLogOpen ? 'rgba(139,92,246,0.15)' : 'var(--bg)',
+                  color: liveLogOpen ? 'var(--violet)' : 'var(--text-2)',
+                  border: `1px solid ${liveLogOpen ? 'var(--violet)' : 'var(--border)'}`,
+                  padding: '5px 12px', borderRadius: 6, fontSize: 11, fontWeight: 600, cursor: 'pointer',
+                }}
+                title="Live-log: последние 40 строк per-job лога, обновляется раз в 3 сек"
+              >
+                {liveLogOpen ? '▼' : '▶'} 📜 Live log ({liveLogOpen ? 'открыт' : 'открыть'})
+              </button>
+              {liveLogOpen && (
+                <div ref={liveLogRef}
+                  style={{
+                    marginTop: 8, padding: 10, borderRadius: 6,
+                    background: '#000', border: '1px solid rgba(139,92,246,0.20)',
+                    fontFamily: 'ui-monospace, "Cascadia Code", Menlo, Consolas, monospace',
+                    fontSize: 10, lineHeight: 1.4, color: '#c9d1d9',
+                    maxHeight: 260, overflowY: 'auto', whiteSpace: 'pre',
+                  }}
+                >
+                  {liveLogLines.length === 0
+                    ? <span style={{ color: 'var(--text-3)' }}>жду данных…</span>
+                    : liveLogLines.map((ln, i) => {
+                        const isErr = /ERROR|Traceback|❌|crash|FAIL/i.test(ln)
+                        const isWarn = /WARNING|⚠/i.test(ln)
+                        return (
+                          <div key={i} style={{
+                            color: isErr ? '#f87171' : isWarn ? '#eab308' : '#c9d1d9',
+                          }}>{ln}</div>
+                        )
+                      })
+                  }
+                </div>
+              )}
+            </div>
+          )}
+
           {progress.preview_urls && progress.preview_urls.length > 0 && status === 'queued' && (
             <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-3)' }}>
               Превью URL'ов: {progress.preview_urls.slice(0, 3).map(u => u.split('//')[1]).join(', ')}
@@ -864,7 +955,14 @@ export default function WebScraperPanel() {
               <span>🔎 Кандидатов из Stage 1: <b>{progress.dedup.stage1_candidates || 0}</b></span>
               <span>⏭ Пропущено (уже проверены ≤{progress.dedup.skip_days || 0}д): <b style={{ color: '#eab308' }}>{progress.dedup.skipped_already_checked || 0}</b></span>
               <span>▶ К проверке во Stage 2: <b style={{ color: 'var(--violet)' }}>{progress.dedup.stage2_will_process || 0}</b></span>
-              {progress.dedup.stage2_will_process <= 1 && progress.dedup.skipped_already_checked > 5 && (
+              {progress.dedup.stage2_will_process === 0 && progress.dedup.skipped_already_checked > 0 && (
+                <span style={{ color: '#eab308', width: '100%', marginTop: 4, display: 'block' }}>
+                  ⚠ <b>Все {progress.dedup.skipped_already_checked} кандидатов уже проверялись за последние {progress.dedup.skip_days || 30} дней.</b>
+                  Stage 2 не будет ничего парсить.
+                  Нажми <b>⟳ Пересканить всё</b> в настройках (skip=0) чтобы пройти по ним заново.
+                </span>
+              )}
+              {progress.dedup.stage2_will_process > 0 && progress.dedup.stage2_will_process <= 1 && progress.dedup.skipped_already_checked > 5 && (
                 <span style={{ color: '#eab308' }}>
                   ⚠ Почти всё отфильтровано — поставь «⟳ Пересканить всё» (skip=0 дней) в настройках
                 </span>
