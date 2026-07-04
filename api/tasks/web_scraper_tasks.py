@@ -668,6 +668,15 @@ async def __run_body(
                     stage2_summary["channels_total"] += 1
 
                     u = (data.get("channel_username") or "").lstrip("@")
+                    # Fallback: extractor иногда не заполняет channel_username
+                    # (баг), но URL мы знаем — https://tgstat.com/channel/@X.
+                    # Достаём @X из URL.
+                    if not u:
+                        url = rec.get("url") or ""
+                        marker = "/channel/@"
+                        idx = url.find(marker)
+                        if idx >= 0:
+                            u = url[idx + len(marker):].split("/")[0].split("?")[0].lstrip("@")
                     if not u:
                         continue
                     has_c = bool(data.get("has_open_comments"))
