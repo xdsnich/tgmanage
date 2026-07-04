@@ -1697,10 +1697,17 @@ async def web_scrape_tgstat_start(
 
     import redis as _redis_lib
     r = _redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    # target = сколько каналов проверим в Stage 2 (то что юзер выставил).
+    # UI использует это как основной знаменатель прогресс-бара с самого
+    # старта, а не Stage 1 URL count (обычно 1-8), иначе показывает "0/1"
+    # что вводит в заблуждение.
+    stage2_target = max(0, min(int(body.max_channels or 0), 500))
     initial = {
         "status": "queued",
         "job_id": job_id,
         "urls_total": len(urls),
+        "stage2_target": stage2_target,
+        "total": stage2_target,   # UI приоритет total > urls_total
         "proxies_total": len(proxies),
         "preset": "tgstat",
         "languages": body.languages,
