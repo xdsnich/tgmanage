@@ -55,6 +55,10 @@ export default function WebScraperPanel() {
   const [onlyWithComments, setOnlyWithComments] = useState(true)
   const [pagesPerGeo, setPagesPerGeo] = useState(1)
   const [includeGlobal, setIncludeGlobal] = useState(true)
+  // Дедуп-фильтр: пропускать каналы уже проверенные за последние N дней
+  // (TgstatCheckedChannel table). 0 = не пропускать (пересканить всё).
+  // Дефолт 30 — типичное «повторно проверять не чаще раза в месяц».
+  const [skipRecentDays, setSkipRecentDays] = useState(30)
   // Лимит «сколько каналов проверить детально» — главный контрол для юзера.
   // 30 = 1 страница рейтинга × проверка 30 топовых.
   const [maxChannels, setMaxChannels] = useState(30)
@@ -288,6 +292,7 @@ export default function WebScraperPanel() {
           pages_per_geo: 1,                  // 1 страница хватает на 100 кандидатов
           include_global: selectedCountries.length === 0,
           max_channels: maxChannels,
+          skip_recently_checked_days: skipRecentDays,
           max_workers: maxWorkers,
           max_retries: maxRetries,
           page_timeout_sec: pageTimeout,
@@ -558,6 +563,37 @@ export default function WebScraperPanel() {
                 ≈ {Math.round(maxChannels * 0.7)} мин на 30 проксях
               </span>
             </div>
+
+            <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 12, color: 'var(--text-2)', fontWeight: 600 }}>
+                Дедуп: пропускать проверенные за
+              </span>
+              <input type="number" value={skipRecentDays}
+                min={0} max={365} disabled={isRunning}
+                onChange={e => setSkipRecentDays(Math.max(0, Math.min(365, parseInt(e.target.value || '0'))))}
+                style={{
+                  width: 60, padding: '6px 8px', borderRadius: 6,
+                  background: 'var(--bg)', border: '1px solid var(--border)',
+                  color: 'var(--text)', fontSize: 12, fontWeight: 600,
+                }} />
+              <span style={{ fontSize: 12, color: 'var(--text-2)' }}>дней</span>
+              <button type="button" disabled={isRunning}
+                onClick={() => setSkipRecentDays(0)}
+                title="Пересканить все каналы (в т.ч. недавно проверенные) — полезно если dedup выбрасывает все кандидаты"
+                style={{
+                  padding: '4px 10px', borderRadius: 5, fontSize: 11,
+                  background: skipRecentDays === 0 ? 'rgba(139,92,246,0.15)' : 'var(--bg)',
+                  border: `1px solid ${skipRecentDays === 0 ? 'var(--violet)' : 'var(--border)'}`,
+                  color: skipRecentDays === 0 ? 'var(--text)' : 'var(--text-3)',
+                  cursor: isRunning ? 'not-allowed' : 'pointer',
+                }}
+              >⟳ Пересканить всё</button>
+              <span style={{ fontSize: 10, color: 'var(--text-3)' }}>
+                {skipRecentDays === 0
+                  ? '(dedup выключен — проверим все кандидаты заново)'
+                  : `(каналы из TgstatCheckedChannel за последние ${skipRecentDays} дней будут пропущены)`}
+              </span>
+            </div>
           </div>
 
           {/* 2. Откуда */}
@@ -819,6 +855,24 @@ export default function WebScraperPanel() {
           {progress.error && (
             <div style={{ marginTop: 10, padding: 10, borderRadius: 6, background: 'rgba(239, 68, 68, 0.1)', color: 'var(--red)', fontSize: 12, fontFamily: 'monospace' }}>
               {progress.error}
+            </div>
+          )}
+
+          {/* Dedup-стата: сколько кандидатов отфильтровано */}
+          {progress.dedup && (progress.dedup.skipped_already_checked > 0 || progress.dedup.stage1_candidates > 0) && (
+            <div style={{
+              marginTop: 10, padding: '8px 12px', borderRadius: 6,
+              background: 'rgba(234, 179, 8, 0.10)', border: '1px solid rgba(234, 179, 8, 0.30)',
+              fontSize: 12, color: 'var(--text-2)', display: 'flex', gap: 14, flexWrap: 'wrap',
+            }}>
+              <span>🔎 Кандидатов из Stage 1: <b>{progress.dedup.stage1_candidates || 0}</b></span>
+              <span>⏭ Пропущено (уже проверены ≤{progress.dedup.skip_days || 0}д): <b style={{ color: '#eab308' }}>{progress.dedup.skipped_already_checked || 0}</b></span>
+              <span>▶ К проверке во Stage 2: <b style={{ color: 'var(--violet)' }}>{progress.dedup.stage2_will_process || 0}</b></span>
+              {progress.dedup.stage2_will_process <= 1 && progress.dedup.skipped_already_checked > 5 && (
+                <span style={{ color: '#eab308' }}>
+                  ⚠ Почти всё отфильтровано — поставь «⟳ Пересканить всё» (skip=0 дней) в настройках
+                </span>
+              )}
             </div>
           )}
 

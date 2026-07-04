@@ -1584,6 +1584,9 @@ class WebScrapeTgstatRequest(BaseModel):
     # 0 = без лимита. Влияет на ВРЕМЯ: каждый кандидат это 1 HTTP запрос
     # к /channel/@xxx с 60-120 сек cooldown между прокси.
     max_channels: int = 30
+    # Дедуп: пропускать каналы уже проверенные за N дней.
+    # 0 = не пропускать (пересканить всё). Дефолт 30.
+    skip_recently_checked_days: Optional[int] = 30
 
     max_workers: Optional[int] = 3
     max_retries: Optional[int] = 3
@@ -1673,6 +1676,7 @@ async def web_scrape_tgstat_start(
         "page_locale": body.page_locale or "en-US",
         # Лимит кандидатов на проверку во 2-м проходе. 0 = весь Stage 1.
         "stage2_limit": max(0, min(int(body.max_channels or 0), 500)),
+        "skip_recently_checked_days": max(0, int(body.skip_recently_checked_days or 0)),
         "engine": (body.engine or "camoufox").lower(),
         "camoufox": {
             "humanize": bool(body.humanize),

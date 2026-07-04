@@ -588,14 +588,16 @@ async def __run_body(
             except Exception as e:
                 logger.warning(f"[web_scraper] skip-recently-checked filter failed: {e}")
 
+        stage1_candidates_total = len(candidate_usernames)
+        dedup_skipped = 0
         if already_checked_low:
             before = len(candidate_usernames)
             candidate_usernames = [
                 u for u in candidate_usernames if u.lower() not in already_checked_low
             ]
-            skipped = before - len(candidate_usernames)
+            dedup_skipped = before - len(candidate_usernames)
             logger.info(
-                f"[web_scraper] Stage 2: пропущено {skipped} уже проверенных "
+                f"[web_scraper] Stage 2: пропущено {dedup_skipped} уже проверенных "
                 f"за последние {skip_days} дней, осталось {len(candidate_usernames)}"
             )
 
@@ -607,6 +609,16 @@ async def __run_body(
 
         detail_urls = [f"https://tgstat.com/channel/@{u}" for u in candidate_usernames]
         jsonl_stage2 = jsonl.parent / f"{job_id}.stage2.jsonl"
+
+        # Публикуем dedup-статистику в progress payload — UI покажет
+        # "🔎 из 96 кандидатов пропущено 95 (уже проверялись за 30 дней)"
+        # чтобы юзер понимал почему Stage 2 = 1 URL а не 96.
+        stage2_summary["dedup"] = {
+            "stage1_candidates": stage1_candidates_total,
+            "skipped_already_checked": dedup_skipped,
+            "skip_days": skip_days,
+            "stage2_will_process": len(candidate_usernames),
+        }
 
         try:
             scraper2 = WebScraper(
@@ -644,6 +656,7 @@ async def __run_body(
             # Сбрасываем прогресс-счётчики перед Stage 2 чтобы UI показывал
             # "0/N" где N = кол-во кандидатов, а не наследовал Stage 1
             # snapshot (было "1/1 100%" пока scraper2 не начнёт репорт'ить).
+            # Плюс dedup-инфа — юзер увидит "из 96 пропущено 95".
             _publish_progress("running", {
                 "phase": "stage2_channel_details",
                 "total": len(detail_urls),
@@ -652,6 +665,7 @@ async def __run_body(
                 "elapsed_sec": 0,
                 "in_flight": {},
                 "current_url": "",
+                "dedup": stage2_summary.get("dedup"),
             })
             async with scraper2:
                 await scraper2.run(detail_urls)
