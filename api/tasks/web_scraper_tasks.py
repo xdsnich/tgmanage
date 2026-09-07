@@ -190,6 +190,12 @@ def _dump_env_diagnostics(
 
 # ── Helpers ─────────────────────────────────────────────────────────
 
+class _StopStage2Sentinel(Exception):
+    """Тихо выходим из Stage 2 когда после dedup нечего парсить.
+    Не логируется как ошибка — обрабатывается в дедикейтед branch."""
+    pass
+
+
 def _run_async(coro):
     """sync→async bridge. Celery threads + asyncio = свой loop на task.
 
@@ -345,11 +351,11 @@ async def _run(user_id: int, job_id: str, urls: list[str],
     _job_log_handler, _job_log_path = _setup_job_logger(user_id, job_id)
     _run_ok = False
     try:
-        # ── Выбор движка: camoufox (default) / cloak (persistent profiles) ─
-        engine = (options.get("engine") or "camoufox").lower()
+        # ── Выбор движка: cloak (default, persistent profiles) / camoufox (fallback) ─
+        engine = (options.get("engine") or "cloak").lower()
         if engine not in ("camoufox", "cloak"):
-            logger.warning(f"[web_scraper] неизвестный engine={engine}, fallback camoufox")
-            engine = "camoufox"
+            logger.warning(f"[web_scraper] неизвестный engine={engine}, fallback cloak")
+            engine = "cloak"
 
         # ── Фильтр прокси (socks5+auth несовместим с Camoufox) ─────
         proxies, dropped_proxies = _filter_playwright_compatible(proxies, engine=engine)
@@ -365,12 +371,37 @@ async def _run(user_id: int, job_id: str, urls: list[str],
             proxies_count=len(proxies), dropped_count=len(dropped_proxies),
             options=options, urls_count=len(urls),
         )
-        _result = await __run_body(
-            user_id, job_id, urls, proxies, options, engine,
-            dropped_proxies, redis,
-        )
-        _run_ok = True
-        return _result
+        try:
+            _result = await __run_body(
+                user_id, job_id, urls, proxies, options, engine,
+                dropped_proxies, redis,
+            )
+            _run_ok = True
+            return _result
+        except Exception as _run_exc:
+            # ЛЮБОЕ исключение внутри __run_body должно попасть в per-job лог
+            # с полным трейсом. Без этого 'ok=False' в финальной строке
+            # выглядит как чёрный ящик и юзер бесится.
+            logger.exception(
+                f"[web_scraper] job {job_id} провалился: "
+                f"{type(_run_exc).__name__}: {_run_exc}"
+            )
+            # Пишем error-статус в Redis чтобы UI показал причину, а не
+            # висел в "running".
+            try:
+                from utils.redis_pool import get_redis as _gr
+                _r = _gr()
+                _err_payload = {
+                    "status": "error",
+                    "job_id": job_id,
+                    "ts": int(time.time()),
+                    "error": f"{type(_run_exc).__name__}: {str(_run_exc)[:400]}",
+                }
+                _r.setex(_progress_key(user_id, job_id), 86400,
+                         json.dumps(_err_payload, ensure_ascii=False))
+            except Exception:
+                pass
+            raise
     finally:
         logger.info(
             f"[web_scraper] job {job_id} finished (ok={_run_ok}), "
@@ -387,7 +418,7 @@ async def __run_body(
     """Тело _run без wrap'а с логгером — вынесено чтобы не увеличивать
     отступ на весь файл. Логика идентична предыдущей версии, просто
     engine и dropped_proxies уже вычислены снаружи."""
-    from utils.web_scraper import WebScraper, tgstat_channels_extractor
+    from utils.web_scraper import WebScraper, tgstat_channels_extractor, tgstat_sitemap_extractor
     from utils.web_scraper.tgstat_channel_detail import tgstat_channel_detail_extractor
 
     # Выбор extractor'а по options.extractor
@@ -395,6 +426,9 @@ async def __run_body(
     if extractor_name == "tgstat":
         page_extractor = tgstat_channels_extractor
         logger.info("[web_scraper] extractor=tgstat (рейтинг → карточки)")
+    elif extractor_name == "tgstat_sitemap":
+        page_extractor = tgstat_sitemap_extractor
+        logger.info("[web_scraper] extractor=tgstat_sitemap (sitemap.xml → usernames)")
     elif extractor_name == "tgstat_channel_detail":
         page_extractor = tgstat_channel_detail_extractor
         logger.info("[web_scraper] extractor=tgstat_channel_detail (linked chat)")
@@ -402,9 +436,11 @@ async def __run_body(
         page_extractor = _universal_extractor
         logger.info("[web_scraper] extractor=universal (title/meta/h1/body)")
 
-    # Будут ли использоваться 2 stage'a (для tgstat — да по умолчанию)
+    # Будут ли использоваться 2 stage'a (Stage 2 нужен для tgstat И tgstat_sitemap)
     pipeline = (options.get("pipeline") or "").lower()
-    do_stage2_channel_details = (extractor_name == "tgstat" and pipeline != "stage1_only")
+    do_stage2_channel_details = (
+        extractor_name in ("tgstat", "tgstat_sitemap") and pipeline != "stage1_only"
+    )
 
     prog_k = _progress_key(user_id, job_id)
     cancel_k = _cancel_key(user_id, job_id)
@@ -421,7 +457,14 @@ async def __run_body(
     # ЗДЕСЬ (не внутри Stage 2 блока), чтобы _publish_progress мог
     # включать их в каждый snapshot и UI видел растущий "💾 В БД: +N"
     # прямо во время Stage 2 работы.
-    _incremental_stats = {"new": 0, "updated": 0}
+    # new/updated — только живые с комментами (сохраняем в parsed_channels)
+    # alive_with / alive_without — все проверенные живые
+    # dead — 404 / not-found страницы TGStat
+    _incremental_stats = {
+        "new": 0, "updated": 0,
+        "alive_with_comments": 0, "alive_without_comments": 0,
+        "dead": 0,
+    }
     # Каналы уже сохранённые watcher'ом — финальный catch-up save их
     # пропускает чтобы не считать заново.
     saved_incremental_usernames: set[str] = set()
@@ -436,13 +479,27 @@ async def __run_body(
         }
         if stage2_target:
             payload["stage2_target"] = stage2_target
-        # Инкрементальные счётчики stage2 save — всегда мержим в payload,
-        # чтобы UI показывал зелёный баннер "💾 В БД: +N" по ходу.
-        if _incremental_stats["new"] or _incremental_stats["updated"]:
+        # Инкрементальные счётчики stage2 save — всегда мержим в payload.
+        # Разделяем dead vs alive чтобы UI показывал реальность:
+        #   alive_with_comments   — живые с комментами (эти в БД идут)
+        #   alive_without_comments — живые без комментов
+        #   dead                   — TGStat отдал 404 (страница не найдена)
+        # checked_total = alive + dead — используется для триггера refresh
+        alive_with = _incremental_stats["alive_with_comments"]
+        alive_without = _incremental_stats["alive_without_comments"]
+        dead = _incremental_stats["dead"]
+        checked_alive = alive_with + alive_without
+        checked_total = checked_alive + dead
+        if _incremental_stats["new"] or _incremental_stats["updated"] or checked_total:
             payload["stage2"] = {
                 "saved_new": _incremental_stats["new"],
                 "saved_updated": _incremental_stats["updated"],
                 "saved": _incremental_stats["new"] + _incremental_stats["updated"],
+                "checked_total": checked_total,
+                "checked_alive": checked_alive,
+                "alive_with_comments": alive_with,
+                "alive_without_comments": alive_without,
+                "dead": dead,
             }
         if extra:
             payload.update(extra)
@@ -645,7 +702,36 @@ async def __run_body(
             "stage2_will_process": len(candidate_usernames),
         }
 
+        # ── Early exit: если после dedup ничего не осталось —
+        # scraper2 не запускаем. Логируем громко ЧТО и КАК исправить,
+        # ставим финальный статус, идём к общему return.
+        _stage2_skipped_all_deduped = not candidate_usernames
+        if _stage2_skipped_all_deduped:
+            logger.warning(
+                "═══════════════════════════════════════════════════════════\n"
+                f"[web_scraper] Stage 2 ПРОПУЩЕН: все {stage1_candidates_total} "
+                f"кандидатов из Stage 1 уже проверялись за последние "
+                f"{skip_days} дней (TgstatCheckedChannel).\n"
+                "Что делать:\n"
+                "  1. ⟳ Пересканить всё (skip_recently_checked_days=0) — форс.\n"
+                "  2. Выбери категории (crypto/business/games/…) — новые URL, "
+                "новые каналы.\n"
+                "  3. Добавь страны (IR, IN, KAZ, …) — новые поддомены.\n"
+                "═══════════════════════════════════════════════════════════"
+            )
+            _publish_progress("running", {
+                "phase": "stage2_channel_details",
+                "total": 0, "pending": 0, "done": 0,
+                "ok": 0, "failed": 0, "skipped": 0, "elapsed_sec": 0,
+                "in_flight": {}, "current_url": "",
+                "dedup": stage2_summary.get("dedup"),
+            })
+            stage2_summary["skipped_reason"] = "all_candidates_deduped"
+
+        # ── Стандартный путь: есть что парсить ──
         try:
+            if _stage2_skipped_all_deduped:
+                raise _StopStage2Sentinel()
             scraper2 = WebScraper(
                 proxies=proxies,
                 checkpoint_path=jsonl_stage2,
@@ -658,8 +744,13 @@ async def __run_body(
                 # Поднимаем page_timeout — крупные каналы за Cloudflare
                 # отдают 60-90 сек.
                 page_timeout_sec=float(options.get("stage2_page_timeout_sec", 60.0)),
-                cooldown_min_sec=int(options.get("stage2_cooldown_min_sec", 60)),
-                cooldown_max_sec=int(options.get("stage2_cooldown_max_sec", 120)),
+                # Cooldown Stage 2 повышен 60-120 → 180-360с. Cloudflare
+                # помнит IP несколько минут после challenge — 60-120 давало
+                # немедленный retry в мёртвое окно и снова ловило 403.
+                # 3-6 мин базы + эскалация в NodeRotator (×3, ×8 на повторах)
+                # достаточно чтобы TGStat забыл про этот IP.
+                cooldown_min_sec=int(options.get("stage2_cooldown_min_sec", 180)),
+                cooldown_max_sec=int(options.get("stage2_cooldown_max_sec", 360)),
                 node_rotation_min_sec=5.0,
                 node_rotation_max_sec=15.0,
                 progress_callback=progress_cb,
@@ -677,6 +768,13 @@ async def __run_body(
                 break_max_sec=float(options.get("stage2_break_max_sec", 240.0)),
                 post_read_tail_min_sec=float(options.get("stage2_post_read_tail_min_sec", 2.0)),
                 post_read_tail_max_sec=float(options.get("stage2_post_read_tail_max_sec", 20.0)),
+                # Warmup: перед первым визитом на каждом узле идём на
+                # tgstat.com/ratings/channels чтобы получить __cf_bm и
+                # выглядеть как органический юзер, кликнувший на канал
+                # из рейтинга. Резко снижает шанс 403 на /channel/@X.
+                warmup_url=options.get("stage2_warmup_url", "https://tgstat.com/ratings/channels"),
+                warmup_min_sec=float(options.get("stage2_warmup_min_sec", 5.0)),
+                warmup_max_sec=float(options.get("stage2_warmup_max_sec", 12.0)),
             )
             # Сбрасываем прогресс-счётчики перед Stage 2 чтобы UI показывал
             # "0/N" где N = кол-во кандидатов, а не наследовал Stage 1
@@ -740,14 +838,36 @@ async def __run_body(
                                     key = u.lower()
                                     if key in saved_incremental_usernames:
                                         continue
+                                    # Пропускаем dead (404) — extractor
+                                    # выставляет is_dead=True когда TGStat
+                                    # отдал fallback-страницу «канал не найден».
+                                    # Такие каналы не идут ни в parsed_channels,
+                                    # ни в tgstat_checked_channels (нет смысла
+                                    # запоминать: следующий job их снова
+                                    # проверит и снова получит 404).
+                                    if bool(data.get("is_dead")):
+                                        saved_incremental_usernames.add(key)
+                                        _incremental_stats["dead"] += 1
+                                        continue
                                     has_c = bool(data.get("has_open_comments"))
                                     subs = int(data.get("subscribers") or 0)
                                     title = (data.get("title") or "")[:250] or None
                                     linked = (data.get("linked_chat_username") or "").lstrip("@") or None
+                                    # alive-counter — сразу инкрементим при первом
+                                    # обнаружении. new/updated обновятся отдельно
+                                    # после успешного UPSERT в БД.
+                                    if has_c:
+                                        _incremental_stats["alive_with_comments"] += 1
+                                    else:
+                                        _incremental_stats["alive_without_comments"] += 1
                                     new_checked.append({
                                         "username": u, "has_comments": has_c,
                                         "linked_chat": linked, "subscribers": subs, "title": title,
                                     })
+                                    # В ParsedChannel — только с комментами.
+                                    # Все проверенные (включая без комментов) уже
+                                    # лежат в TgstatCheckedChannel — UI парсинга
+                                    # читает оттуда через /aggregate?with_comments=false.
                                     if has_c:
                                         new_saved.append({
                                             "username": u, "title": title or "",
@@ -831,6 +951,11 @@ async def __run_body(
                     await _save_watcher_task
                 except Exception:
                     pass
+        except _StopStage2Sentinel:
+            # Ожидаемый выход — все Stage 1 кандидаты выпали в dedup.
+            # Warning уже был напечатан выше. Идём к финальному snapshot'у
+            # без ошибок.
+            pass
         except Exception as e:
             logger.exception("[web_scraper] Stage 2 failed")
             _publish_progress("error", {"error": f"stage2: {type(e).__name__}: {e}"})
@@ -866,6 +991,11 @@ async def __run_body(
                         if idx >= 0:
                             u = url[idx + len(marker):].split("/")[0].split("?")[0].lstrip("@")
                     if not u:
+                        continue
+                    # Пропускаем dead (404) — не сохраняем ни в
+                    # parsed_channels, ни в tgstat_checked_channels.
+                    if bool(data.get("is_dead")):
+                        stage2_summary["dead_channels"] = stage2_summary.get("dead_channels", 0) + 1
                         continue
                     has_c = bool(data.get("has_open_comments"))
                     checked_records.append({

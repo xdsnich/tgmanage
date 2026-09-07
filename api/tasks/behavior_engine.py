@@ -144,12 +144,49 @@ COMMENT_STYLE_PROFILES = [
 # ═══════════════════════════════════════════════════════════
 
 ACCOUNT_LIMITS = {
-    "max_comments_per_day": 4,
-    "max_comments_per_channel_day": 1,
-    "cooldown_after_comment_min": 120,    # минуты (1.5 часа)
-    "cooldown_after_comment_max": 340,   # минуты (4 часа)
+    # ── ДНЕВНОЙ ТАРГЕТ КОММЕНТОВ ────────────────────────────
+    # Не фикс, а РАСПРЕДЕЛЕНИЕ per (phone, date) — deterministic:
+    #   25% дней → 2-3 коммента
+    #   50% дней → 4-6 комментов
+    #   25% дней → 7 комментов
+    # Реализация в get_daily_target(phone, date). Разные дни у одного акка =
+    # разные значения → выглядит естественно, не машинный ритм.
+    # Значение ниже — только upper bound / fallback (если phone не передан).
+    "max_comments_per_day": 7,               # fallback / cap
+    "max_comments_per_channel_day": 2,
+    "cooldown_after_comment_min": 60,    # минуты (1 час)
+    "cooldown_after_comment_max": 180,   # минуты (3 часа)
     "min_account_age_days": 0,  # disabled — user manages warmup manually
 }
+
+
+def get_daily_target(phone: str, day) -> int:
+    """Deterministic таргет комментов на день:
+      *  5% → 0 или 1  (полу-rest день, минимум активности)
+      * 25% → 2 или 3
+      * 45% → 4, 5 или 6
+      * 25% → 7
+    Один и тот же (phone, day) всегда даёт один и тот же таргет.
+    """
+    if not phone:
+        return ACCOUNT_LIMITS["max_comments_per_day"]
+    if hasattr(day, "isoformat"):
+        day_str = day.isoformat()
+    else:
+        day_str = str(day)
+    seed = hashlib.md5(f"{phone}_{day_str}_daily".encode()).hexdigest()
+    # bucket: 0-99, определяет полосу
+    bucket = int(seed[:4], 16) % 100
+    # inner: определяет точное значение внутри полосы
+    inner = int(seed[4:8], 16)
+    if bucket < 5:
+        return inner % 2                # 0 или 1
+    elif bucket < 30:                   # 5..29 = 25%
+        return 2 + (inner % 2)          # 2 или 3
+    elif bucket < 75:                   # 30..74 = 45%
+        return 4 + (inner % 3)          # 4, 5 или 6
+    else:                               # 75..99 = 25%
+        return 7
 
 
 # ═══════════════════════════════════════════════════════════
@@ -254,9 +291,13 @@ async def get_or_create_behavior(db, account_id: int, phone: str):
     return behavior
 
 
-def check_account_can_comment(behavior, channel: str) -> tuple[bool, str]:
+def check_account_can_comment(behavior, channel: str, phone: str = None) -> tuple[bool, str]:
     """
     Проверяет лимиты аккаунта. Возвращает (can_comment, reason).
+
+    phone — опциональный, если передан → используется для расчёта
+    дневного таргета по распределению 25/50/25 (2-3 / 4-6 / 7).
+    Если не передан → fallback на статический ACCOUNT_LIMITS.
     """
     from datetime import datetime
 
@@ -269,14 +310,15 @@ def check_account_can_comment(behavior, channel: str) -> tuple[bool, str]:
         behavior.channels_commented_today = []
         behavior.day_reset_at = now
 
-    # Max comments per day
-    if behavior.comments_today >= limits["max_comments_per_day"]:
-        return False, f"Дневной лимит: {behavior.comments_today}/{limits['max_comments_per_day']}"
+    # Max comments per day — динамический таргет по (phone, date)
+    daily_target = get_daily_target(phone, now.date()) if phone else limits["max_comments_per_day"]
+    if behavior.comments_today >= daily_target:
+        return False, f"Дневной лимит: {behavior.comments_today}/{daily_target}"
 
     # Max per channel per day
     channels_today = behavior.channels_commented_today or []
-    if channel in channels_today:
-        return False, f"Уже комментировал @{channel} сегодня"
+    if channels_today.count(channel) >= limits["max_comments_per_channel_day"]:
+        return False, f"Уже {limits['max_comments_per_channel_day']}× комментировал @{channel} сегодня"
 
     # Cooldown
     if behavior.last_comment_at:

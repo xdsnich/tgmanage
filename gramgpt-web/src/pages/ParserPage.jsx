@@ -39,8 +39,19 @@ function CheckBanner({ icon, label, status, current, line, color, onStop, onDism
   )
 }
 
+// Сколько каналов берём с сервера за раз и сколько строк рисуем.
+// В базе десятки тысяч каналов: и запрос целиком, и отрисовка всех
+// разом вешали вкладку. Фильтры считаются по загруженному списку,
+// а остальное догружается по кнопке.
+const PAGE_SIZE = 300
+
 export default function ParserPage() {
   const [channels, setChannels] = useState([])
+  const [totalChannels, setTotalChannels] = useState(0)
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE)
+  // Счётчики по всей базе, а не по загруженной странице
+  const [dbStats, setDbStats] = useState(null)
+  const [loadingMore, setLoadingMore] = useState(false)
   const [accounts, setAccounts] = useState([])
   const [loading, setLoading] = useState(true)
   const [searching, setSearching] = useState(false)
@@ -50,15 +61,27 @@ export default function ParserPage() {
   const [folders, setFolders] = useState([])
   const [filterFolder, setFilterFolder] = useState('all')
   const [onlyWithComments, setOnlyWithComments] = useState(false)
+  const [onlyUnchecked, setOnlyUnchecked] = useState(false)
+  // 'subs' — крупные сверху, 'new' — свежие находки паутинки сверху
+  const [sortBy, setSortBy] = useState('subs')
   const [newFolderInput, setNewFolderInput] = useState(false)
   const [selectedChannels, setSelectedChannels] = useState([])
   const [folderModal, setFolderModal] = useState(false)
   const [folderName, setFolderName] = useState('')
 
   const [form, setForm] = useState({
-    account_id: null, keywords: '', min_subscribers: 1000, max_subscribers: 500000,
+    account_id: null,                       // legacy, single-mode
+    account_ids: [],                        // multi-mode — новый флоу
+    keywords: '', min_subscribers: 1000, max_subscribers: 500000,
     only_with_comments: true, active_hours: 48, source: 'telegram',
+    min_concurrency: 2, max_concurrency: 7, // случайная параллельность
   })
+  // Cooldowns на аккаунтах (после FloodWait). Показываем баджиком в списке.
+  const [accCooldowns, setAccCooldowns] = useState({})     // {acc_id: {seconds_left}}
+  // Multi-парсер state
+  const [multiJobId, setMultiJobId] = useLocalStorageState('parser_multi_job', null)
+  const [multiProgress, setMultiProgress] = useState(null)
+  const multiPollRef = useRef(null)
   const [importText, setImportText] = useState('')
 
   // Keyword geo-expansion
@@ -117,11 +140,19 @@ export default function ParserPage() {
   const [spiderSaving, setSpiderSaving]       = useState(false)
   const [spiderProgress, setSpiderProgress]   = useState(null)
   const [spiderForm, setSpiderForm]           = useState({
-    account_id: null, seeds: '', max_depth: 2, max_channels: 500,
+    account_id: null,               // legacy single
+    account_ids: [],                // multi
+    seeds: '', max_depth: 2, max_channels: 500,
     folder: '', pause_min: 8.0, pause_max: 15.0,
     stop_on_flood: true, flood_cooldown_sec: 300,
+    min_concurrency: 2, max_concurrency: 7,
+    only_with_comments: true,       // ← только каналы с комментами
   })
   const spiderPollRef = useRef(null)
+  // Multi-паутинка
+  const [spiderMultiJobId, setSpiderMultiJobId] = useLocalStorageState('spider_multi_job', null)
+  const [spiderMultiProgress, setSpiderMultiProgress] = useState(null)
+  const spiderMultiPollRef = useRef(null)
 
   // Check modal (verify_comments + alive_check)
   const [checkModal, setCheckModal]    = useState(false)
@@ -143,20 +174,71 @@ export default function ParserPage() {
 
   const showToast = (t, type = 'success') => { setToast({ text: t, type }); setTimeout(() => setToast(null), 3500) }
 
-  const load = async (silent = false) => {
+  // ── Загрузка страницами ───────────────────────────────────────
+  // Сервер отдаёт по PAGE_SIZE каналов. Раньше тянули все 35 тысяч на
+  // каждое открытие вкладки и на каждое автообновление раз в 15 секунд —
+  // страница висла, а свежие находки паутинки появлялись только после
+  // полной перезагрузки.
+  // Фильтры считает база, а не браузер: иначе «только непроверенные» на
+  // загруженной странице искали бы среди трёхсот каналов из тридцати пяти
+  // тысяч и показывали пусто.
+  const query = () => ({
+    ...(filterFolder !== 'all' ? { folder: filterFolder } : {}),
+    ...(onlyWithComments ? { only_with_comments: true } : {}),
+    ...(onlyUnchecked ? { only_unchecked: true } : {}),
+    ...(sortBy !== 'subs' ? { sort: sortBy } : {}),
+  })
+
+  const load = async (silent = false, reset = false) => {
     if (!silent) setLoading(true)
+    // Автообновление не должно отматывать список назад: если человек уже
+    // догрузил несколько страниц, обновляем ровно столько же строк.
+    // При смене фильтра, наоборот, начинаем с одной страницы.
+    const take = (silent && !reset)
+      ? Math.min(Math.max(channels.length, PAGE_SIZE), 5000)
+      : PAGE_SIZE
     try {
-      const [c, a, f] = await Promise.all([
-        parserAPI.list(), accountsAPI.list(),
+      const [c, a, f, st] = await Promise.all([
+        parserAPI.list({ ...query(), limit: take, offset: 0 }),
+        accountsAPI.list(),
         parserAPI.folders().catch(() => ({ data: [] })),
+        parserAPI.stats(filterFolder !== 'all' ? { folder: filterFolder } : {})
+          .catch(() => ({ data: null })),
       ])
-      setChannels(c.data); setAccounts(a.data.filter(acc => acc.status === 'active'))
+      setChannels(c.data)
+      if (st.data) setDbStats(st.data)
+      setTotalChannels(Number(c.headers?.['x-total-count'] ?? c.data.length))
+      setAccounts(a.data.filter(acc => acc.status === 'active'))
       setFolders(f.data || [])
     } catch { }
     if (!silent) setLoading(false)
   }
 
+  // Догрузить следующую страницу, не трогая уже показанное
+  const loadMore = async () => {
+    if (loadingMore) return
+    setLoadingMore(true)
+    try {
+      const c = await parserAPI.list({
+        ...query(), limit: PAGE_SIZE, offset: channels.length })
+      setChannels(prev => {
+        const seen = new Set(prev.map(x => x.id))
+        return [...prev, ...c.data.filter(x => !seen.has(x.id))]
+      })
+      setTotalChannels(Number(c.headers?.['x-total-count'] ?? 0))
+    } catch { }
+    setLoadingMore(false)
+  }
+
   useEffect(() => { load() }, [])
+  // Сменили фильтр — начинаем список заново с первой страницы.
+  // На первом рендере не дёргаем: там уже отработал эффект выше.
+  const firstRun = useRef(true)
+  useEffect(() => {
+    if (firstRun.current) { firstRun.current = false; return }
+    setVisibleCount(PAGE_SIZE)
+    load(true, true)
+  }, [filterFolder, onlyWithComments, onlyUnchecked, sortBy])
   useAutoRefresh(() => load(true), 15000)
 
   // ── Search progress polling ─────────────────────────────────
@@ -211,6 +293,113 @@ export default function ParserPage() {
     } catch { }
   }
 
+  // ── MULTI-парсинг polling ───────────────────────────────────
+  const loadMultiProgress = async (jobId) => {
+    if (!jobId) return 'idle'
+    try {
+      const { data } = await parserAPI.searchMultiProgress(jobId)
+      if (!data || data.status === 'idle') return 'idle'
+      setMultiProgress(data)
+      return data.status
+    } catch { return 'idle' }
+  }
+
+  const loadCooldowns = async () => {
+    try {
+      const { data } = await parserAPI.searchMultiCooldowns()
+      const map = {}
+      for (const row of data || []) {
+        map[row.account_id] = row
+      }
+      setAccCooldowns(map)
+    } catch { }
+  }
+
+  // На mount:
+  //   1) Читаем /multi/active — есть ли живые multi-задачи у юзера.
+  //      Даже если localStorage пустой, если бэк говорит running — авто-
+  //      подхватываем. Так задача переживает F5 в любом браузере.
+  //   2) Если LS был, но на бэке нет свежих running задач — чистим LS.
+  useEffect(() => {
+    (async () => {
+      let active = []
+      try {
+        const { data } = await parserAPI.searchMultiActive()
+        active = data.jobs || []
+      } catch {}
+      const running = active.find(j => j.status === 'running')
+      if (running) {
+        setMultiJobId(running.job_id)
+        loadMultiProgress(running.job_id)
+      } else if (multiJobId) {
+        // LS-джоб не running, но всё равно тянем чтобы показать final
+        // state (done/error/cancelled) если он свежий
+        const st = await loadMultiProgress(multiJobId)
+        if (st === 'idle') setMultiJobId(null)
+      }
+      loadCooldowns()
+    })()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    if (multiPollRef.current) clearInterval(multiPollRef.current)
+    if (multiProgress?.status === 'running' && multiJobId) {
+      multiPollRef.current = setInterval(async () => {
+        const st = await loadMultiProgress(multiJobId)
+        if (['done', 'idle', 'error', 'cancelled'].includes(st)) {
+          clearInterval(multiPollRef.current)
+          loadCooldowns()  // после done — обновляем cooldowns
+          load(true)       // подтянуть найденные каналы
+        }
+      }, 2500)
+    }
+    return () => { if (multiPollRef.current) clearInterval(multiPollRef.current) }
+  }, [multiProgress?.status, multiJobId])
+
+  const handleMultiStop = async () => {
+    if (!multiJobId) return
+    try {
+      await parserAPI.searchMultiStop(multiJobId)
+      setMultiProgress(p => p ? { ...p, status: 'cancelling' } : null)
+    } catch { }
+  }
+
+  const handleMultiForceReset = async () => {
+    if (!multiJobId) return
+    if (!confirm(
+      '🚨 Force-reset multi-парсера:\n\n' +
+      '  1. Убить celery-таск через revoke(terminate=True) — SIGTERM в воркер\n' +
+      '  2. Поставить cancel-флаг (второй пояс безопасности)\n' +
+      '  3. Пометить снапшот как error → UI перестанет крутить\n\n' +
+      'Продолжить?'
+    )) return
+    try {
+      const { data } = await parserAPI.searchMultiReset(multiJobId)
+      setMultiProgress(p => p ? {
+        ...p, status: 'error', stale: true,
+        error: `Force-reset юзером${data?.revoked ? ' (celery revoked)' : ''}`,
+      } : null)
+      showToast(`Force-reset ok${data?.revoked ? ' · celery убит' : ''}`, 'success')
+      // Немного подождём и обновим cooldowns/каналы
+      setTimeout(() => { loadCooldowns(); load(true) }, 1500)
+    } catch (err) {
+      showToast(err.response?.data?.detail || 'Force-reset не удался', 'error')
+    }
+  }
+
+  const handleMultiClose = () => {
+    setMultiJobId(null)
+    setMultiProgress(null)
+  }
+
+  const handleClearCooldown = async (accId) => {
+    try {
+      await parserAPI.searchMultiCooldownClear(accId)
+      await loadCooldowns()
+    } catch { }
+  }
+
   // ── Spider polling ──────────────────────────────────────────
   const loadSpiderProgress = async () => {
     try {
@@ -239,15 +428,53 @@ export default function ParserPage() {
   }, [spiderProgress?.status])
 
   const handleSpiderStart = async () => {
-    if (!spiderForm.account_id || !spiderForm.seeds.trim()) return
+    const useMulti = (spiderForm.account_ids || []).length > 0
+    if (!useMulti && !spiderForm.account_id) return
+    if (!spiderForm.seeds.trim()) return
     setSpiderSaving(true)
     try {
       const seeds = spiderForm.seeds.split('\n').map(s => s.trim().replace(/^@/, '')).filter(Boolean)
-      await parserAPI.similarStart({ ...spiderForm, seeds })
-      setSpiderModal(false)
-      showToast(`Паутинка запущена: ${seeds.length} стартовых каналов`)
-      await loadSpiderProgress()
-    } catch (err) { showToast(err.response?.data?.detail || 'Ошибка', 'error') }
+      if (useMulti) {
+        const payload = {
+          account_ids: spiderForm.account_ids,
+          seeds,
+          max_depth: spiderForm.max_depth,
+          max_channels: spiderForm.max_channels,
+          folder: spiderForm.folder || '',
+          pause_min: spiderForm.pause_min,
+          pause_max: spiderForm.pause_max,
+          min_concurrency: spiderForm.min_concurrency || 2,
+          max_concurrency: spiderForm.max_concurrency || 7,
+          only_with_comments: spiderForm.only_with_comments,
+        }
+        const { data } = await parserAPI.similarMultiStart(payload)
+        setSpiderMultiJobId(data.job_id)
+        setSpiderMultiProgress({ status: 'running', job_id: data.job_id, accounts: {} })
+        setSpiderModal(false)
+        showToast(`🕷 Multi-паутинка: ${data.accounts_scheduled} акк, ${seeds.length} seeds`)
+      } else {
+        await parserAPI.similarStart({ ...spiderForm, seeds })
+        setSpiderModal(false)
+        showToast(`Паутинка запущена: ${seeds.length} стартовых каналов`)
+        await loadSpiderProgress()
+      }
+    } catch (err) {
+      const status = err.response?.status
+      const detail = err.response?.data?.detail || 'Ошибка'
+      if (status === 409 && useMulti) {
+        // Уже идёт — подпишемся на прогресс
+        try {
+          const { data } = await parserAPI.similarMultiActive()
+          const running = (data.jobs || []).find(j => j.status === 'running')
+          if (running) {
+            setSpiderMultiJobId(running.job_id)
+            loadSpiderMultiProgress(running.job_id)
+          }
+        } catch {}
+      } else {
+        showToast(detail, 'error')
+      }
+    }
     setSpiderSaving(false)
   }
 
@@ -257,6 +484,71 @@ export default function ParserPage() {
       showToast('Паутинка остановлена')
       setTimeout(async () => { await loadSpiderProgress(); await load() }, 2000)
     } catch { }
+  }
+
+  // ── Multi-паутинка polling + persistence ──
+  const loadSpiderMultiProgress = async (jobId) => {
+    if (!jobId) return 'idle'
+    try {
+      const { data } = await parserAPI.similarMultiProgress(jobId)
+      if (!data || data.status === 'idle') return 'idle'
+      setSpiderMultiProgress(data)
+      return data.status
+    } catch { return 'idle' }
+  }
+  useEffect(() => {
+    (async () => {
+      let active = []
+      try {
+        const { data } = await parserAPI.similarMultiActive()
+        active = data.jobs || []
+      } catch {}
+      const running = active.find(j => j.status === 'running')
+      if (running) {
+        setSpiderMultiJobId(running.job_id)
+        loadSpiderMultiProgress(running.job_id)
+      } else if (spiderMultiJobId) {
+        const st = await loadSpiderMultiProgress(spiderMultiJobId)
+        if (st === 'idle') setSpiderMultiJobId(null)
+      }
+    })()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  useEffect(() => {
+    if (spiderMultiPollRef.current) clearInterval(spiderMultiPollRef.current)
+    if (spiderMultiProgress?.status === 'running' && spiderMultiJobId) {
+      spiderMultiPollRef.current = setInterval(async () => {
+        const st = await loadSpiderMultiProgress(spiderMultiJobId)
+        if (['done', 'idle', 'error', 'cancelled'].includes(st)) {
+          clearInterval(spiderMultiPollRef.current)
+          load(true)
+        }
+      }, 2500)
+    }
+    return () => { if (spiderMultiPollRef.current) clearInterval(spiderMultiPollRef.current) }
+  }, [spiderMultiProgress?.status, spiderMultiJobId])
+
+  const handleSpiderMultiStop = async () => {
+    if (!spiderMultiJobId) return
+    try {
+      await parserAPI.similarMultiStop(spiderMultiJobId)
+      setSpiderMultiProgress(p => p ? { ...p, status: 'cancelling' } : null)
+    } catch {}
+  }
+  const handleSpiderMultiForceReset = async () => {
+    if (!spiderMultiJobId) return
+    if (!confirm('🚨 Force-reset multi-паутинки?\n\nSIGTERM в celery-воркер + очистка Redis.')) return
+    try {
+      const { data } = await parserAPI.similarMultiReset(spiderMultiJobId)
+      setSpiderMultiProgress(p => p ? { ...p, status: 'error', stale: true, error: `Force-reset${data?.revoked ? ' (revoked)' : ''}` } : null)
+      showToast('Force-reset ok', 'success')
+    } catch (err) {
+      showToast(err.response?.data?.detail || 'Reset не удался', 'error')
+    }
+  }
+  const handleSpiderMultiClose = () => {
+    setSpiderMultiJobId(null)
+    setSpiderMultiProgress(null)
   }
 
   // ── Verify / Alive progress polling ──────────────────────────
@@ -344,11 +636,23 @@ export default function ParserPage() {
     } catch { showToast('Ошибка', 'error') }
   }
 
+
   const filteredChannels = channels.filter(c => {
     if (filterFolder !== 'all' && (c.folder || '') !== filterFolder) return false
-    if (onlyWithComments && !c.has_comments) return false
+    // «С комментариями» означает «можно писать», а не «есть обсуждение».
+    // Проверенный канал судим по вердикту, непроверенный — по старому флагу:
+    // он там кандидат и помечен в списке отдельно.
+    if (onlyWithComments) {
+      if (c.cap_commentable === false) return false
+      if (c.cap_commentable !== true && !c.has_comments) return false
+    }
+    if (onlyUnchecked && c.checked) return false
     return true
   })
+
+  // При смене фильтра начинаем показ заново — иначе после сужения выборки
+  // остался бы прокрученный хвост от прошлой.
+  useEffect(() => { setVisibleCount(PAGE_SIZE) }, [filterFolder, onlyWithComments, onlyUnchecked])
 
   const handleSetFolder = async (folder) => {
     if (!selectedChannels.length) return
@@ -369,7 +673,10 @@ export default function ParserPage() {
   }
 
   const handleSearch = async () => {
-    if (!form.account_id || !form.keywords.trim()) return
+    // Multi-режим: если выбрано >0 акков в чекбоксах.
+    const useMulti = (form.account_ids || []).length > 0
+    if (!useMulti && !form.account_id) return
+    if (!form.keywords.trim()) return
     setSearching(true)
     try {
       let searchForm = { ...form }
@@ -385,9 +692,28 @@ export default function ParserPage() {
         searchForm = { ...form, keywords: flat.join(', ') }
         setExpanding(false)
       }
-      await parserAPI.search(searchForm)
-      setSearchModal(false)
-      setTimeout(loadSearchProgress, 1000)
+      if (useMulti) {
+        // Multi-режим — random 2..7 воркеров, FloodWait→cooldown≥1час
+        const payload = {
+          account_ids: form.account_ids,
+          keywords: searchForm.keywords,
+          min_subscribers: searchForm.min_subscribers,
+          max_subscribers: searchForm.max_subscribers,
+          only_with_comments: searchForm.only_with_comments,
+          active_hours: searchForm.active_hours,
+          min_concurrency: searchForm.min_concurrency || 2,
+          max_concurrency: searchForm.max_concurrency || 7,
+        }
+        const { data } = await parserAPI.searchMulti(payload)
+        setMultiJobId(data.job_id)
+        setMultiProgress({ status: 'running', job_id: data.job_id, accounts: {} })
+        setSearchModal(false)
+        showToast(`🚀 Multi: ${data.accounts_scheduled} акк, ${data.keywords} ключей`)
+      } else {
+        await parserAPI.search(searchForm)
+        setSearchModal(false)
+        setTimeout(loadSearchProgress, 1000)
+      }
     } catch (err) {
       setExpanding(false)
       showToast(err.response?.data?.detail || 'Ошибка поиска', 'error')
@@ -403,6 +729,61 @@ export default function ParserPage() {
       showToast('CSV скачан')
     } catch { showToast('Ошибка экспорта', 'error') }
   }
+
+  // ── Универсальный экспорт с фильтрами ──
+  // filters: {folder?, only_with_comments?, min_subscribers?, max_subscribers?, format?}
+  // Опция silent — не тостить успех (для быстрых per-folder кнопок).
+  const doExport = async (filters, silent = false) => {
+    try {
+      const params = {}
+      if (filters.folder !== undefined) params.folder = filters.folder
+      if (filters.only_with_comments) params.only_with_comments = true
+      if (filters.min_subscribers) params.min_subscribers = filters.min_subscribers
+      if (filters.max_subscribers) params.max_subscribers = filters.max_subscribers
+      if (filters.min_pass_rate) params.min_pass_rate = filters.min_pass_rate
+      if (filters.no_skips) params.no_skips = true
+      if (filters.min_attempts) params.min_attempts = filters.min_attempts
+      params.format = filters.format || 'csv'
+      const resp = await parserAPI.exportChannels(params)
+      const count = resp.headers['x-records-count'] || '?'
+      // Достаём filename из Content-Disposition
+      const cd = resp.headers['content-disposition'] || ''
+      let filename = 'channels.csv'
+      const m1 = cd.match(/filename\*=UTF-8''([^;]+)/i)
+      const m2 = cd.match(/filename="?([^";]+)"?/i)
+      if (m1) filename = decodeURIComponent(m1[1])
+      else if (m2) filename = m2[1]
+      const url = window.URL.createObjectURL(new Blob([resp.data]))
+      const a = document.createElement('a'); a.href = url; a.download = filename; a.click()
+      window.URL.revokeObjectURL(url)
+      if (!silent) showToast(`💾 ${count} каналов → ${filename}`)
+    } catch (err) {
+      showToast(err.response?.data?.detail || 'Ошибка экспорта', 'error')
+    }
+  }
+
+  // Модалка «Скачать список»
+  const [exportModal, setExportModal] = useState(false)
+  const [exportForm, setExportForm] = useState({
+    source: 'parsed',             // parsed | tgstat_checked
+    folder: 'all',                // 'all' | '' (без папки) | название (только для parsed)
+    only_with_comments: false,
+    min_subscribers: 0,
+    min_pass_rate: 0,             // 0..100 % успешно прошедших комментов
+    no_skips: false,              // отбросить каналы где skipped_count > 0
+    min_attempts: 0,              // минимум N попыток чтобы статистика была значима
+    format: 'csv',                // csv | txt | txt_links
+  })
+  const [exportCounts, setExportCounts] = useState(null)  // {parsed: {total, with_comments}, tgstat_checked: {...}}
+
+  // Подгружаем счётчики при открытии модалки чтобы юзер сразу видел
+  // сколько в каждом источнике (Parsed: 555 с комм / TGStat: 1277 с комм).
+  useEffect(() => {
+    if (!exportModal) return
+    parserAPI.exportCounts()
+      .then(({ data }) => setExportCounts(data))
+      .catch(() => setExportCounts(null))
+  }, [exportModal])
 
   const handleImport = async () => {
     const list = importText.split('\n').map(s => s.trim()).filter(Boolean)
@@ -433,7 +814,7 @@ export default function ParserPage() {
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           <Button variant="ghost" onClick={() => setImportModal(true)}>📥 Импорт</Button>
-          <Button variant="ghost" onClick={handleExport} disabled={channels.length === 0}>📤 CSV</Button>
+          <Button variant="ghost" onClick={() => setExportModal(true)} disabled={channels.length === 0}>📤 Скачать</Button>
           <Button variant="outline" onClick={() => { setSpiderModal(true) }}
             style={spiderProgress?.status === 'running' ? { borderColor: 'rgba(0,194,178,0.5)', color: 'var(--teal)' } : {}}>
             🕷 Паутинка
@@ -475,7 +856,8 @@ export default function ParserPage() {
             outline: !onlyWithComments ? '2px solid rgba(124,77,255,0.5)' : 'none',
             outlineOffset: -2, borderRadius: 12,
           }}>
-            <StatCard label={`Каналов в базе${!onlyWithComments ? ' • активный' : ''}`} value={channels.length} icon="📢" />
+            <StatCard label={`Каналов в базе${!onlyWithComments ? ' • активный' : ''}`}
+              value={(dbStats?.total ?? channels.length).toLocaleString('ru')} icon="📢" />
           </div>
           <div onClick={() => setOnlyWithComments(true)} style={{
             cursor: 'pointer',
@@ -484,11 +866,33 @@ export default function ParserPage() {
           }} title="Кликни — показать только каналы с открытыми комментариями">
             <StatCard
               label={`С комментариями${onlyWithComments ? ' • активный' : ''}`}
-              value={channels.filter(c => c.has_comments).length}
+              value={(dbStats?.with_comments
+                      ?? channels.filter(c => c.has_comments).length).toLocaleString('ru')}
               color="var(--green)" icon="💬"
             />
           </div>
-          <StatCard label="Ср. подписчиков" value={channels.length > 0 ? Math.round(channels.reduce((s, c) => s + c.subscribers, 0) / channels.length).toLocaleString() : 0} color="var(--violet)" icon="👥" />
+          {/* Сколько каналов ещё не проверяли на комментарии (2026-08-24).
+              Раньше этого не было видно вовсе, и непроверенные молча
+              смешивались с проверенными-без-комментов. */}
+          <div
+            onClick={() => setOnlyUnchecked(v => !v)}
+            style={{
+              cursor: 'pointer',
+              outline: onlyUnchecked ? '2px solid rgba(255,170,0,0.9)' : 'none',
+              outlineOffset: -2, borderRadius: 12,
+            }} title="Кликни — показать только каналы, которые ещё не проверяли">
+            <StatCard
+              label={`Не проверено${onlyUnchecked ? ' • активный' : ''}`}
+              value={(dbStats?.unchecked
+                      ?? channels.filter(c => !c.checked).length).toLocaleString('ru')}
+              color="rgba(255,170,0,0.95)" icon="❓"
+            />
+          </div>
+          <StatCard label="Ср. подписчиков"
+            value={(dbStats?.avg_subscribers
+                    ?? (channels.length ? Math.round(channels.reduce((s, c) => s + c.subscribers, 0) / channels.length) : 0)
+                   ).toLocaleString('ru')}
+            color="var(--violet)" icon="👥" />
         </div>
       )}
 
@@ -560,6 +964,135 @@ export default function ParserPage() {
         </div>
       )}
 
+      {/* Multi-search progress banner */}
+      {multiProgress && multiProgress.status !== 'idle' && (
+        <div style={{
+          marginBottom: 10, padding: '12px 16px', borderRadius: 12,
+          background: multiProgress.status === 'running'
+            ? 'rgba(124,77,255,0.08)'
+            : multiProgress.status === 'done'
+            ? 'rgba(61,214,140,0.06)'
+            : 'rgba(248,81,73,0.06)',
+          border: `1px solid ${multiProgress.status === 'running' ? 'rgba(124,77,255,0.3)' : multiProgress.status === 'done' ? 'rgba(61,214,140,0.2)' : 'rgba(248,81,73,0.2)'}`,
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 15 }}>
+                {multiProgress.status === 'running' ? '🚀'
+                  : multiProgress.status === 'done' ? '✅'
+                  : multiProgress.status === 'cancelled' ? '⏹'
+                  : '❌'}
+              </span>
+              <span style={{ fontWeight: 700, fontSize: 13,
+                color: multiProgress.status === 'running' ? 'var(--violet)'
+                     : multiProgress.status === 'done' ? 'var(--green)'
+                     : 'var(--red)' }}>
+                Multi-парсинг
+                {multiProgress.concurrency
+                  ? ` · ${multiProgress.concurrency} воркер(ов) одновременно`
+                  : ''}
+              </span>
+              <span style={{ fontSize: 12, color: 'var(--text-3)' }}>
+                Найдено: <b>{multiProgress.found_total || 0}</b>
+                &nbsp;·&nbsp; В БД: <b>{multiProgress.saved_total || 0}</b>
+                &nbsp;·&nbsp; Акков: {multiProgress.total_accounts || 0}
+              </span>
+            </div>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              {multiProgress.status === 'running' && (
+                <>
+                  <Button variant="danger" size="sm" onClick={handleMultiStop}>⏹ Стоп</Button>
+                  <Button variant="danger" size="sm" onClick={handleMultiForceReset}
+                    style={{ background: '#7f1d1d', borderColor: '#dc2626' }}
+                    title="Убить celery-таск через SIGTERM + очистить Redis. Если обычный Стоп не сработал.">
+                    🚨 Force reset
+                  </Button>
+                </>
+              )}
+              {multiProgress.status !== 'running' && (
+                <button onClick={handleMultiClose} style={{ background: 'none', border: 'none', color: 'var(--text-3)', cursor: 'pointer', fontSize: 16 }}>✕</button>
+              )}
+            </div>
+          </div>
+
+          {/* Error message для error/stale */}
+          {(multiProgress.status === 'error' || multiProgress.stale) && (
+            <div style={{
+              marginBottom: 8, padding: '8px 10px', borderRadius: 6,
+              background: 'rgba(248,81,73,0.10)', border: '1px solid rgba(248,81,73,0.35)',
+              fontSize: 12, color: 'var(--red)',
+            }}>
+              {multiProgress.stale ? '⚠ Воркер умер — задача прервана. ' : ''}
+              {multiProgress.error || 'Ошибка выполнения. Запусти заново.'}
+            </div>
+          )}
+
+          {/* Per-account grid */}
+          {multiProgress.accounts && Object.keys(multiProgress.accounts).length > 0 && (
+            <div style={{
+              display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))',
+              gap: 6, marginTop: 6,
+            }}>
+              {Object.entries(multiProgress.accounts).map(([accId, acc]) => {
+                const icon = {
+                  queued: '⋯', running: '🔍', done: '✅',
+                  flooded: '⏰', cancelled: '⏹',
+                  not_authorized: '🚫', no_session: '🚫',
+                  connect_fail: '❌',
+                  busy_other: '🔒', yielded: '↪',
+                }[acc.status] || '·'
+                const color = {
+                  running: 'rgba(124,77,255,0.20)',
+                  done: 'rgba(61,214,140,0.15)',
+                  flooded: 'rgba(255,152,0,0.18)',
+                  cancelled: 'rgba(150,150,150,0.15)',
+                  busy_other: 'rgba(100,116,139,0.20)',
+                  yielded: 'rgba(100,116,139,0.20)',
+                }[acc.status] || 'rgba(255,255,255,0.04)'
+                return (
+                  <div key={accId} style={{
+                    padding: '6px 9px', borderRadius: 8,
+                    background: color, fontSize: 11,
+                    border: '1px solid rgba(255,255,255,0.05)',
+                  }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <span style={{ fontWeight: 600 }}>{icon} {acc.phone}</span>
+                      <span style={{ color: 'var(--text-3)' }}>
+                        {acc.saved || 0}/{acc.found || 0}
+                      </span>
+                    </div>
+                    <div style={{ color: 'var(--text-3)', fontSize: 10, marginTop: 2 }}>
+                      {acc.status === 'running' && acc.current_kw && (
+                        <>«{acc.current_kw}» · kw {acc.keywords_done}/{acc.keywords_total}</>
+                      )}
+                      {acc.status === 'flooded' && (
+                        <>⏰ Flood {acc.flood_wait}с → пауза ≥1ч</>
+                      )}
+                      {acc.status === 'queued' && (<>ждёт очереди · {acc.keywords_total} kw</>)}
+                      {acc.status === 'done' && (<>готово · {acc.keywords_done} kw обработано</>)}
+                      {acc.status === 'cancelled' && (<>остановлено</>)}
+                      {acc.status === 'not_authorized' && (<>не авторизован</>)}
+                      {acc.status === 'connect_fail' && (<>ошибка подключения</>)}
+                      {acc.status === 'busy_other' && (<>🔒 занят warmup/comment/refix</>)}
+                      {acc.status === 'yielded' && (<>↪ передан warmup/comment</>)}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+
+          {/* Skipped list */}
+          {Array.isArray(multiProgress.skipped) && multiProgress.skipped.length > 0 && (
+            <div style={{ marginTop: 8, fontSize: 10, color: 'var(--text-3)' }}>
+              Пропущено ({multiProgress.skipped.length}):{' '}
+              {multiProgress.skipped.slice(0, 5).map(s => `${s.phone || s.acc_id} (${s.reason})`).join(', ')}
+              {multiProgress.skipped.length > 5 ? '…' : ''}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Spider progress banner */}
       {spiderProgress && (
         <div style={{
@@ -601,6 +1134,132 @@ export default function ParserPage() {
         </div>
       )}
 
+      {/* Multi-паутинка progress banner */}
+      {spiderMultiProgress && spiderMultiProgress.status !== 'idle' && (
+        <div style={{
+          marginBottom: 16, padding: '12px 16px', borderRadius: 12,
+          background: spiderMultiProgress.status === 'running'
+            ? 'rgba(0,194,178,0.08)'
+            : spiderMultiProgress.status === 'done'
+            ? 'rgba(61,214,140,0.06)'
+            : 'rgba(248,81,73,0.06)',
+          border: `1px solid ${spiderMultiProgress.status === 'running' ? 'rgba(0,194,178,0.3)' : spiderMultiProgress.status === 'done' ? 'rgba(61,214,140,0.2)' : 'rgba(248,81,73,0.2)'}`,
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8, gap: 8, flexWrap: 'wrap' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 15 }}>
+                {spiderMultiProgress.status === 'running' ? '🕷'
+                  : spiderMultiProgress.status === 'done' ? '✅'
+                  : spiderMultiProgress.status === 'cancelled' ? '⏹'
+                  : '❌'}
+              </span>
+              <span style={{ fontWeight: 700, fontSize: 13,
+                color: spiderMultiProgress.status === 'running' ? '#00c2b2'
+                     : spiderMultiProgress.status === 'done' ? 'var(--green)'
+                     : 'var(--red)' }}>
+                Multi-паутинка
+                {spiderMultiProgress.concurrency
+                  ? ` · ${spiderMultiProgress.concurrency} воркер(ов) одновременно`
+                  : ''}
+              </span>
+              <span style={{ fontSize: 12, color: 'var(--text-3)' }}>
+                Найдено: <b>{spiderMultiProgress.found_total || 0}</b>
+                &nbsp;·&nbsp; В БД: <b>{spiderMultiProgress.saved_total || 0}</b>
+                &nbsp;·&nbsp; Очередь: {spiderMultiProgress.queue_size || 0}
+                &nbsp;·&nbsp; Акков: {spiderMultiProgress.total_accounts || 0}
+              </span>
+            </div>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              {spiderMultiProgress.status === 'running' && (
+                <>
+                  <Button variant="danger" size="sm" onClick={handleSpiderMultiStop}>⏹ Стоп</Button>
+                  <Button variant="danger" size="sm" onClick={handleSpiderMultiForceReset}
+                    style={{ background: '#7f1d1d', borderColor: '#dc2626' }}
+                    title="SIGTERM в celery + очистка Redis. Если Стоп не сработал.">
+                    🚨 Force reset
+                  </Button>
+                </>
+              )}
+              {spiderMultiProgress.status !== 'running' && (
+                <button onClick={handleSpiderMultiClose} style={{ background: 'none', border: 'none', color: 'var(--text-3)', cursor: 'pointer', fontSize: 16 }}>✕</button>
+              )}
+            </div>
+          </div>
+
+          {(spiderMultiProgress.status === 'error' || spiderMultiProgress.stale) && (
+            <div style={{
+              marginBottom: 8, padding: '8px 10px', borderRadius: 6,
+              background: 'rgba(248,81,73,0.10)', border: '1px solid rgba(248,81,73,0.35)',
+              fontSize: 12, color: 'var(--red)',
+            }}>
+              {spiderMultiProgress.stale ? '⚠ Воркер умер — задача прервана. ' : ''}
+              {spiderMultiProgress.error || 'Ошибка выполнения. Запусти заново.'}
+            </div>
+          )}
+
+          {/* Per-account grid */}
+          {spiderMultiProgress.accounts && Object.keys(spiderMultiProgress.accounts).length > 0 && (
+            <div style={{
+              display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))',
+              gap: 6, marginTop: 6,
+            }}>
+              {Object.entries(spiderMultiProgress.accounts).map(([accId, acc]) => {
+                const icon = {
+                  queued: '⋯', running: '🕷', done: '✅',
+                  flooded: '⏰', cancelled: '⏹',
+                  not_authorized: '🚫', no_session: '🚫',
+                  connect_fail: '❌',
+                  busy_other: '🔒', yielded: '↪',
+                }[acc.status] || '·'
+                const color = {
+                  running: 'rgba(0,194,178,0.18)',
+                  done: 'rgba(61,214,140,0.15)',
+                  flooded: 'rgba(255,152,0,0.18)',
+                  cancelled: 'rgba(150,150,150,0.15)',
+                  busy_other: 'rgba(100,116,139,0.20)',
+                  yielded: 'rgba(100,116,139,0.20)',
+                }[acc.status] || 'rgba(255,255,255,0.04)'
+                return (
+                  <div key={accId} style={{
+                    padding: '6px 9px', borderRadius: 8,
+                    background: color, fontSize: 11,
+                    border: '1px solid rgba(255,255,255,0.05)',
+                  }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <span style={{ fontWeight: 600 }}>{icon} {acc.phone}</span>
+                      <span style={{ color: 'var(--text-3)' }}>
+                        {acc.saved || 0}/{acc.found || 0}
+                      </span>
+                    </div>
+                    <div style={{ color: 'var(--text-3)', fontSize: 10, marginTop: 2 }}>
+                      {acc.status === 'running' && acc.current_seed && (
+                        <>@{acc.current_seed} · d{acc.depth} · очередь {acc.queue_size}</>
+                      )}
+                      {acc.status === 'flooded' && (<>⏰ Flood {acc.flood_wait}с → пауза ≥1ч</>)}
+                      {acc.status === 'queued' && (<>ждёт · {acc.seeds_total} seeds</>)}
+                      {acc.status === 'done' && (<>готово · {acc.seeds_done} seeds</>)}
+                      {acc.status === 'cancelled' && (<>остановлено</>)}
+                      {acc.status === 'not_authorized' && (<>не авторизован</>)}
+                      {acc.status === 'connect_fail' && (<>ошибка подключения</>)}
+                      {acc.status === 'busy_other' && (<>🔒 занят warmup/comment/refix</>)}
+                      {acc.status === 'yielded' && (<>↪ передан warmup/comment</>)}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+
+          {Array.isArray(spiderMultiProgress.skipped) && spiderMultiProgress.skipped.length > 0 && (
+            <div style={{ marginTop: 8, fontSize: 10, color: 'var(--text-3)' }}>
+              Пропущено ({spiderMultiProgress.skipped.length}):{' '}
+              {spiderMultiProgress.skipped.slice(0, 5).map(s => `${s.phone || s.acc_id} (${s.reason})`).join(', ')}
+              {spiderMultiProgress.skipped.length > 5 ? '…' : ''}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Verify progress banner */}
       {verifyProgress && (
         <CheckBanner
@@ -627,6 +1286,22 @@ export default function ParserPage() {
         <Empty icon="🔍" title="База каналов пуста" subtitle="Запустите поиск или импортируйте список" action={<Button variant="primary" onClick={() => setSearchModal(true)}>🔍 Поиск</Button>} />
       ) : (
         <>
+          {/* Порядок списка. По умолчанию крупные сверху, но паутинка
+              приносит каналы от 50 тысяч, а на первой странице по размеру
+              стоят от 420 тысяч — свежих находок так не увидеть. */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10 }}>
+            <span style={{ fontSize: 10, color: 'var(--text-3)', fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', minWidth: 60 }}>↕ Порядок</span>
+            {[['subs', 'Крупные сверху'], ['new', 'Свежие находки']].map(([v, label]) => (
+              <button key={v} onClick={() => setSortBy(v)} style={{
+                padding: '5px 12px', borderRadius: 20, cursor: 'pointer', fontSize: 11, transition: 'all 0.15s',
+                fontWeight: sortBy === v ? 600 : 400,
+                border: `1px solid ${sortBy === v ? 'rgba(124,77,255,0.4)' : 'var(--border)'}`,
+                background: sortBy === v ? 'rgba(124,77,255,0.15)' : 'transparent',
+                color: sortBy === v ? 'var(--violet)' : 'var(--text-3)',
+              }}>{label}</button>
+            ))}
+          </div>
+
           {/* Папки — чипы */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginBottom: 12 }}>
             <span style={{ fontSize: 10, color: 'var(--text-3)', fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase', minWidth: 60 }}>📁 Папки</span>
@@ -636,7 +1311,7 @@ export default function ParserPage() {
               border: `1px solid ${filterFolder === 'all' ? 'rgba(124,77,255,0.4)' : 'var(--border)'}`,
               background: filterFolder === 'all' ? 'rgba(124,77,255,0.15)' : 'transparent',
               color: filterFolder === 'all' ? 'var(--violet)' : 'var(--text-3)',
-            }}>Все ({channels.length})</button>
+            }}>Все ({(dbStats?.total ?? channels.length).toLocaleString('ru')})</button>
             <button onClick={() => setFilterFolder('')} style={{
               padding: '5px 12px', borderRadius: 20, cursor: 'pointer', fontSize: 11, transition: 'all 0.15s',
               fontWeight: filterFolder === '' ? 600 : 400,
@@ -645,13 +1320,34 @@ export default function ParserPage() {
               color: filterFolder === '' ? 'var(--yellow)' : 'var(--text-3)',
             }}>Без папки ({channels.filter(c => !c.folder).length})</button>
             {folders.map(f => (
-              <button key={f.name} onClick={() => setFilterFolder(filterFolder === f.name ? 'all' : f.name)} style={{
-                padding: '5px 12px', borderRadius: 20, cursor: 'pointer', fontSize: 11, transition: 'all 0.15s',
-                fontWeight: filterFolder === f.name ? 600 : 400,
+              <div key={f.name} style={{
+                display: 'inline-flex', alignItems: 'stretch',
+                borderRadius: 20, overflow: 'hidden',
                 border: `1px solid ${filterFolder === f.name ? 'rgba(124,77,255,0.4)' : 'var(--border)'}`,
-                background: filterFolder === f.name ? 'rgba(124,77,255,0.15)' : 'transparent',
-                color: filterFolder === f.name ? 'var(--violet)' : 'var(--text-3)',
-              }}>{f.name} ({f.count})</button>
+              }}>
+                <button onClick={() => setFilterFolder(filterFolder === f.name ? 'all' : f.name)} style={{
+                  padding: '5px 12px', cursor: 'pointer', fontSize: 11, transition: 'all 0.15s',
+                  fontWeight: filterFolder === f.name ? 600 : 400,
+                  border: 'none',
+                  background: filterFolder === f.name ? 'rgba(124,77,255,0.15)' : 'transparent',
+                  color: filterFolder === f.name ? 'var(--violet)' : 'var(--text-3)',
+                }}>{f.name} ({f.count})</button>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    setExportForm({
+                      folder: f.name, only_with_comments: false, min_subscribers: 0, format: 'csv',
+                    })
+                    setExportModal(true)
+                  }}
+                  title={`Скачать «${f.name}» (${f.count} каналов${f.with_comments ? `, ${f.with_comments} с комментами` : ''})`}
+                  style={{
+                    padding: '5px 8px', cursor: 'pointer', fontSize: 11,
+                    background: 'transparent', color: 'var(--text-3)',
+                    border: 'none', borderLeft: '1px solid var(--border)',
+                  }}
+                >📥</button>
+              </div>
             ))}
             {!newFolderInput ? (
               <button onClick={() => setNewFolderInput(true)} style={{
@@ -687,7 +1383,7 @@ export default function ParserPage() {
 
           {/* Channels list */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-            {filteredChannels.map(c => (
+            {filteredChannels.slice(0, visibleCount).map(c => (
               <Card key={c.id} style={{ padding: '10px 14px', borderLeft: selectedChannels.includes(c.id) ? '3px solid var(--violet)' : '3px solid transparent' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                   <input type="checkbox" checked={selectedChannels.includes(c.id)} onChange={() => toggleSelect(c.id)}
@@ -696,19 +1392,102 @@ export default function ParserPage() {
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 2 }}>
                       <span style={{ fontWeight: 700, fontSize: 13 }}>@{c.username}</span>
                       <span style={{ fontSize: 11, color: 'var(--text-3)' }}>{c.title}</span>
-                      {c.has_comments && <Badge color="green">💬</Badge>}
+                      {/* Статус проверки на комментарии (2026-08-24).
+                          Раньше был только зелёный значок при has_comments, и
+                          «не проверен» выглядел ровно как «проверен, комментов
+                          нет». Теперь три разных состояния. */}
+                      {!c.checked && (
+                        <span title="Канал ещё не проверяли на комментарии"
+                          style={{ fontSize: 10, padding: '1px 8px', borderRadius: 10,
+                            background: 'rgba(255,170,0,0.12)', color: 'rgba(255,170,0,0.95)',
+                            border: '1px solid rgba(255,170,0,0.3)', fontWeight: 600 }}>
+                          ❓ не проверен
+                        </span>
+                      )}
+                      {c.checked && c.cap_commentable === true && (
+                        <Badge color="green" title={c.cap_join_to_send
+                          ? 'Комментировать можно, но нужно вступить в обсуждение'
+                          : 'Комментировать можно сразу'}>
+                          💬{c.cap_join_to_send ? '↩' : ''}
+                        </Badge>
+                      )}
+                      {c.checked && c.cap_commentable === false && (
+                        <span title={`Комментировать нельзя: ${c.cap_reason}`}
+                          style={{ fontSize: 10, padding: '1px 8px', borderRadius: 10,
+                            background: 'rgba(255,80,80,0.10)', color: 'rgba(255,120,120,0.95)',
+                            border: '1px solid rgba(255,80,80,0.25)' }}>
+                          🚫 {{
+                            no_discussion: 'нет обсуждений',
+                            needs_approval: 'по заявке',
+                            write_banned: 'писать нельзя',
+                            username_not_found: 'канала нет',
+                          }[c.cap_reason] || c.cap_reason}
+                        </span>
+                      )}
+                      {/* Живучесть комментов (2026-08-27). Значок «можно
+                          комментировать» отвечает лишь на вопрос, пустят ли
+                          писать. Пустить могут, а через десять минут снять
+                          модерацией — и снаружи это выглядело одинаково.
+                          Показываем долю выживших там, где уже есть вердикт
+                          хотя бы по одному комменту. */}
+                      {c.survival_rate !== null && c.survival_rate !== undefined && (
+                        <span title={`Написано ${c.comments_written}, живы ${c.comments_alive}, удалено ${c.comments_deleted}`}
+                          style={{ fontSize: 10, padding: '1px 8px', borderRadius: 10, fontWeight: 600,
+                            background: c.survival_rate >= 80 ? 'rgba(61,214,140,0.12)'
+                                      : c.survival_rate >= 50 ? 'rgba(255,180,0,0.12)'
+                                      : 'rgba(248,81,73,0.12)',
+                            color: c.survival_rate >= 80 ? 'var(--green)'
+                                 : c.survival_rate >= 50 ? 'var(--yellow)' : 'var(--red)',
+                            border: `1px solid ${c.survival_rate >= 80 ? 'rgba(61,214,140,0.25)'
+                                              : c.survival_rate >= 50 ? 'rgba(255,180,0,0.25)'
+                                              : 'rgba(248,81,73,0.25)'}` }}>
+                          🌱 {Math.round(c.survival_rate)}%
+                          {c.comments_deleted > 0 ? ` (−${c.comments_deleted})` : ''}
+                        </span>
+                      )}
                       {c.folder && <span style={{ fontSize: 10, padding: '1px 8px', borderRadius: 10, background: 'rgba(124,77,255,0.1)', color: 'rgba(124,77,255,0.8)', border: '1px solid rgba(124,77,255,0.2)' }}>📁 {c.folder}</span>}
                     </div>
                     <div style={{ display: 'flex', gap: 14, fontSize: 10, color: 'var(--text-3)' }}>
                       <span>👥 {c.subscribers?.toLocaleString()}</span>
                       {c.last_post_date && <span>📅 {new Date(c.last_post_date).toLocaleDateString('ru')}</span>}
                       <span>🔍 {c.search_query}</span>
+                      {c.comments_written > 0 && <span>✍ написано {c.comments_written}</span>}
                     </div>
                   </div>
                   <button onClick={() => parserAPI.delete(c.id).then(load)} style={{ background: 'none', border: 'none', color: 'var(--red)', cursor: 'pointer', fontSize: 14 }}>✕</button>
                 </div>
               </Card>
             ))}
+
+            {filteredChannels.length <= visibleCount && channels.length < totalChannels && (
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center',
+                            gap: 12, padding: '14px 0' }}>
+                <span style={{ fontSize: 12, color: 'var(--text-3)' }}>
+                  загружено {channels.length.toLocaleString('ru')} из {totalChannels.toLocaleString('ru')}
+                </span>
+                <Button size="sm" variant="ghost" disabled={loadingMore}
+                  onClick={async () => { await loadMore(); setVisibleCount(v => v + PAGE_SIZE) }}>
+                  {loadingMore ? 'Гружу…' : `Загрузить ещё ${PAGE_SIZE}`}
+                </Button>
+              </div>
+            )}
+
+            {filteredChannels.length > visibleCount && (
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center',
+                            gap: 12, padding: '14px 0' }}>
+                <span style={{ fontSize: 12, color: 'var(--text-3)' }}>
+                  показано {visibleCount} из {filteredChannels.length.toLocaleString('ru')}
+                </span>
+                <Button size="sm" variant="ghost"
+                  onClick={() => setVisibleCount(v => v + PAGE_SIZE)}>
+                  Показать ещё {PAGE_SIZE}
+                </Button>
+                <Button size="sm" variant="ghost"
+                  onClick={() => setVisibleCount(filteredChannels.length)}>
+                  Показать все
+                </Button>
+              </div>
+            )}
           </div>
         </>
       ))}
@@ -734,8 +1513,22 @@ export default function ParserPage() {
                 <option value="last_ban">По последнему бану</option>
               </select>
             </div>
-            <div style={{ alignSelf: 'flex-end' }}>
+            <div style={{ alignSelf: 'flex-end', display: 'flex', gap: 6 }}>
               <Button variant="ghost" size="sm" onClick={() => loadWhitelist()}>↺ Обновить</Button>
+              <Button variant="danger" size="sm" onClick={async () => {
+                if (!window.confirm(
+                  '🗑 Очистить ВСЮ проходимость?\n\n' +
+                  'Удалятся все ChannelBanStats — все текущие показатели pass_rate ' +
+                  'обнулятся. Полезно если данные там нерелевантные ' +
+                  '(старые прогоны без auto-verify).\n\n' +
+                  'После очистки: следующий раз verify-механизм начнёт считать с нуля.'
+                )) return
+                try {
+                  const { data } = await parserAPI.whitelistWipe()
+                  showToast(`Очищено ${data.deleted} записей`)
+                  loadWhitelist()
+                } catch (err) { showToast(err.response?.data?.detail || 'Ошибка', 'error') }
+              }}>🗑 Очистить всё</Button>
             </div>
           </div>
 
@@ -761,9 +1554,15 @@ export default function ParserPage() {
                             border: `1px solid ${pct >= 70 ? 'rgba(61,214,140,0.25)' : pct >= 40 ? 'rgba(255,180,0,0.25)' : 'rgba(248,81,73,0.25)'}`,
                           }}>{pct}%</span>
                         </div>
-                        <div style={{ display: 'flex', gap: 16, fontSize: 11, color: 'var(--text-3)' }}>
-                          <span>✅ Успешно: {ch.total_attempts - ch.banned_count}</span>
-                          <span>🚫 Баны: {ch.banned_count}</span>
+                        <div style={{ display: 'flex', gap: 16, fontSize: 11, color: 'var(--text-3)', flexWrap: 'wrap' }}>
+                          <span>✅ Успешно: {ch.total_attempts - (ch.banned_count || 0) - (ch.skipped_count || 0)}</span>
+                          <span>🚫 Баны: {ch.banned_count || 0}</span>
+                          {(ch.skipped_count || 0) > 0 && (
+                            <span title={ch.last_skip_reason || ''} style={{ color: 'var(--yellow)' }}>
+                              ⏭ Скипы: {ch.skipped_count}
+                              {ch.last_skip_reason ? ` (${ch.last_skip_reason})` : ''}
+                            </span>
+                          )}
                           <span>📊 Всего: {ch.total_attempts}</span>
                           {ch.last_ban_reason && <span>💬 {ch.last_ban_reason}</span>}
                         </div>
@@ -829,11 +1628,68 @@ export default function ParserPage() {
       <Modal open={searchModal} onClose={() => setSearchModal(false)} title="Поиск каналов" width={560}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
           <div>
-            <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Аккаунт для поиска</label>
-            <select value={form.account_id || ''} onChange={e => setForm(f => ({ ...f, account_id: parseInt(e.target.value) }))} style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 14, outline: 'none' }}>
-              <option value="">Выберите</option>
-              {accounts.map(a => <option key={a.id} value={a.id}>{a.first_name || a.phone}</option>)}
-            </select>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 6 }}>
+              <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+                Аккаунты · выбрано {form.account_ids.length}/{accounts.length}
+              </label>
+              <div style={{ display: 'flex', gap: 8, fontSize: 11 }}>
+                <button type="button" onClick={() => {
+                  const notCd = accounts.filter(a => !accCooldowns[a.id]).map(a => a.id)
+                  setForm(f => ({ ...f, account_ids: notCd }))
+                }} style={{ background: 'none', border: 'none', color: 'var(--violet)', cursor: 'pointer', textDecoration: 'underline' }}>все ✓</button>
+                <button type="button" onClick={() => setForm(f => ({ ...f, account_ids: [] }))} style={{ background: 'none', border: 'none', color: 'var(--text-3)', cursor: 'pointer', textDecoration: 'underline' }}>сброс</button>
+              </div>
+            </div>
+            <div style={{
+              maxHeight: 200, overflowY: 'auto',
+              padding: 6, borderRadius: 10, border: '1px solid var(--border)',
+              background: 'var(--bg-3)',
+              display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 4,
+            }}>
+              {accounts.length === 0 && (
+                <div style={{ padding: 10, fontSize: 12, color: 'var(--text-3)', textAlign: 'center' }}>Нет активных аккаунтов</div>
+              )}
+              {accounts.map(a => {
+                const on = form.account_ids.includes(a.id)
+                const cd = accCooldowns[a.id]
+                const cdMin = cd ? Math.ceil(cd.seconds_left / 60) : 0
+                return (
+                  <label key={a.id} style={{
+                    display: 'flex', alignItems: 'center', gap: 6, padding: '5px 8px',
+                    borderRadius: 6, cursor: cd ? 'default' : 'pointer',
+                    background: on ? 'rgba(124,77,255,0.15)' : 'transparent',
+                    border: `1px solid ${on ? 'rgba(124,77,255,0.35)' : 'transparent'}`,
+                    fontSize: 12,
+                    opacity: cd ? 0.55 : 1,
+                  }}>
+                    <input type="checkbox" checked={on} disabled={!!cd}
+                      onChange={e => setForm(f => ({
+                        ...f,
+                        account_ids: e.target.checked
+                          ? [...f.account_ids, a.id]
+                          : f.account_ids.filter(x => x !== a.id),
+                      }))}
+                      style={{ accentColor: 'var(--violet)' }} />
+                    <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {a.first_name || a.phone}
+                    </span>
+                    {cd && (
+                      <span title={`FloodWait cooldown — ещё ${cdMin} мин`}
+                        style={{ fontSize: 10, color: 'var(--orange, #ff9800)', cursor: 'pointer' }}
+                        onClick={(e) => { e.preventDefault(); handleClearCooldown(a.id) }}
+                      >
+                        ⏰ {cdMin}м
+                      </span>
+                    )}
+                  </label>
+                )
+              })}
+            </div>
+            <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 4 }}>
+              💡 Multi-режим: случайно 2–7 акков одновременно (по разным прокси).
+              При FloodWait акк уходит на перекур ≥1 час без ретраев.
+              Клик на «⏰ Nм» — сброс cooldown вручную.
+            </div>
           </div>
 
           <Input label="Ключевые слова (через запятую)" value={form.keywords} onChange={e => setForm(f => ({ ...f, keywords: e.target.value }))} placeholder="криптовалюта, крипта, блокчейн" />
@@ -999,8 +1855,16 @@ export default function ParserPage() {
 
           <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
             <Button variant="ghost" onClick={() => setSearchModal(false)}>Закрыть</Button>
-            <Button variant="primary" loading={searching} disabled={!form.account_id || !form.keywords.trim()} onClick={handleSearch}>
-              {expanding ? '🌐 Расширяю...' : searching ? 'Запускаю...' : geoExpand && selectedGeos.length > 0 ? '🌐 Расширить и найти' : '🔍 Запустить поиск'}
+            <Button variant="primary" loading={searching}
+              disabled={(form.account_ids.length === 0) || !form.keywords.trim()}
+              onClick={handleSearch}>
+              {expanding
+                ? '🌐 Расширяю...'
+                : searching
+                  ? 'Запускаю...'
+                  : geoExpand && selectedGeos.length > 0
+                    ? `🌐 Расширить и найти · ${form.account_ids.length} акк`
+                    : `🔍 Multi-парсинг · ${form.account_ids.length} акк`}
             </Button>
           </div>
         </div>
@@ -1015,11 +1879,65 @@ export default function ParserPage() {
           </div>
 
           <div>
-            <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Аккаунт</label>
-            <select value={spiderForm.account_id || ''} onChange={e => setSpiderForm(f => ({ ...f, account_id: parseInt(e.target.value) }))} style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 14, outline: 'none' }}>
-              <option value="">Выберите аккаунт</option>
-              {accounts.map(a => <option key={a.id} value={a.id}>{a.first_name || a.phone}</option>)}
-            </select>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 6 }}>
+              <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+                Аккаунты · выбрано {spiderForm.account_ids.length}/{accounts.length}
+              </label>
+              <div style={{ display: 'flex', gap: 8, fontSize: 11 }}>
+                <button type="button" onClick={() => {
+                  const notCd = accounts.filter(a => !accCooldowns[a.id]).map(a => a.id)
+                  setSpiderForm(f => ({ ...f, account_ids: notCd }))
+                }} style={{ background: 'none', border: 'none', color: 'var(--teal, #00c2b2)', cursor: 'pointer', textDecoration: 'underline' }}>все ✓</button>
+                <button type="button" onClick={() => setSpiderForm(f => ({ ...f, account_ids: [] }))} style={{ background: 'none', border: 'none', color: 'var(--text-3)', cursor: 'pointer', textDecoration: 'underline' }}>сброс</button>
+              </div>
+            </div>
+            <div style={{
+              maxHeight: 180, overflowY: 'auto',
+              padding: 6, borderRadius: 10, border: '1px solid var(--border)',
+              background: 'var(--bg-3)',
+              display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 4,
+            }}>
+              {accounts.length === 0 && (
+                <div style={{ padding: 10, fontSize: 12, color: 'var(--text-3)', textAlign: 'center' }}>Нет активных аккаунтов</div>
+              )}
+              {accounts.map(a => {
+                const on = spiderForm.account_ids.includes(a.id)
+                const cd = accCooldowns[a.id]
+                const cdMin = cd ? Math.ceil(cd.seconds_left / 60) : 0
+                return (
+                  <label key={a.id} style={{
+                    display: 'flex', alignItems: 'center', gap: 6, padding: '5px 8px',
+                    borderRadius: 6, cursor: cd ? 'default' : 'pointer',
+                    background: on ? 'rgba(0,194,178,0.15)' : 'transparent',
+                    border: `1px solid ${on ? 'rgba(0,194,178,0.35)' : 'transparent'}`,
+                    fontSize: 12, opacity: cd ? 0.55 : 1,
+                  }}>
+                    <input type="checkbox" checked={on} disabled={!!cd}
+                      onChange={e => setSpiderForm(f => ({
+                        ...f,
+                        account_ids: e.target.checked
+                          ? [...f.account_ids, a.id]
+                          : f.account_ids.filter(x => x !== a.id),
+                      }))}
+                      style={{ accentColor: 'var(--teal, #00c2b2)' }} />
+                    <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {a.first_name || a.phone}
+                    </span>
+                    {cd && (
+                      <span title={`Cooldown ещё ${cdMin} мин`}
+                        style={{ fontSize: 10, color: 'var(--orange, #ff9800)', cursor: 'pointer' }}
+                        onClick={(e) => { e.preventDefault(); handleClearCooldown(a.id) }}
+                      >⏰ {cdMin}м</span>
+                    )}
+                  </label>
+                )
+              })}
+            </div>
+            <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 4 }}>
+              💡 Multi-режим: случайно 2–7 акков одновременно (по разным прокси).
+              Общий Redis SET дедупа — акки не парсят одинаковые каналы.
+              FloodWait → cooldown ≥1ч без ретраев.
+            </div>
           </div>
 
           <div>
@@ -1094,6 +2012,13 @@ export default function ParserPage() {
                 onChange={e => setSpiderForm(f => ({ ...f, pause_max: parseFloat(e.target.value) || 0 }))} />
             </div>
             <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', fontSize: 12, color: 'var(--text-2)' }}>
+              <input type="checkbox" checked={spiderForm.only_with_comments}
+                onChange={e => setSpiderForm(f => ({ ...f, only_with_comments: e.target.checked }))}
+                style={{ width: 16, height: 16, accentColor: '#00c2b2' }} />
+              <span><b>💬 Только каналы с комментариями</b> (Precise-check через GetFullChannel во время crawl'а — +1 запрос TG на кандидата, но сохраняем сразу правильный флаг)</span>
+            </label>
+
+            <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', fontSize: 12, color: 'var(--text-2)' }}>
               <input type="checkbox" checked={spiderForm.stop_on_flood}
                 onChange={e => setSpiderForm(f => ({ ...f, stop_on_flood: e.target.checked }))}
                 style={{ width: 16, height: 16, accentColor: 'var(--violet)' }} />
@@ -1110,11 +2035,11 @@ export default function ParserPage() {
             <Button
               variant="primary"
               loading={spiderSaving}
-              disabled={!spiderForm.account_id || !spiderForm.seeds.trim()}
+              disabled={spiderForm.account_ids.length === 0 || !spiderForm.seeds.trim()}
               onClick={handleSpiderStart}
               style={{ background: '#00c2b2' }}
             >
-              🕷 Запустить
+              🕷 Multi-паутинка · {spiderForm.account_ids.length} акк
             </Button>
           </div>
         </div>
@@ -1254,6 +2179,176 @@ export default function ParserPage() {
       </Modal>
 
       {/* Import Modal */}
+      <Modal open={exportModal} onClose={() => setExportModal(false)} title="📤 Скачать каналы" width={520}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+          {/* Источник */}
+          <div>
+            <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Источник</label>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+              {[
+                {
+                  key: 'parsed',
+                  label: '📁 База (parsed)',
+                  desc: exportCounts
+                    ? `${exportCounts.parsed.with_comments} с комм / ${exportCounts.parsed.total}`
+                    : 'ParsedChannel',
+                },
+                {
+                  key: 'tgstat_checked',
+                  label: '🌐 TGStat (checked)',
+                  desc: exportCounts
+                    ? `${exportCounts.tgstat_checked.with_comments} с комм / ${exportCounts.tgstat_checked.total}`
+                    : 'TgstatCheckedChannel',
+                },
+              ].map(opt => {
+                const on = exportForm.source === opt.key
+                return (
+                  <button key={opt.key} onClick={() => setExportForm(f => ({ ...f, source: opt.key }))} style={{
+                    padding: '10px 12px', borderRadius: 10, cursor: 'pointer',
+                    fontSize: 12, fontWeight: on ? 700 : 500,
+                    background: on ? 'rgba(124,77,255,0.15)' : 'var(--bg-3)',
+                    border: `1px solid ${on ? 'rgba(124,77,255,0.4)' : 'var(--border)'}`,
+                    color: on ? 'var(--violet)' : 'var(--text-2)',
+                    display: 'flex', flexDirection: 'column', gap: 3, textAlign: 'left',
+                  }}>
+                    <div>{opt.label}</div>
+                    <div style={{ fontSize: 10, opacity: 0.75, fontWeight: 400 }}>{opt.desc}</div>
+                  </button>
+                )
+              })}
+            </div>
+            <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 4 }}>
+              💡 <b>База</b> — то что осело в ParsedChannel (уникальные найденные).
+              &nbsp;<b>TGStat checked</b> — ВСЁ что web-скрейпер проверил на TGStat
+              (включая каналы которые не попали в базу из-за дедупа).
+            </div>
+          </div>
+
+          {/* Папка (только для parsed) */}
+          {exportForm.source === 'parsed' && (
+            <div>
+              <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Папка</label>
+              <select value={exportForm.folder}
+                onChange={e => setExportForm(f => ({ ...f, folder: e.target.value }))}
+                style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 14, outline: 'none' }}>
+                <option value="all">Все каналы ({channels.length})</option>
+                <option value="">Без папки ({channels.filter(c => !c.folder).length})</option>
+                {folders.map(f => (
+                  <option key={f.name} value={f.name}>
+                    {f.name} ({f.count}{f.with_comments ? ` · ${f.with_comments} с комм` : ''})
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {/* Формат */}
+          <div>
+            <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Формат</label>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 6 }}>
+              {[
+                { key: 'csv', label: '📊 CSV', desc: 'Все колонки' },
+                { key: 'txt', label: '📝 TXT @', desc: '@usernames' },
+                { key: 'txt_links', label: '🔗 TXT ссылки', desc: 't.me/xxx' },
+              ].map(opt => {
+                const on = exportForm.format === opt.key
+                return (
+                  <button key={opt.key} onClick={() => setExportForm(f => ({ ...f, format: opt.key }))} style={{
+                    padding: '10px 8px', borderRadius: 10, cursor: 'pointer',
+                    fontSize: 12, fontWeight: on ? 700 : 500,
+                    background: on ? 'rgba(124,77,255,0.15)' : 'var(--bg-3)',
+                    border: `1px solid ${on ? 'rgba(124,77,255,0.4)' : 'var(--border)'}`,
+                    color: on ? 'var(--violet)' : 'var(--text-2)',
+                    display: 'flex', flexDirection: 'column', gap: 2,
+                  }}>
+                    <div>{opt.label}</div>
+                    <div style={{ fontSize: 10, opacity: 0.7, fontWeight: 400 }}>{opt.desc}</div>
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+
+          {/* Только с комментариями */}
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, cursor: 'pointer' }}>
+            <input type="checkbox" checked={exportForm.only_with_comments}
+              onChange={e => setExportForm(f => ({ ...f, only_with_comments: e.target.checked }))}
+              style={{ accentColor: 'var(--violet)' }} />
+            💬 Только с открытыми комментариями
+          </label>
+
+          {/* Мин. подписчиков */}
+          <div>
+            <label style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 600, letterSpacing: '0.08em', textTransform: 'uppercase', display: 'block', marginBottom: 6 }}>Мин. подписчиков (0 = без фильтра)</label>
+            <input type="number" value={exportForm.min_subscribers}
+              onChange={e => setExportForm(f => ({ ...f, min_subscribers: parseInt(e.target.value) || 0 }))}
+              style={{ width: '100%', padding: '10px 14px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 10, color: 'var(--text)', fontSize: 14, outline: 'none' }} />
+          </div>
+
+          {/* ── Фильтр по проходимости из ChannelBanStats ── */}
+          <div style={{ padding: 12, background: 'rgba(0,194,178,0.06)', border: '1px solid rgba(0,194,178,0.15)', borderRadius: 10, display: 'flex', flexDirection: 'column', gap: 10 }}>
+            <div style={{ fontSize: 11, color: 'var(--green)', fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+              📊 Фильтр по проходимости (кампании комментов)
+            </div>
+
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+              <div>
+                <label style={{ fontSize: 10, color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>Мин. процент прохождения</label>
+                <input type="number" min={0} max={100} value={exportForm.min_pass_rate}
+                  onChange={e => setExportForm(f => ({ ...f, min_pass_rate: parseFloat(e.target.value) || 0 }))}
+                  placeholder="0..100"
+                  style={{ width: '100%', padding: '8px 10px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 13, outline: 'none' }} />
+              </div>
+              <div>
+                <label style={{ fontSize: 10, color: 'var(--text-3)', display: 'block', marginBottom: 4 }}>Мин. попыток (0 = любые)</label>
+                <input type="number" min={0} value={exportForm.min_attempts}
+                  onChange={e => setExportForm(f => ({ ...f, min_attempts: parseInt(e.target.value) || 0 }))}
+                  placeholder="напр. 3"
+                  style={{ width: '100%', padding: '8px 10px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', fontSize: 13, outline: 'none' }} />
+              </div>
+            </div>
+
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, cursor: 'pointer' }}>
+              <input type="checkbox" checked={exportForm.no_skips}
+                onChange={e => setExportForm(f => ({ ...f, no_skips: e.target.checked }))}
+                style={{ accentColor: 'var(--green)' }} />
+              ✅ Только каналы БЕЗ скипов (skipped_count=0)
+            </label>
+
+            <div style={{ fontSize: 10, color: 'var(--text-3)', lineHeight: 1.5 }}>
+              💡 Ставь <b>100%</b> + <b>мин. попыток 3+</b> чтобы получить каналы где все 3+ комментов прошли без банов и скипов.
+              Каналы без статистики (не участвовали в кампаниях) фильтруются <b>только</b> если задан min_attempts или min_pass_rate.
+            </div>
+          </div>
+
+          <div style={{ padding: '8px 12px', background: 'rgba(139,92,246,0.06)', borderLeft: '3px solid rgba(139,92,246,0.3)', borderRadius: 6, fontSize: 11, color: 'var(--text-3)', lineHeight: 1.5 }}>
+            💡 <b>CSV</b> — для Excel/базы. <b>TXT</b> — @username по одному на строку (готово к вставке в кампанию комментинга).
+            <b> TXT ссылки</b> — t.me/xxx (для открытия в Telegram).
+          </div>
+
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+            <Button variant="ghost" onClick={() => setExportModal(false)}>Отмена</Button>
+            <Button variant="primary" onClick={async () => {
+              const f = {
+                source: exportForm.source,
+                format: exportForm.format,
+                only_with_comments: exportForm.only_with_comments,
+                min_subscribers: exportForm.min_subscribers || undefined,
+                min_pass_rate: exportForm.min_pass_rate || undefined,
+                no_skips: exportForm.no_skips || undefined,
+                min_attempts: exportForm.min_attempts || undefined,
+              }
+              // folder — только для source=parsed. Для tgstat_checked папок нет.
+              if (exportForm.source === 'parsed' && exportForm.folder !== 'all') {
+                f.folder = exportForm.folder
+              }
+              await doExport(f)
+              setExportModal(false)
+            }}>💾 Скачать</Button>
+          </div>
+        </div>
+      </Modal>
+
       <Modal open={importModal} onClose={() => setImportModal(false)} title="Импорт каналов" width={480}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
           <div style={{ padding: '10px 14px', background: 'rgba(124,77,255,0.06)', border: '1px solid rgba(124,77,255,0.15)', borderRadius: 10, fontSize: 12, color: 'var(--text-2)', lineHeight: 1.6 }}>

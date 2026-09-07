@@ -18,6 +18,7 @@ scraper.py — Главный orchestrator WebScraper.
     persistence, прогресс и отмену.
 """
 
+from urllib.parse import urlparse
 import asyncio
 import logging
 import random
@@ -121,11 +122,11 @@ class WebScraper:
         camoufox_kwargs: Optional[dict] = None,
         page_locale: str = "en-US",
         # ── Выбор движка браузера ─────────────────────────────
-        # camoufox — patched Firefox с fresh context на каждый URL (текущий дефолт).
         # cloak    — CloakBrowser с persistent-профилем на каждый прокси.
         #            Cookies и fingerprint сохраняются между запусками —
-        #            WAF видит "вернувшегося юзера", не первый визит.
-        engine: Literal["camoufox", "cloak"] = "camoufox",
+        #            WAF видит "вернувшегося юзера", не первый визит. Дефолт.
+        # camoufox — patched Firefox с fresh context на каждый URL (fallback).
+        engine: Literal["camoufox", "cloak"] = "cloak",
         cloak_kwargs: Optional[dict] = None,
         profiles_dir: Optional[str | Path] = None,
         # ── Рандомизация "человеческого" поведения ────────────
@@ -143,6 +144,14 @@ class WebScraper:
         # Реальный юзер полистал → задержался ещё немного → ушёл.
         post_read_tail_min_sec: float = 0.0,
         post_read_tail_max_sec: float = 15.0,
+        # Warmup URL: если задан, при ПЕРВОМ успешном визите на каждом
+        # узле сначала открываем warmup_url (обычно homepage / listing) —
+        # получаем __cf_bm и прочие Cloudflare-cookie как реальный юзер
+        # с органического входа. Потом основной URL идёт без CF-challenge.
+        # None = warmup выключен (для Stage 1 / sitemap не нужно).
+        warmup_url: Optional[str] = None,
+        warmup_min_sec: float = 5.0,
+        warmup_max_sec: float = 12.0,
     ):
         if max_workers > 4:
             logger.warning(
@@ -166,6 +175,9 @@ class WebScraper:
         self.break_max_sec = float(break_max_sec)
         self.post_read_tail_min_sec = float(post_read_tail_min_sec)
         self.post_read_tail_max_sec = float(post_read_tail_max_sec)
+        self.warmup_url = warmup_url
+        self.warmup_min_sec = float(warmup_min_sec)
+        self.warmup_max_sec = float(warmup_max_sec)
 
         self.rotator = NodeRotator(
             proxies=proxies,
@@ -202,10 +214,36 @@ class WebScraper:
         self._browser_crash_count: int = 0
         self._browser_healthy: bool = True
         self._restart_lock = asyncio.Lock()
-        # Circuit breaker: если N consecutive fails — форс-cancel
-        # чтобы не пожечь весь пул прокси на бесполезных retry.
+        # Circuit breaker с двумя фазами (SOFT-PAUSE, потом FORCE-STOP):
+        # 1. При N consecutive fails → SOFT PAUSE (3-5 мин).
+        #    Все воркеры замирают, прокси-пул отдыхает. Внешнее событие
+        #    (прокси-провайдер моргнул, TGStat WAF массовый) — обычно
+        #    восстанавливается за минуту.
+        # 2. Если после pause СНОВА 20 fails подряд — FORCE STOP.
+        #    Значит либо пул реально мёртв, либо мы забанены.
         self._consecutive_fails: int = 0
         self._max_consecutive_fails: int = 20
+
+        # ── Предохранитель НА КАЖДЫЙ ДОМЕН ────────────────────────────
+        # Общий счётчик выше не различает, откуда идут отказы. Инцидент
+        # 26.08: tgstat.ru отвечал 403 на все 35 запросов, а tgstat.com с
+        # тех же узлов давал 35 успехов из 35. Каждый 403 уводил прокси в
+        # остывание на 15-20 минут, и один домен выжег весь пул из 36 узлов
+        # — девять оставшихся страновых поддоменов так и не были пройдены,
+        # задача встала на no_available_node.
+        # Теперь домен, который ни разу не ответил успехом и набрал
+        # HOST_FAIL_LIMIT отказов, признаётся мёртвым: его ссылки
+        # пропускаются мгновенно, без обращения к прокси.
+        self._host_fails: dict[str, int] = {}
+        self._host_ok: dict[str, int] = {}
+        self._dead_hosts: set[str] = set()
+        self._host_fail_limit: int = int(os.getenv("SCRAPER_HOST_FAIL_LIMIT", "5"))
+        # Soft-pause параметры
+        self._pause_min_sec: float = 180.0   # 3 мин
+        self._pause_max_sec: float = 300.0   # 5 мин
+        self._pauses_taken: int = 0
+        self._max_pauses: int = 2            # 3-й раз = force-stop
+        self._soft_pause_until: float = 0.0
         self._force_stop: bool = False
         # Оборачиваем внешний cancel_check чтобы также реагировать на
         # circuit breaker
@@ -364,11 +402,29 @@ class WebScraper:
             if self.cancel_check():
                 logger.info(f"[worker-{worker_id}] отмена")
                 return
+            # Проверка soft-pause: если circuit breaker включил паузу,
+            # ждём пока не истечёт. Каждые 5 сек проверяем cancel/pause.
+            if self._soft_pause_until > time.time():
+                remaining = int(self._soft_pause_until - time.time())
+                if remaining % 30 == 0 or remaining < 10:
+                    # логируем не чаще раза в 30 сек
+                    logger.debug(
+                        f"[worker-{worker_id}] soft-pause: ещё {remaining}с"
+                    )
+                await asyncio.sleep(min(5.0, remaining))
+                continue
             try:
                 url = await asyncio.wait_for(queue.get(), timeout=2.0)
             except asyncio.TimeoutError:
                 # Очередь пустая — но run() может ещё положить (нет в нашем
                 # случае, но архитектурно поддерживаем). Просто продолжаем.
+                continue
+
+            _host = urlparse(url).netloc
+            if _host in self._dead_hosts:
+                # Домен уже признан мёртвым — не тратим ни прокси, ни попытку.
+                self.stats.failed += 1
+                queue.task_done()
                 continue
 
             async with self._in_flight_lock:
@@ -379,19 +435,53 @@ class WebScraper:
                 if result.success:
                     self.stats.ok += 1
                     self._consecutive_fails = 0
+                    self._host_ok[_host] = self._host_ok.get(_host, 0) + 1
                 else:
                     self.stats.failed += 1
                     self._consecutive_fails += 1
-                    # Circuit breaker: 20 подряд failed → TGStat нас
-                    # либо забанил, либо прокси-пул мёртв. Смысла жечь
-                    # оставшиеся URL нет — форсим завершение.
-                    if self._consecutive_fails >= self._max_consecutive_fails:
+                    self._host_fails[_host] = self._host_fails.get(_host, 0) + 1
+                    if (self._host_ok.get(_host, 0) == 0
+                            and self._host_fails[_host] >= self._host_fail_limit):
+                        self._dead_hosts.add(_host)
                         logger.error(
-                            f"[worker-{worker_id}] 🛑 circuit breaker: "
-                            f"{self._consecutive_fails} fails подряд — "
-                            f"остальные URL пропускаем"
+                            f"[scraper] 🚫 домен {_host} признан мёртвым: "
+                            f"{self._host_fails[_host]} отказов, ни одного успеха. "
+                            f"Остальные его ссылки пропускаются, пул прокси не тратится."
                         )
-                        self._force_stop = True
+                    # Circuit breaker: 20 подряд failed → пробуем
+                    # SOFT PAUSE (3-5 мин, прокси-пул отдыхает).
+                    # После pause сбрасываем счётчик, воркеры продолжают.
+                    # Если после N-й pause снова 20 fails — force-stop
+                    # (значит пул реально мёртв, не транзиентная гроза).
+                    if self._consecutive_fails >= self._max_consecutive_fails:
+                        if self._pauses_taken < self._max_pauses:
+                            pause_sec = random.uniform(
+                                self._pause_min_sec, self._pause_max_sec
+                            )
+                            self._pauses_taken += 1
+                            self._soft_pause_until = time.time() + pause_sec
+                            # Аналитика состояния пула для лога
+                            rot = self.rotator.stats()
+                            logger.warning(
+                                f"[worker-{worker_id}] 🟡 SOFT PAUSE #{self._pauses_taken}/"
+                                f"{self._max_pauses}: {self._consecutive_fails} fails подряд. "
+                                f"Проксии: avail={rot.get('available',0)} cd={rot.get('in_cooldown',0)} "
+                                f"burned={rot.get('burned',0)} busy={rot.get('busy',0)}. "
+                                f"Пауза {int(pause_sec)}с, потом продолжим. "
+                                f"Обычно это транзиентный сбой прокси-провайдера."
+                            )
+                            # Сбрасываем счётчик fail'ов — после pause
+                            # начнём с чистого листа
+                            self._consecutive_fails = 0
+                        else:
+                            logger.error(
+                                f"[worker-{worker_id}] 🛑 FORCE STOP: "
+                                f"{self._max_pauses} pause-циклов не помогли, "
+                                f"прокси-пул мёртв или мы забанены. "
+                                f"Job cancelled — checkpoint сохранён, "
+                                f"новый прогон продолжит с этого места."
+                            )
+                            self._force_stop = True
 
                 # Запись в JSONL — атомарно под локом checkpoint'а
                 await self.checkpoint.save({
@@ -506,6 +596,38 @@ class WebScraper:
                         # момент после открытия page чтобы инициализировать
                         # JS-environment под fingerprint.
                         await micro_pause(0.5, 2.0)
+
+                        # ── Warmup: первый визит на узле → homepage сначала.
+                        # Cloudflare выдаёт __cf_bm при первой навигации;
+                        # если сразу идти на /channel/@X без него, WAF
+                        # score выше → 403. Homepage считается низкорисковой
+                        # (SEO-краулеры её посещают миллион раз), проходит
+                        # без challenge и оставляет cookie для основного URL.
+                        # Триггер: node.successes == 0 (свежий на эту сессию)
+                        # и warmup_url задан.
+                        if self.warmup_url and node.successes == 0:
+                            try:
+                                logger.debug(
+                                    f"[worker-{worker_id}] warmup {self.warmup_url} "
+                                    f"на свежем узле {proxy_label}"
+                                )
+                                await page.goto(
+                                    self.warmup_url,
+                                    wait_until="domcontentloaded",
+                                    timeout=int(self.page_timeout_sec * 1000),
+                                )
+                                # Читаем страницу как реальный юзер, копим cookie
+                                await micro_pause(
+                                    self.warmup_min_sec, self.warmup_max_sec
+                                )
+                            except Exception as _wu_e:
+                                # Warmup упал — не критично, идём дальше
+                                # без него. Основной запрос покажет реальную
+                                # проблему.
+                                logger.debug(
+                                    f"[worker-{worker_id}] warmup упал "
+                                    f"({type(_wu_e).__name__}), идём напрямую"
+                                )
 
                         response = await page.goto(
                             url,

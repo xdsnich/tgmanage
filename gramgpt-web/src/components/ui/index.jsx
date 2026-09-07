@@ -1,5 +1,7 @@
 // JetBrains-style UI components
 
+import { useEffect } from 'react'
+
 export function Button({ children, variant = 'primary', size = 'md', loading, disabled, onClick, type = 'button', style }) {
   const base = {
     display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
@@ -161,15 +163,33 @@ export function Empty({ icon, title, subtitle, action }) {
 }
 
 export function Modal({ open = true, onClose, title, children, width = 480 }) {
+  // Закрытие ТОЛЬКО:
+  //   1) клик по крестику ✕
+  //   2) нажатие Escape
+  //
+  // РАНЬШЕ: клик по бэкдропу закрывал модалку. Проблема: юзер выделяет текст
+  // ВНУТРИ модалки, отпускает мышь ЗА границей — браузер триггерит click
+  // на бэкдропе (mousedown внутри, mouseup снаружи → click на общем предке
+  // = backdrop) → модалка закрывалась, вся форма пропадала.
+  // Решение: не вешаем onClick на бэкдроп совсем.
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e) => {
+      if (e.key === 'Escape') onClose?.()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open, onClose])
+
   if (!open) return null
   return (
-    <div onClick={onClose} style={{
+    <div style={{
       position: 'fixed', inset: 0, zIndex: 200,
       background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(8px)',
       display: 'flex', alignItems: 'center', justifyContent: 'center',
       padding: 24, animation: 'fadeIn 0.15s ease',
     }}>
-      <div onClick={e => e.stopPropagation()} style={{
+      <div style={{
         background: 'var(--bg-2)', border: '1px solid var(--border)',
         borderRadius: 'var(--radius)', width: '100%', maxWidth: width,
         maxHeight: 'calc(100vh - 48px)',
@@ -179,7 +199,7 @@ export function Modal({ open = true, onClose, title, children, width = 480 }) {
       }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '18px 24px', borderBottom: '1px solid var(--border)', flexShrink: 0 }}>
           <h3 style={{ fontSize: 15, fontWeight: 700, letterSpacing: '-0.02em' }}>{title}</h3>
-          <button onClick={onClose} style={{
+          <button onClick={onClose} title="Закрыть (Esc)" style={{
             background: 'rgba(255,255,255,0.06)', border: 'none', color: 'var(--text-3)',
             width: 28, height: 28, borderRadius: 6, cursor: 'pointer', fontSize: 14,
             display: 'flex', alignItems: 'center', justifyContent: 'center',

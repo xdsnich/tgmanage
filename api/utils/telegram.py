@@ -14,6 +14,7 @@ GramGPT API — utils/telegram.py
 """
 
 from pathlib import Path
+import os
 import hashlib
 import logging
 
@@ -315,6 +316,55 @@ DEVICE_PROFILES = (
 # ГЛАВНАЯ ФУНКЦИЯ — make_telethon_client
 # ═══════════════════════════════════════════════════════════
 
+# ── Перехватчик здоровья аккаунта ───────────────────────────
+_HEALTH_CLIENT_CLS = None
+
+
+def _get_health_client_cls():
+    """Ленивая сборка подкласса TelegramClient, который сам сообщает о
+    претензиях Telegram в utils.account_health.
+
+    Почему на уровне клиента, а не в каждой задаче: аккаунты подключают
+    17 разных тасков, а здоровье кормили только три — plan_executor,
+    channel_probe и bulk_channel_check. Остальные (парсеры, подписки,
+    прогрев, comment_executor, leomatch, backfill) ловили FLOOD_WAIT
+    собственным except, писали строку в лог и продолжали работать.
+    Инцидент 2026-08-24: acc#51 получил FLOOD_WAIT на 62278с (17 часов)
+    и через 36 секунд ушёл в следующий запрос.
+
+    Через `__call__` проходят ВСЕ RPC-запросы Telethon, включая те, что
+    делают внутри себя send_message/get_entity/join — одна точка на всё.
+    Поведение запроса не меняется: исключение пробрасывается дальше как
+    раньше, добавляется только запись в счётчик здоровья. Решение о том,
+    наказывать ли аккаунт, целиком за record_error — наши внутренние
+    поломки и проблемы каналов туда не проходят.
+    """
+    global _HEALTH_CLIENT_CLS
+    if _HEALTH_CLIENT_CLS is not None:
+        return _HEALTH_CLIENT_CLS
+
+    from telethon import TelegramClient
+
+    class _HealthAwareClient(TelegramClient):
+        gramgpt_account_id = None
+
+        async def __call__(self, *args, **kwargs):
+            try:
+                return await super().__call__(*args, **kwargs)
+            except Exception as e:
+                acc_id = getattr(self, "gramgpt_account_id", None)
+                if acc_id:
+                    try:
+                        from utils.account_health import record_error
+                        record_error(acc_id, type(e).__name__, e)
+                    except Exception:
+                        pass
+                raise
+
+    _HEALTH_CLIENT_CLS = _HealthAwareClient
+    return _HEALTH_CLIENT_CLS
+
+
 def make_telethon_client(
     account,
     proxy_row=None,
@@ -422,7 +472,11 @@ def make_telethon_client(
             account.device_fingerprint = fp_string
             logger.info(f"📱 Fingerprint сохранён: {device} / {system} / lang={lang_code} (platform={used_platform})")
 
-    return TelegramClient(
+    _acc_id = getattr(account, "id", None)
+    if _acc_id is None and isinstance(account, dict):
+        _acc_id = account.get("id")
+
+    client = _get_health_client_cls()(
         session_path, used_api_id, used_api_hash,
         proxy=tg_proxy,
         device_model=device,
@@ -431,7 +485,22 @@ def make_telethon_client(
         lang_code=lang_code,
         system_lang_code=system_lang_code,
         timeout=30,
+        # ── Anti-burst: не долбим 5 раз подряд ─────────────────
+        # По умолчанию Telethon retries=5, что генерит "Connection
+        # to Telegram failed 5 time(s)" и 5 подряд конектов с одного
+        # IP → TG может воспринять как burst и забанить IP/акк.
+        #
+        # 2026-08-26: одна попытка оказалась другой крайностью. Замер за
+        # сутки — 83 сорванных сессии, каждая пятая: любой сетевой заик
+        # через прокси сразу убивал сессию, и слот подключения сгорал.
+        # При этом прокси исправны — прямой тест дал 3/3 на всех, задержка
+        # 420-730мс. Две попытки с паузой 30с burst'ом не выглядят.
+        connection_retries=int(os.getenv("TG_CONNECTION_RETRIES", "2")),
+        retry_delay=30,
+        request_retries=1,
     )
+    client.gramgpt_account_id = _acc_id
+    return client
 
 
 # ═══════════════════════════════════════════════════════════

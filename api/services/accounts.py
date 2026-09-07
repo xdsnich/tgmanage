@@ -70,7 +70,10 @@ async def get_accounts(db: AsyncSession, user_id: int) -> list[TelegramAccount]:
 
 async def get_account(db: AsyncSession, account_id: int, user_id: int) -> TelegramAccount:
     result = await db.execute(
-        select(TelegramAccount).options(joinedload(TelegramAccount.api_app)).where(
+        select(TelegramAccount).options(
+            joinedload(TelegramAccount.api_app),
+            joinedload(TelegramAccount.proxy),
+        ).where(
             TelegramAccount.id == account_id,
             TelegramAccount.user_id == user_id
         )
@@ -78,6 +81,12 @@ async def get_account(db: AsyncSession, account_id: int, user_id: int) -> Telegr
     account = result.scalar_one_or_none()
     if not account:
         raise HTTPException(status_code=404, detail="Аккаунт не найден")
+    # Прокидываем гео прокси в flat-поля для AccountOut (как в get_accounts)
+    p = account.proxy
+    account.proxy_country      = p.country if p else None
+    account.proxy_country_code = p.country_code if p else None
+    account.proxy_city         = p.city if p else None
+    account.proxy_host         = f"{p.host}:{p.port}" if p else None
     return account
 
 

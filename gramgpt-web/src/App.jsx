@@ -19,6 +19,7 @@ import SettingsPage from './pages/SettingsPage'
 import { Spinner } from './components/ui'
 import ApiKeysPage from './pages/ApiKeysPage'
 import ReactionsPage from './pages/ReactionsPage'
+import LeomatchPage from './pages/LeomatchPage'
 
 // Защищённый роут — редиректит на /login если не авторизован
 function PrivateRoute({ children }) {
@@ -64,6 +65,7 @@ export default function App() {
               <Route path="/api-keys" element={<ApiKeysPage />} />
               <Route path="*" element={<Navigate to="/" replace />} />
               <Route path="/reactions" element={<ReactionsPage />} />
+              <Route path="/leomatch" element={<LeomatchPage />} />
             </Routes>
           </Layout>
         </PrivateRoute>

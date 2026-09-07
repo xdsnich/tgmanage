@@ -113,11 +113,27 @@ async def _process_campaign(c, db):
         logger.info(f"[{c.name}] Нет доступных аккаунтов")
         return
 
+    # check_only: заранее вытаскиваем каналы где мы УЖЕ комментили
+    # (по CommentLog за всё время этой кампании) — их нужно пропустить,
+    # каждый канал получает ровно ОДИН коммент от нашей кампании.
+    _is_check_only = getattr(c, "campaign_type", "regular") == "check_only"
+    _already_commented_ch: set[str] = set()
+    if _is_check_only:
+        from models.campaign import CommentLog as _CL2
+        _cl_r = await db.execute(
+            select(_CL2.channel_username).where(_CL2.campaign_id == c.id).distinct()
+        )
+        _already_commented_ch = {r[0] for r in _cl_r.all() if r[0]}
+
     # Проверяем каналы
     for channel in channels:
         if c.comments_sent >= c.max_comments:
             break
         if not channel.username:
+            continue
+
+        # check_only: пропускаем каналы где уже писали (1 коммент/канал)
+        if _is_check_only and channel.username in _already_commented_ch:
             continue
 
         logger.info(f"[{c.name}] [WEB] @{channel.username} (last={channel.last_post_id})")
@@ -156,8 +172,8 @@ async def _process_campaign(c, db):
             if not acc or not behavior:
                 continue
 
-            # Проверка лимитов
-            can_comment, limit_reason = check_account_can_comment(behavior, channel.username)
+            # Проверка лимитов (phone → динамический таргет 2-7 из get_daily_target)
+            can_comment, limit_reason = check_account_can_comment(behavior, channel.username, phone=acc.phone)
             if not can_comment:
                 logger.info(f"[{c.name}] Аккаунт {acc.phone}: {limit_reason}")
                 continue
@@ -177,6 +193,38 @@ async def _process_campaign(c, db):
 
         delay_seconds = get_comment_delay(timing)
         scheduled_at = datetime.utcnow() + timedelta(seconds=delay_seconds)
+
+        # ── NIGHT BOOST ─────────────────────────────────────
+        # По умолчанию scheduled_at попадает в +5мин..+2ч от момента поста.
+        # Целевые каналы почти не постят ночью → комментинг днём кучкой.
+        # Юзер просил ~2 ночных сессии + 1 дневная. Реализация:
+        #   С 30% шансом сдвигаем scheduled_at в ближайшее ночное окно
+        #   01:00-05:00 UTC+3 (= 22:00-02:00 UTC). Это даёт ~1/3 ночных,
+        #   что примерно соответствует "2 ночных из 5-6 сессий в сутки".
+        # Cooldown 60-180 мин проверяется в comment_executor при взятии из
+        # queue — если акк комментил час назад, ночная задача подождёт.
+        import random as _r
+        if _r.random() < 0.30:
+            now_utc = datetime.utcnow()
+            now_local = now_utc + timedelta(hours=3)   # UTC+3
+            night_h = _r.randint(1, 4)                  # 01..04 local
+            night_m = _r.randint(0, 59)
+            # Если сейчас уже после 05:00 local — ночь = завтра
+            if now_local.hour >= 5:
+                night_local = (now_local + timedelta(days=1)).replace(
+                    hour=night_h, minute=night_m, second=0, microsecond=0
+                )
+            else:
+                night_local = now_local.replace(
+                    hour=night_h, minute=night_m, second=0, microsecond=0
+                )
+            # +- 15 мин jitter чтобы не было ровно на минуте
+            night_local += timedelta(minutes=_r.randint(-15, 15))
+            scheduled_at = night_local - timedelta(hours=3)  # обратно UTC
+            logger.info(
+                f"[{c.name}] 🌙 Night-boost: @{channel.username} #{post.post_id} "
+                f"сдвинут на {(scheduled_at + timedelta(hours=3)).strftime('%H:%M')} local"
+            )
 
         # Проверяем дубликат в очереди
         existing_q = await db.execute(

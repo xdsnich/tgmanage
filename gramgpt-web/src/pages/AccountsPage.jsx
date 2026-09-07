@@ -20,7 +20,32 @@ export default function AccountsPage() {
   const [search, setSearch] = useState('')
 
   // ── Multi-select (bulk operations) ────────────────────────
-  const [selectedIds, setSelectedIds] = useState(() => new Set())
+  // Персистим в localStorage — если юзер случайно кликнул на строку
+  // (а не по чекбоксу) и провалился в детали акка, при возврате
+  // назад выбор восстановится, не придётся выбирать заново.
+  const SELECTED_LS = 'accounts_selected_ids'
+  const [selectedIds, setSelectedIdsRaw] = useState(() => {
+    try {
+      const raw = localStorage.getItem(SELECTED_LS)
+      if (!raw) return new Set()
+      const arr = JSON.parse(raw)
+      if (!Array.isArray(arr)) return new Set()
+      return new Set(arr.filter(x => typeof x === 'number'))
+    } catch { return new Set() }
+  })
+  const setSelectedIds = (updater) => {
+    setSelectedIdsRaw(prev => {
+      const next = typeof updater === 'function' ? updater(prev) : updater
+      try {
+        if (next && next.size > 0) {
+          localStorage.setItem(SELECTED_LS, JSON.stringify([...next]))
+        } else {
+          localStorage.removeItem(SELECTED_LS)
+        }
+      } catch {}
+      return next
+    })
+  }
   const [bulkMediaModal, setBulkMediaModal] = useState(false)
   const [bulkMediaFiles, setBulkMediaFiles] = useState([])
   const [bulkUploading, setBulkUploading] = useState(false)
@@ -77,6 +102,640 @@ export default function AccountsPage() {
   const [checkProgress, setCheckProgress] = useState(null) // {current, total, taskId}
   const [checking, setChecking] = useState(false)
   const [checkResults, setCheckResults] = useState(null)   // {summary, results[]}
+
+  // ── Bulk «Подготовка» (аватарки + имена + канал, разнесённо во времени) ──
+  const [prepModal, setPrepModal] = useState(false)
+  const [prepChangeAvatars, setPrepChangeAvatars] = useState(false)
+  const [prepAvatarFiles, setPrepAvatarFiles] = useState([])
+  const [prepDragOver, setPrepDragOver] = useState(false)
+  const [prepDeletePrevProfileAvatar, setPrepDeletePrevProfileAvatar] = useState(false)
+  const [prepChangeNames, setPrepChangeNames] = useState(false)
+  const [prepNamesText, setPrepNamesText] = useState('')
+  // Каналы
+  const [prepCreateChannels, setPrepCreateChannels] = useState(false)
+  const [prepChTitles, setPrepChTitles] = useState('')
+  const [prepChDescriptions, setPrepChDescriptions] = useState('')
+  const [prepChFirstPost, setPrepChFirstPost] = useState('')
+  const [prepChPin, setPrepChPin] = useState(true)
+  // Публичный канал (с @username) + пул кандидатов
+  const [prepChPublic, setPrepChPublic] = useState(false)
+  const [prepChUsernames, setPrepChUsernames] = useState('')
+  const [prepChAvatarFiles, setPrepChAvatarFiles] = useState([])
+  const [prepChDragOver, setPrepChDragOver] = useState(false)
+  const [prepDeletePrevChannelAvatar, setPrepDeletePrevChannelAvatar] = useState(false)
+  const [prepChPostPhotoFiles, setPrepChPostPhotoFiles] = useState([])
+  const [prepChPostDragOver, setPrepChPostDragOver] = useState(false)
+  // Ручное распределение постов по акк-id (не рандомно).
+  // Формат: { [acc_id]: { text: "...", photoFile: File | null } }
+  const [prepChCustomPostsEnabled, setPrepChCustomPostsEnabled] = useState(false)
+  const [prepChCustomPosts, setPrepChCustomPosts] = useState({})
+  const prepChFileInputRef = useRef(null)
+  const prepChPostFileInputRef = useRef(null)
+  // Общее
+  const [prepMinDelay, setPrepMinDelay] = useState(60)
+  const [prepMaxDelay, setPrepMaxDelay] = useState(180)
+  const [prepMode, setPrepMode] = useState('fast')  // 'fast' | 'plan'
+  const [prepDurationHours, setPrepDurationHours] = useState(0.5)
+  const [prepSessionsPerAcc, setPrepSessionsPerAcc] = useState(3)
+  const [prepRecommend, setPrepRecommend] = useState(null)
+  const [prepStarting, setPrepStarting] = useState(false)
+  // Персистентность настроек модалки — чтобы при случайной ошибке
+  // или перезагрузке страницы не терять форму. Файлы (File) не
+  // сериализуются, поэтому не персистятся. Остальное — да.
+  const PREP_FORM_LS = 'prep_form_state_v1'
+  const prepFormLoadedRef = useRef(false)
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(PREP_FORM_LS)
+      if (raw) {
+        const s = JSON.parse(raw)
+        if (typeof s.prepChangeAvatars === 'boolean') setPrepChangeAvatars(s.prepChangeAvatars)
+        if (typeof s.prepDeletePrevProfileAvatar === 'boolean') setPrepDeletePrevProfileAvatar(s.prepDeletePrevProfileAvatar)
+        if (typeof s.prepChangeNames === 'boolean') setPrepChangeNames(s.prepChangeNames)
+        if (typeof s.prepNamesText === 'string') setPrepNamesText(s.prepNamesText)
+        if (typeof s.prepCreateChannels === 'boolean') setPrepCreateChannels(s.prepCreateChannels)
+        if (typeof s.prepChTitles === 'string') setPrepChTitles(s.prepChTitles)
+        if (typeof s.prepChDescriptions === 'string') setPrepChDescriptions(s.prepChDescriptions)
+        if (typeof s.prepChFirstPost === 'string') setPrepChFirstPost(s.prepChFirstPost)
+        if (typeof s.prepChPin === 'boolean') setPrepChPin(s.prepChPin)
+        if (typeof s.prepChPublic === 'boolean') setPrepChPublic(s.prepChPublic)
+        if (typeof s.prepChUsernames === 'string') setPrepChUsernames(s.prepChUsernames)
+        if (typeof s.prepDeletePrevChannelAvatar === 'boolean') setPrepDeletePrevChannelAvatar(s.prepDeletePrevChannelAvatar)
+        if (typeof s.prepChCustomPostsEnabled === 'boolean') setPrepChCustomPostsEnabled(s.prepChCustomPostsEnabled)
+        // Текст постов сохраняем, файлы нет
+        if (s.prepChCustomPostsText && typeof s.prepChCustomPostsText === 'object') {
+          const restored = {}
+          for (const [k, v] of Object.entries(s.prepChCustomPostsText)) {
+            if (v && typeof v.text === 'string') restored[k] = { text: v.text, photoFile: null }
+          }
+          if (Object.keys(restored).length) setPrepChCustomPosts(restored)
+        }
+        if (typeof s.prepMinDelay === 'number') setPrepMinDelay(s.prepMinDelay)
+        if (typeof s.prepMaxDelay === 'number') setPrepMaxDelay(s.prepMaxDelay)
+        if (typeof s.prepMode === 'string') setPrepMode(s.prepMode)
+        if (typeof s.prepDurationHours === 'number') setPrepDurationHours(s.prepDurationHours)
+        if (typeof s.prepSessionsPerAcc === 'number') setPrepSessionsPerAcc(s.prepSessionsPerAcc)
+      }
+    } catch {}
+    prepFormLoadedRef.current = true
+  }, [])
+  // Autosave при любом изменении. Debounce небольшой чтобы не спамить LS
+  // на каждый symbolgin набора текста.
+  useEffect(() => {
+    if (!prepFormLoadedRef.current) return
+    const t = setTimeout(() => {
+      try {
+        // Извлекаем только текст из custom posts (File объекты не сериализуемы)
+        const customPostsText = {}
+        for (const [k, v] of Object.entries(prepChCustomPosts || {})) {
+          if (v?.text) customPostsText[k] = { text: v.text }
+        }
+        const s = {
+          prepChangeAvatars, prepDeletePrevProfileAvatar,
+          prepChangeNames, prepNamesText,
+          prepCreateChannels, prepChTitles, prepChDescriptions, prepChFirstPost,
+          prepChPin, prepChPublic, prepChUsernames,
+          prepDeletePrevChannelAvatar,
+          prepChCustomPostsEnabled,
+          prepChCustomPostsText: customPostsText,
+          prepMinDelay, prepMaxDelay,
+          prepMode, prepDurationHours, prepSessionsPerAcc,
+        }
+        localStorage.setItem(PREP_FORM_LS, JSON.stringify(s))
+      } catch {}
+    }, 300)
+    return () => clearTimeout(t)
+  }, [
+    prepChangeAvatars, prepDeletePrevProfileAvatar,
+    prepChangeNames, prepNamesText,
+    prepCreateChannels, prepChTitles, prepChDescriptions, prepChFirstPost,
+    prepChPin, prepChPublic, prepChUsernames,
+    prepDeletePrevChannelAvatar,
+    prepChCustomPostsEnabled, prepChCustomPosts,
+    prepMinDelay, prepMaxDelay,
+    prepMode, prepDurationHours, prepSessionsPerAcc,
+  ])
+  // Кнопка «Очистить форму» — чтобы юзер мог обнулить если хочет свежий запуск.
+  const clearPrepForm = () => {
+    setPrepChangeAvatars(false); setPrepAvatarFiles([]); setPrepDeletePrevProfileAvatar(false)
+    setPrepChangeNames(false); setPrepNamesText('')
+    setPrepCreateChannels(false); setPrepChTitles(''); setPrepChDescriptions(''); setPrepChFirstPost('')
+    setPrepChPin(true); setPrepChPublic(false); setPrepChUsernames('')
+    setPrepChAvatarFiles([]); setPrepDeletePrevChannelAvatar(false)
+    setPrepChPostPhotoFiles([])
+    setPrepChCustomPostsEnabled(false); setPrepChCustomPosts({})
+    setPrepMinDelay(60); setPrepMaxDelay(180)
+    setPrepMode('fast'); setPrepDurationHours(0.5); setPrepSessionsPerAcc(3)
+    try { localStorage.removeItem(PREP_FORM_LS) } catch {}
+  }
+  // prepJobId и prepMode2 персистятся в localStorage — чтобы:
+  //   1) Если юзер закроет модалку (или обновит страницу) — poll на прогресс
+  //      продолжится и статус будет виден в floating badge
+  //   2) На новом заходе можно повторно открыть модалку и увидеть текущее
+  //      состояние job'а без запуска нового
+  const PREP_LS_JOB = 'prep_active_job'
+  const PREP_LS_MODE = 'prep_active_mode'
+  const [prepJobId, setPrepJobIdRaw] = useState(() => {
+    try { return localStorage.getItem(PREP_LS_JOB) || null } catch { return null }
+  })
+  const setPrepJobId = (v) => {
+    setPrepJobIdRaw(v)
+    try {
+      if (v) localStorage.setItem(PREP_LS_JOB, v)
+      else localStorage.removeItem(PREP_LS_JOB)
+    } catch {}
+  }
+  const [prepProgress, setPrepProgress] = useState(null)
+  const [prepMode2, setPrepMode2Raw] = useState(() => {
+    try { return localStorage.getItem(PREP_LS_MODE) || 'fast' } catch { return 'fast' }
+  })
+  const setPrepMode2 = (v) => {
+    setPrepMode2Raw(v)
+    try {
+      if (v) localStorage.setItem(PREP_LS_MODE, v)
+      else localStorage.removeItem(PREP_LS_MODE)
+    } catch {}
+  }
+  const prepFileInputRef = useRef(null)
+  const prepPollRef = useRef(null)
+
+  // Добавляем файлы к уже выбранным, с дедупом по name+size (чтобы юзер
+  // мог таскать несколько партий и не переживать за дубли).
+  const addPrepFiles = (incoming) => {
+    if (!incoming || incoming.length === 0) return
+    // Только картинки — на dnd могут прилететь любые типы
+    const images = Array.from(incoming).filter(f =>
+      f.type && f.type.startsWith('image/')
+    )
+    if (images.length === 0) {
+      alert('Можно только изображения (image/*)')
+      return
+    }
+    setPrepAvatarFiles(prev => {
+      const seen = new Set(prev.map(f => `${f.name}::${f.size}`))
+      const merged = [...prev]
+      let dupes = 0
+      for (const f of images) {
+        const key = `${f.name}::${f.size}`
+        if (seen.has(key)) { dupes++; continue }
+        seen.add(key)
+        merged.push(f)
+      }
+      if (dupes > 0) {
+        console.log(`[prep] пропущено ${dupes} дубликатов файлов`)
+      }
+      return merged
+    })
+  }
+
+  const removePrepFile = (idx) => {
+    setPrepAvatarFiles(prev => prev.filter((_, i) => i !== idx))
+  }
+
+  const openPrepModal = () => {
+    // НЕ обнуляем форму — она восстанавливается из localStorage через
+    // useEffect. Чистим только эфемерные вещи: файлы (File объекты
+    // не сериализуемы) и текущий job.
+    setPrepAvatarFiles([])
+    setPrepChAvatarFiles([])
+    setPrepChPostPhotoFiles([])
+    // Из custom-posts подчищаем photoFile — тексты остаются
+    setPrepChCustomPosts(prev => {
+      const next = {}
+      for (const [k, v] of Object.entries(prev || {})) {
+        if (v?.text) next[k] = { text: v.text, photoFile: null }
+      }
+      return next
+    })
+    setPrepRecommend(null)
+    setPrepJobId(null)
+    setPrepProgress(null)
+    setPrepModal(true)
+  }
+
+  // Вычисляем число action'ов на акк — для рекомендации duration
+  // Валидные username'ы для публичного канала: [A-Za-z][A-Za-z0-9_]{4,31}
+  const prepChValidUsernames = (() => {
+    if (!prepChPublic) return []
+    const re = /^[A-Za-z][A-Za-z0-9_]{4,31}$/
+    const list = []
+    for (const raw of prepChUsernames.split('\n')) {
+      const u = raw.trim().replace(/^@/, '')
+      if (u && re.test(u) && !list.includes(u)) list.push(u)
+    }
+    return list
+  })()
+
+  const prepActionsPerAcc = (() => {
+    let n = 0
+    if (prepChangeNames) n += 1
+    if (prepChangeAvatars) n += 1
+    if (prepCreateChannels) {
+      n += 1  // create_channel
+      if (prepChAvatarFiles.length > 0) n += 1  // channel avatar
+      if (prepChPin) n += 1  // pin
+      if (prepChFirstPost.trim() || prepChPostPhotoFiles.length > 0) n += 1  // first post (текст ИЛИ фото)
+    }
+    return Math.max(1, n)
+  })()
+
+  // Автоматически подтягиваем рекомендацию когда меняются параметры
+  const [prepDurationUserEdited, setPrepDurationUserEdited] = useState(false)
+  useEffect(() => {
+    if (!prepModal || prepMode !== 'plan' || !selectedIds.size) {
+      setPrepRecommend(null); return
+    }
+    let cancelled = false
+    accountsAPI.bulkPreparePlanRecommend(selectedIds.size, prepActionsPerAcc)
+      .then(({ data }) => {
+        if (cancelled) return
+        setPrepRecommend(data)
+        // Автоподстановка рекомендации если юзер сам не менял значение —
+        // тогда открытие модалки сразу показывает разумное время под задачу,
+        // а не hardcoded 2ч или 30 мин.
+        if (!prepDurationUserEdited && data.recommended_hours) {
+          setPrepDurationHours(data.recommended_hours)
+        }
+      })
+      .catch(() => { if (!cancelled) setPrepRecommend(null) })
+    return () => { cancelled = true }
+  }, [prepModal, prepMode, selectedIds.size, prepActionsPerAcc, prepDurationUserEdited])
+
+  // Аналог addPrepFiles но для channel-аватарок
+  const addPrepChFiles = (incoming) => {
+    if (!incoming || incoming.length === 0) return
+    const images = Array.from(incoming).filter(f => f.type && f.type.startsWith('image/'))
+    if (images.length === 0) { alert('Только изображения'); return }
+    setPrepChAvatarFiles(prev => {
+      const seen = new Set(prev.map(f => `${f.name}::${f.size}`))
+      const merged = [...prev]
+      for (const f of images) {
+        const key = `${f.name}::${f.size}`
+        if (seen.has(key)) continue
+        seen.add(key)
+        merged.push(f)
+      }
+      return merged
+    })
+  }
+  const removePrepChFile = (idx) => {
+    setPrepChAvatarFiles(prev => prev.filter((_, i) => i !== idx))
+  }
+
+  // Фото/видео первого поста. Принимаем image/* И video/*.
+  // Telethon send_file автоматически определит тип по расширению:
+  //   .mov/.mp4/.webm/.mkv/.avi → как видео (streamable если возможно)
+  //   .jpg/.png/.webp/.gif      → как фото
+  // Некоторые ОС/браузеры не выставляют MIME для .mov (пустой f.type),
+  // так что дополнительно смотрим на расширение.
+  const VIDEO_EXTS = ['.mov', '.mp4', '.webm', '.mkv', '.avi', '.m4v']
+  const addPrepChPostFiles = (incoming) => {
+    if (!incoming || incoming.length === 0) return
+    const accepted = Array.from(incoming).filter(f => {
+      const type = f.type || ''
+      if (type.startsWith('image/') || type.startsWith('video/')) return true
+      const nameLower = (f.name || '').toLowerCase()
+      return VIDEO_EXTS.some(ext => nameLower.endsWith(ext))
+    })
+    if (accepted.length === 0) {
+      alert('Только изображения или видео (mp4, mov, webm, mkv, avi, m4v)')
+      return
+    }
+    setPrepChPostPhotoFiles(prev => {
+      const seen = new Set(prev.map(f => `${f.name}::${f.size}`))
+      const merged = [...prev]
+      for (const f of accepted) {
+        const key = `${f.name}::${f.size}`
+        if (seen.has(key)) continue
+        seen.add(key)
+        merged.push(f)
+      }
+      return merged
+    })
+  }
+  const removePrepChPostFile = (idx) => {
+    setPrepChPostPhotoFiles(prev => prev.filter((_, i) => i !== idx))
+  }
+
+  const startPrepPolling = (jobId, mode) => {
+    if (prepPollRef.current) clearInterval(prepPollRef.current)
+    const useMode = mode || 'fast'
+    const fn = useMode === 'plan'
+      ? accountsAPI.bulkPreparePlanProgress
+      : accountsAPI.bulkPrepareProgress
+    const poll = async () => {
+      try {
+        const { data } = await fn(jobId)
+        setPrepProgress({ ...data, _mode: useMode })
+        if (data.status === 'done' || data.status === 'error') {
+          // Останавливаем polling — но НЕ чистим prepJobId.
+          // Раньше здесь стоял setPrepJobId(null) — из-за чего клик
+          // по done-job'у в списке моментально сбрасывался обратно
+          // в список: polling получал 'done' → clearJobId → перерендер.
+          // Job'ы теперь остаются видимыми в timeline пока юзер сам
+          // не закроет модалку или не нажмёт «⟳ Новый job».
+          clearInterval(prepPollRef.current)
+          prepPollRef.current = null
+        }
+      } catch (e) { console.error('prep poll', e) }
+    }
+    poll()
+    // Plan-mode медленный (сессии по расписанию) — но нужно быстро
+    // отслеживать переход generating → scheduled → running
+    prepPollRef.current = setInterval(poll, useMode === 'plan' ? 3000 : 2500)
+  }
+
+  const [prepCancelling, setPrepCancelling] = useState(false)
+  const [prepResuming, setPrepResuming] = useState(false)
+  const [prepRefixingVideo, setPrepRefixingVideo] = useState(false)
+  const [prepRefixingAva, setPrepRefixingAva] = useState(false)
+  const [prepRefixingAttach, setPrepRefixingAttach] = useState(false)
+  const prepRefixFileInputRef = useRef(null)
+  const prepRefixAvaInputRef = useRef(null)
+  // Прогресс двух refix-задач (avatar / video) для текущего prepJobId
+  const [prepRefixProgress, setPrepRefixProgress] = useState({})  // { avatar: {...}, video: {...} }
+  const prepRefixPollRefs = useRef({})   // { avatar: intervalId, video: intervalId }
+
+  const startPrepRefixPolling = (jobId, kind) => {
+    if (prepRefixPollRefs.current[kind]) clearInterval(prepRefixPollRefs.current[kind])
+    const poll = async () => {
+      try {
+        const { data } = await accountsAPI.bulkPreparePlanRefixProgress(jobId, kind)
+        setPrepRefixProgress(prev => ({ ...prev, [kind]: data }))
+        if (['done', 'idle', 'error', 'cancelled'].includes(data.status)) {
+          clearInterval(prepRefixPollRefs.current[kind])
+          prepRefixPollRefs.current[kind] = null
+        }
+      } catch (e) { /* silent */ }
+    }
+    poll()
+    prepRefixPollRefs.current[kind] = setInterval(poll, 3000)
+  }
+  // При смене prepJobId — переставляем polling, чистим прошлое состояние
+  useEffect(() => {
+    // stop old
+    for (const k of ['avatar', 'video', 'attach']) {
+      if (prepRefixPollRefs.current[k]) {
+        clearInterval(prepRefixPollRefs.current[k])
+        prepRefixPollRefs.current[k] = null
+      }
+    }
+    setPrepRefixProgress({})
+    if (prepJobId) {
+      startPrepRefixPolling(prepJobId, 'avatar')
+      startPrepRefixPolling(prepJobId, 'video')
+      startPrepRefixPolling(prepJobId, 'attach')
+    }
+    return () => {
+      for (const k of ['avatar', 'video', 'attach']) {
+        if (prepRefixPollRefs.current[k]) clearInterval(prepRefixPollRefs.current[k])
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prepJobId])
+  const handlePrepRefixAva = async () => {
+    if (!prepJobId) return
+    prepRefixAvaInputRef.current?.click()
+  }
+  const handlePrepRefixAvaFile = async (file, deletePrev) => {
+    if (!file || !prepJobId) return
+    setPrepRefixingAva(true)
+    try {
+      const fd = new FormData()
+      fd.append('job_id', prepJobId)
+      fd.append('photo_file', file)
+      fd.append('delay_min_sec', '30')
+      fd.append('delay_max_sec', '90')
+      fd.append('delete_previous', deletePrev ? 'true' : 'false')
+      const { data } = await accountsAPI.bulkPreparePlanRefixChannelAvatar(fd)
+      // Не alert'им — прогресс покажется в inline banner ниже
+      startPrepRefixPolling(prepJobId, 'avatar')
+      setPrepRefixProgress(prev => ({ ...prev, avatar: {
+        status: 'running', total: 0, done: 0, ok: 0, failed: 0, kind: 'avatar',
+      } }))
+    } catch (err) {
+      const status = err.response?.status
+      const detail = err.response?.data?.detail || 'Не удалось запустить refix'
+      if (status === 409) {
+        startPrepRefixPolling(prepJobId, 'avatar')
+      } else {
+        alert(detail)
+      }
+    } finally {
+      setPrepRefixingAva(false)
+    }
+  }
+  const handlePrepRefixVideo = async () => {
+    if (!prepJobId) return
+    prepRefixFileInputRef.current?.click()
+  }
+  const handlePrepRefixVideoFile = async (file, caption) => {
+    if (!file || !prepJobId) return
+    setPrepRefixingVideo(true)
+    try {
+      const fd = new FormData()
+      fd.append('job_id', prepJobId)
+      fd.append('caption', caption || '')
+      fd.append('video_file', file)
+      fd.append('delay_min_sec', '30')
+      fd.append('delay_max_sec', '90')
+      const { data } = await accountsAPI.bulkPreparePlanRefixFirstPost(fd)
+      startPrepRefixPolling(prepJobId, 'video')
+      setPrepRefixProgress(prev => ({ ...prev, video: {
+        status: 'running', total: 0, done: 0, ok: 0, failed: 0, kind: 'video',
+      } }))
+    } catch (err) {
+      const status = err.response?.status
+      const detail = err.response?.data?.detail || 'Не удалось запустить refix'
+      if (status === 409) {
+        startPrepRefixPolling(prepJobId, 'video')
+      } else {
+        alert(detail)
+      }
+    } finally {
+      setPrepRefixingVideo(false)
+    }
+  }
+  const handlePrepRefixAttach = async () => {
+    if (!prepJobId) return
+    if (!confirm(
+      '🔗 Прикрепить созданный канал к профилю юзера (personal_channel) — ' +
+      'это тот значок канала в профиле, не в закреплённых чатах.\n\n' +
+      'Пройдёт по всем ~N акаунтам этого job\'а. У кого канал уже прикреплён — ' +
+      'пропустит. Продолжить?'
+    )) return
+    setPrepRefixingAttach(true)
+    try {
+      await accountsAPI.bulkPreparePlanRefixAttachChannel(prepJobId)
+      startPrepRefixPolling(prepJobId, 'attach')
+      setPrepRefixProgress(prev => ({ ...prev, attach: {
+        status: 'running', total: 0, done: 0, ok: 0, failed: 0, kind: 'attach',
+      } }))
+    } catch (err) {
+      const status = err.response?.status
+      const detail = err.response?.data?.detail || 'Не удалось запустить прикрепление'
+      // 409 = уже идёт. Не показываем как ошибку — сразу подписываемся
+      // на живой прогресс, юзер увидит текущий баннер.
+      if (status === 409) {
+        startPrepRefixPolling(prepJobId, 'attach')
+      } else {
+        alert(detail)
+      }
+    } finally {
+      setPrepRefixingAttach(false)
+    }
+  }
+  const handlePrepPlanResume = async () => {
+    if (!prepJobId) return
+    const hours = parseFloat(prompt(
+      '🔄 Дожать skipped/failed сессии из этого job\'а.\n\n' +
+      'Соберёт все действия которые не выполнились (skipped/failed/cancelled)\n' +
+      'и запланирует их в новом job\'е с другими рандомными слотами.\n\n' +
+      'За сколько часов дожать?', '1'
+    ))
+    if (!hours || hours < 0.1) return
+    setPrepResuming(true)
+    try {
+      const { data } = await accountsAPI.bulkPreparePlanResume(prepJobId, hours, 2)
+      alert(`Resume запущен · new_job=${data.new_job_id.slice(0, 8)}...`)
+      // Переключаемся на новый job чтобы видеть его прогресс
+      setPrepJobId(data.new_job_id)
+      setPrepProgress({
+        status: 'queued', total: 0, done: 0, ok: 0, failed: 0,
+        _mode: 'plan', phase: 'generating',
+      })
+      startPrepPolling(data.new_job_id, 'plan')
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Не удалось дожать')
+    } finally {
+      setPrepResuming(false)
+    }
+  }
+
+  const handlePrepPlanCancel = async () => {
+    if (!prepJobId) return
+    if (!window.confirm(
+      '🛑 ФОРСИРОВАННО остановить план?\n\n' +
+      '• Все запланированные сессии моментально удаляются из очереди Celery (revoke)\n' +
+      '• Все pending/scheduled/waiting сессии помечаются cancelled\n' +
+      '• Уже работающие сессии получают SIGTERM — Telethon connection\n' +
+      '  оборвётся (Telegram обычно ok с этим)\n\n' +
+      'Продолжить?'
+    )) return
+    setPrepCancelling(true)
+    try {
+      const { data } = await accountsAPI.bulkPreparePlanCancel(prepJobId)
+      alert(data.message || 'Остановлено')
+      // Сразу перечитываем прогресс, чтобы UI обновился
+      try {
+        const { data: prog } = await accountsAPI.bulkPreparePlanProgress(prepJobId)
+        setPrepProgress({ ...prog, _mode: 'plan' })
+      } catch {}
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Не удалось отменить')
+    } finally {
+      setPrepCancelling(false)
+    }
+  }
+
+  const handlePrepStart = async () => {
+    if (!selectedIds.size) { alert('Не выбран ни один аккаунт'); return }
+    if (!prepChangeAvatars && !prepChangeNames && !prepCreateChannels) {
+      alert('Выбери хотя бы одно действие: аватарка, имя или канал'); return
+    }
+    if (prepChangeAvatars && !prepAvatarFiles.length) {
+      alert('Ты включил смену аватарок, но не загрузил файлы'); return
+    }
+    const namesLines = prepNamesText.split(/\n/).map(s => s.trim()).filter(Boolean)
+    if (prepChangeNames && namesLines.length === 0) {
+      alert('Ты включил смену имён, но список пуст'); return
+    }
+    const chTitlesLines = prepChTitles.split(/\n/).map(s => s.trim()).filter(Boolean)
+    if (prepCreateChannels && chTitlesLines.length === 0) {
+      alert('Ты включил создание каналов, но список названий пуст'); return
+    }
+    if (prepCreateChannels && prepChPublic && prepChValidUsernames.length === 0) {
+      alert('Ты включил публичный канал, но валидных username\'ов нет (5-32 символа, начинается с буквы, латиница/цифры/подчёркивание)')
+      return
+    }
+    if (prepMinDelay > prepMaxDelay) {
+      alert('min задержка не может быть больше max'); return
+    }
+    setPrepStarting(true)
+    try {
+      const fd = new FormData()
+      fd.append('account_ids', JSON.stringify([...selectedIds]))
+      fd.append('change_avatars', prepChangeAvatars ? 'true' : 'false')
+      fd.append('delete_previous_profile_avatar',
+        (prepChangeAvatars && prepDeletePrevProfileAvatar) ? 'true' : 'false')
+      fd.append('change_names', prepChangeNames ? 'true' : 'false')
+      fd.append('create_channels', prepCreateChannels ? 'true' : 'false')
+      fd.append('delete_previous_channel_avatar',
+        (prepCreateChannels && prepDeletePrevChannelAvatar) ? 'true' : 'false')
+      fd.append('names_text', prepChangeNames ? prepNamesText : '')
+      fd.append('channel_titles_text', prepCreateChannels ? prepChTitles : '')
+      fd.append('channel_descriptions_text', prepCreateChannels ? prepChDescriptions : '')
+      // Legacy — если новое поле пусто, старый single-line description больше не используется
+      fd.append('channel_description', '')
+      fd.append('channel_first_post', prepCreateChannels ? prepChFirstPost : '')
+      fd.append('channel_pin', prepCreateChannels && prepChPin ? 'true' : 'false')
+      fd.append('channel_public', prepCreateChannels && prepChPublic ? 'true' : 'false')
+      fd.append('channel_usernames_text', prepCreateChannels && prepChPublic ? prepChUsernames : '')
+      fd.append('min_delay_sec', String(prepMinDelay))
+      fd.append('max_delay_sec', String(prepMaxDelay))
+      fd.append('plan_mode', prepMode === 'plan' ? 'true' : 'false')
+      fd.append('target_duration_hours', String(prepDurationHours))
+      fd.append('sessions_per_acc', String(prepSessionsPerAcc))
+      if (prepChangeAvatars) {
+        prepAvatarFiles.forEach(f => fd.append('files', f))
+      }
+      if (prepCreateChannels) {
+        prepChAvatarFiles.forEach(f => fd.append('channel_avatar_files', f))
+        prepChPostPhotoFiles.forEach(f => fd.append('channel_post_files', f))
+        // Ручное распределение: сериализуем map { acc_id → { text, photo_filename } }
+        // + приклеиваем кастомные файлы в тот же channel_post_files pool.
+        // Backend матчит по photo_filename → путь, дедуп по имени.
+        if (prepChCustomPostsEnabled) {
+          const arr = []
+          const seenFileNames = new Set(prepChPostPhotoFiles.map(f => f.name))
+          for (const accId of selectedIds) {
+            const entry = prepChCustomPosts[accId]
+            if (!entry) continue
+            const text = (entry.text || '').trim()
+            const photoFile = entry.photoFile || null
+            if (!text && !photoFile) continue
+            let photoFilename = null
+            if (photoFile) {
+              photoFilename = photoFile.name
+              // Не задваиваем — если файл с таким именем уже в pool'е, не добавляем
+              if (!seenFileNames.has(photoFilename)) {
+                fd.append('channel_post_files', photoFile)
+                seenFileNames.add(photoFilename)
+              }
+            }
+            arr.push({
+              account_id: accId,
+              text,
+              photo_filename: photoFilename,
+            })
+          }
+          fd.append('channel_posts_json', JSON.stringify(arr))
+        }
+      }
+      const { data } = await accountsAPI.bulkPrepare(fd)
+      setPrepJobId(data.job_id)
+      setPrepMode2(data.mode || prepMode)
+      setPrepProgress({
+        status: 'queued', total: data.total, done: 0, ok: 0, failed: 0,
+        est_total_sec: data.est_total_sec, _mode: data.mode || prepMode,
+      })
+      startPrepPolling(data.job_id, data.mode || prepMode)
+    } catch (err) {
+      alert(err.response?.data?.detail || 'Ошибка запуска')
+    } finally {
+      setPrepStarting(false)
+    }
+  }
 
   // Запуск проверки выбранных аккаунтов: жмёт /tasks/check-accounts с
   // account_ids, ловит task_id, поллит /tasks/{id} раз в 2 сек до конца,
@@ -287,6 +946,19 @@ export default function AccountsPage() {
       setAccounts(accRes.data)
       setGeoList(filRes.data.geos || [])
       setCategoryList(filRes.data.categories || [])
+      // Чистим selectedIds от акков которых больше нет в БД (удалены /
+      // не принадлежат юзеру). Иначе если из localStorage подтянутся
+      // мёртвые id, они будут учитываться в bulk-действиях.
+      const validIds = new Set((accRes.data || []).map(a => a.id))
+      setSelectedIds(prev => {
+        let dirty = false
+        const next = new Set()
+        for (const id of prev) {
+          if (validIds.has(id)) next.add(id)
+          else dirty = true
+        }
+        return dirty ? next : prev
+      })
     } catch { }
     setLoading(false)
   }
@@ -296,6 +968,75 @@ export default function AccountsPage() {
   // Стоп-интервал поллинга прогресса экспорта при размонтировании
   useEffect(() => {
     return () => stopExportPoll()
+  }, [])
+
+  // ── Список всех активных prep-plan job'ов юзера (Redis TTL=7д) ──
+  // Читаем на mount, показываем в UI в виде списка. Если в localStorage
+  // ничего нет, но на бэке живой running job — авто-подхватываем.
+  const [prepPlanList, setPrepPlanList] = useState([])
+  const [prepPlanListLoading, setPrepPlanListLoading] = useState(false)
+  const loadPrepPlanList = async () => {
+    setPrepPlanListLoading(true)
+    try {
+      const { data } = await accountsAPI.bulkPreparePlanList()
+      const jobs = data.jobs || []
+      setPrepPlanList(jobs)
+      // Автоподхват живой задачи:
+      //   - если LS пуст → берём первую running/scheduled
+      //   - если LS указывает на задачу которой уже нет (или phase=done/
+      //     cancelled/error) → переключаем на живой running (если есть)
+      // Это чинит кейс когда старый prep_active_job в LS блокировал
+      // отображение badge для новой активной кампании.
+      const ACTIVE_PHASES = ['running', 'scheduled', 'generating', 'cancelling']
+      const active = jobs.find(j => ACTIVE_PHASES.includes(j.phase))
+      const lsJob = jobs.find(j => j.job_id === prepJobId)
+      const lsJobDead = prepJobId && (!lsJob || !ACTIVE_PHASES.includes(lsJob.phase))
+      if ((!prepJobId || lsJobDead) && active) {
+        console.log('[prep] auto-switch to live job', active.job_id, 'phase=', active.phase)
+        setPrepJobId(active.job_id)
+        setPrepMode2('plan')
+        startPrepPolling(active.job_id, 'plan')
+      }
+    } catch (e) {
+      console.error('prep list', e)
+    } finally {
+      setPrepPlanListLoading(false)
+    }
+  }
+  useEffect(() => {
+    loadPrepPlanList()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // ── Rehydrate prep job из localStorage ──
+  // Если юзер закрыл модалку или обновил страницу пока идёт подготовка,
+  // возобновляем poll'инг чтобы floating badge показал статус.
+  useEffect(() => {
+    if (!prepJobId) return
+    const fn = prepMode2 === 'plan'
+      ? accountsAPI.bulkPreparePlanProgress
+      : accountsAPI.bulkPrepareProgress
+    let cancelled = false
+    fn(prepJobId).then(({ data }) => {
+      if (cancelled) return
+      if (!data || data.status === 'idle') {
+        // job не найден в Redis — старый прогон, чистим localStorage
+        setPrepJobId(null)
+        return
+      }
+      setPrepProgress({ ...data, _mode: prepMode2 })
+      // Если ещё не готов — возобновляем polling
+      if (data.status !== 'done' && data.status !== 'error') {
+        startPrepPolling(prepJobId, prepMode2)
+      }
+    }).catch(() => {
+      if (!cancelled) setPrepJobId(null)
+    })
+    return () => {
+      cancelled = true
+      if (prepPollRef.current) clearInterval(prepPollRef.current)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   // Превью загруженных фото в модалке создания канала
@@ -567,12 +1308,29 @@ export default function AccountsPage() {
                   ? 'rgba(124,77,255,0.06)'
                   : acc.active_campaign ? 'rgba(61,214,140,0.05)' : 'transparent'
               }}>
-              {/* Checkbox */}
-              <input type="checkbox"
-                checked={selectedIds.has(acc.id)}
-                onClick={e => e.stopPropagation()}
-                onChange={() => toggleSelect(acc.id)}
-                style={{ width: 16, height: 16, accentColor: 'var(--violet)', cursor: 'pointer' }} />
+              {/* Checkbox — расширенная кликабельная область на всю ячейку
+                  чтобы промах по 16×16 чекбоксу не открывал профиль.
+                  Ячейка колонки = 36px ширины × вся высота строки. */}
+              <div
+                onClick={e => {
+                  e.stopPropagation()
+                  toggleSelect(acc.id)
+                }}
+                style={{
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  alignSelf: 'stretch',      // растягиваем на всю высоту строки
+                  cursor: 'pointer',
+                  minHeight: 44,             // гарантия достаточной вертикальной зоны попадания
+                }}>
+                <input type="checkbox"
+                  checked={selectedIds.has(acc.id)}
+                  onChange={() => {}}        // управляется через onClick обёртки
+                  readOnly
+                  style={{
+                    width: 16, height: 16, accentColor: 'var(--violet)',
+                    pointerEvents: 'none',    // клики летят на обёртку
+                  }} />
+              </div>
               {/* Name + avatar */}
               <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                 <div style={{
@@ -1455,6 +2213,10 @@ export default function AccountsPage() {
           <Button variant="ghost" size="sm" onClick={handleBulkClearMedia} title="Удалить все фото у выбранных">
             🗑 Очистить фото
           </Button>
+          <Button variant="primary" size="sm" onClick={openPrepModal}
+            title="Смена аватарки + имени/фамилии, разнесённо во времени (без флудвейтов)">
+            ⚙ Подготовка
+          </Button>
           <Button variant="outline" size="sm" loading={bulkExporting}
             onClick={handleBulkExportTData}
             title="Экспортировать TData всех выбранных аккаунтов в один ZIP-архив">
@@ -1693,6 +2455,1368 @@ export default function AccountsPage() {
             </Button>
           </div>
         </div>
+      </Modal>
+
+      {/* ══ Floating badge для активного prep job'а ══ */}
+      {prepJobId && prepProgress && prepProgress.status !== 'done' && prepProgress.status !== 'error' && !prepModal && (
+        <div style={{
+          position: 'fixed', top: 20, right: 20, zIndex: 90,
+          background: 'var(--bg-2)', border: '1px solid rgba(139,92,246,0.4)',
+          borderRadius: 10, padding: '10px 14px',
+          boxShadow: '0 8px 30px rgba(0,0,0,0.4)',
+          fontSize: 12, color: 'var(--text)',
+          minWidth: 240, maxWidth: 340,
+        }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, marginBottom: 6 }}>
+            <span style={{ fontWeight: 700 }}>
+              {prepProgress._mode === 'plan' ? '🗓 План' : '⚙ Подготовка'} идёт
+            </span>
+            <button onClick={() => setPrepModal(true)}
+              style={{
+                background: 'rgba(139,92,246,0.15)', border: '1px solid var(--violet)',
+                color: 'var(--text)', padding: '3px 10px', borderRadius: 4,
+                cursor: 'pointer', fontSize: 11,
+              }}>Открыть</button>
+          </div>
+          {prepProgress._mode === 'plan' ? (
+            <>
+              <div style={{ fontSize: 11, color: 'var(--text-2)' }}>
+                {prepProgress.phase === 'generating' && '🧠 Генерация…'}
+                {prepProgress.phase === 'scheduled' && '🗓 Запланировано, жду'}
+                {prepProgress.phase === 'running' && '🔄 Сессии идут'}
+              </div>
+              {prepProgress.totals && (
+                <div style={{ marginTop: 4, fontSize: 11 }}>
+                  <span style={{ color: 'var(--green)' }}>{prepProgress.totals.sessions_done}</span>
+                  {' / '}{prepProgress.totals.sessions_total}
+                  {' сессий '}
+                  <span style={{ color: 'var(--text-3)' }}>({prepProgress.totals.accounts_total} акк)</span>
+                </div>
+              )}
+              <div style={{ height: 4, background: 'var(--bg-3)', borderRadius: 2, overflow: 'hidden', marginTop: 6 }}>
+                <div style={{
+                  height: '100%',
+                  width: `${prepProgress.totals ? Math.min(100, ((prepProgress.totals.sessions_done || 0) / Math.max(1, prepProgress.totals.sessions_total || 1)) * 100) : 0}%`,
+                  background: 'var(--violet)', transition: 'width 0.5s',
+                }} />
+              </div>
+            </>
+          ) : (
+            <>
+              <div style={{ fontSize: 11, color: 'var(--text-2)' }}>
+                {prepProgress.done || 0} / {prepProgress.total || 0} акк
+                {prepProgress.sleeping_sec > 0 && ` · 💤 ${prepProgress.sleeping_sec}с`}
+              </div>
+              <div style={{ height: 4, background: 'var(--bg-3)', borderRadius: 2, overflow: 'hidden', marginTop: 6 }}>
+                <div style={{
+                  height: '100%',
+                  width: `${Math.min(100, ((prepProgress.done || 0) / Math.max(1, prepProgress.total || 1)) * 100)}%`,
+                  background: 'var(--violet)', transition: 'width 0.5s',
+                }} />
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* ══ Prepare (аватарки + имена, разнесённо) ══ */}
+      <Modal open={prepModal} onClose={() => setPrepModal(false)}
+        title={`⚙ Подготовка · ${selectedIds.size} аккаунт(ов)`} width={560}>
+        {!prepJobId ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            {/* Список активных plan-job'ов из Redis */}
+            {prepPlanList.length > 0 && (
+              <div style={{
+                padding: 10, borderRadius: 8, background: 'var(--bg-2)',
+                border: '1px solid var(--border)',
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text)' }}>
+                    🗓 Существующие план-job'ы ({prepPlanList.length})
+                  </div>
+                  <button onClick={loadPrepPlanList}
+                    disabled={prepPlanListLoading}
+                    style={{ background: 'none', border: 'none', color: 'var(--text-3)', cursor: 'pointer', fontSize: 11 }}>
+                    {prepPlanListLoading ? '…' : '↻'}
+                  </button>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 200, overflowY: 'auto' }}>
+                  {prepPlanList.map(j => {
+                    const when = j.start_ts ? new Date(j.start_ts * 1000).toLocaleString('ru-RU', {
+                      day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit',
+                    }) : '?'
+                    const undone = (j.sessions_skipped || 0) + (j.sessions_failed || 0)
+                    const phaseIcon = j.phase === 'done' ? '✅' :
+                                      j.phase === 'running' ? '🔄' :
+                                      j.phase === 'scheduled' ? '🗓' :
+                                      j.phase === 'generating' ? '🧠' :
+                                      j.phase === 'cancelling' ? '🛑' :
+                                      j.phase === 'cancelled' ? '⛔' : '❓'
+                    return (
+                      <div key={j.job_id} onClick={() => {
+                        setPrepJobId(j.job_id)
+                        setPrepMode2('plan')
+                        startPrepPolling(j.job_id, 'plan')
+                      }} style={{
+                        padding: '6px 8px', borderRadius: 5, cursor: 'pointer',
+                        background: 'var(--bg-3)', border: '1px solid transparent',
+                        display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8,
+                        fontSize: 11,
+                      }}
+                        onMouseEnter={e => e.currentTarget.style.borderColor = 'var(--violet)'}
+                        onMouseLeave={e => e.currentTarget.style.borderColor = 'transparent'}>
+                        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                          <span>{phaseIcon}</span>
+                          <code style={{ fontSize: 10, color: 'var(--text-3)' }}>{j.job_id.slice(0, 8)}</code>
+                          <span style={{ color: 'var(--text-2)' }}>{j.total_accounts} акк</span>
+                          {j.resumed_from && (
+                            <span style={{ fontSize: 9, color: 'var(--text-3)' }}>
+                              ↩ {j.resumed_from.slice(0, 6)}
+                            </span>
+                          )}
+                        </div>
+                        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                          <span style={{ color: 'var(--green)' }}>{j.sessions_done}</span>
+                          <span style={{ color: 'var(--text-3)' }}>/</span>
+                          <span style={{ color: 'var(--text-3)' }}>{j.sessions_total}</span>
+                          {undone > 0 && (
+                            <span style={{ color: 'var(--red)' }}>({undone} недоделано)</span>
+                          )}
+                          <span style={{ color: 'var(--text-3)', marginLeft: 4 }}>{when}</span>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+            <div style={{ fontSize: 12, color: 'var(--text-3)', lineHeight: 1.5 }}>
+              Разнесёт операции во времени с рандомными задержками (обычно 60-180 сек между акками).
+              Один прокси = одно подключение за раз. Порядок акков перемешан, ресурсы (файлы + имена)
+              распределяются случайно.
+            </div>
+
+            {/* Чек-бокс 1: аватарки */}
+            <div style={{
+              padding: 12, borderRadius: 8,
+              background: prepChangeAvatars ? 'rgba(139,92,246,0.08)' : 'var(--bg-2)',
+              border: `1px solid ${prepChangeAvatars ? 'var(--violet)' : 'var(--border)'}`,
+            }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13, fontWeight: 600 }}>
+                <input type="checkbox" checked={prepChangeAvatars}
+                  onChange={e => setPrepChangeAvatars(e.target.checked)} />
+                📸 Поменять аватарки
+              </label>
+              {prepChangeAvatars && (
+                <div style={{ marginTop: 10 }}>
+                  <div
+                    onClick={() => prepFileInputRef.current?.click()}
+                    onDragOver={e => { e.preventDefault(); e.stopPropagation(); setPrepDragOver(true) }}
+                    onDragEnter={e => { e.preventDefault(); e.stopPropagation(); setPrepDragOver(true) }}
+                    onDragLeave={e => { e.preventDefault(); e.stopPropagation(); setPrepDragOver(false) }}
+                    onDrop={e => {
+                      e.preventDefault(); e.stopPropagation(); setPrepDragOver(false)
+                      addPrepFiles(e.dataTransfer.files)
+                    }}
+                    style={{
+                      padding: 18, textAlign: 'center', cursor: 'pointer',
+                      border: `2px dashed ${prepDragOver ? 'var(--violet)' : 'var(--border)'}`,
+                      borderRadius: 8,
+                      background: prepDragOver ? 'rgba(139,92,246,0.10)' : 'var(--bg-3)',
+                      fontSize: 12, color: 'var(--text-2)',
+                      transition: 'all 0.15s ease',
+                    }}>
+                    {prepAvatarFiles.length === 0 ? (
+                      <>
+                        <div style={{ fontSize: 24, marginBottom: 6 }}>
+                          {prepDragOver ? '📥' : '🖼️'}
+                        </div>
+                        <div style={{ fontWeight: 600, color: 'var(--text)', marginBottom: 3 }}>
+                          {prepDragOver ? 'Отпусти чтобы добавить' : 'Перетащи фото сюда'}
+                        </div>
+                        <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
+                          или кликни чтобы выбрать · любое количество (1 или несколько, из папки не нужно)
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div style={{ fontWeight: 600, color: 'var(--text)' }}>
+                          ✓ {prepAvatarFiles.length} файл(ов) выбрано
+                        </div>
+                        <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 3 }}>
+                          {prepDragOver
+                            ? 'Отпусти чтобы дописать ещё'
+                            : 'Кликни или перетащи ещё чтобы дополнить · распределятся рандомно'}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                  <input ref={prepFileInputRef} type="file" accept="image/*" multiple
+                    style={{ display: 'none' }}
+                    onChange={e => {
+                      addPrepFiles(e.target.files)
+                      // Сбрасываем value чтобы повторный выбор того же файла триггерил change
+                      e.target.value = ''
+                    }} />
+                  {prepAvatarFiles.length > 0 && (
+                    <div style={{
+                      marginTop: 8, maxHeight: 140, overflowY: 'auto',
+                      background: 'var(--bg-3)', borderRadius: 6, padding: 4,
+                    }}>
+                      {prepAvatarFiles.map((f, i) => (
+                        <div key={`${f.name}-${f.size}-${i}`} style={{
+                          display: 'flex', alignItems: 'center', gap: 8,
+                          padding: '4px 8px', fontSize: 11,
+                        }}>
+                          <span style={{ color: 'var(--text-3)' }}>🖼</span>
+                          <span style={{ color: 'var(--text-2)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {f.name}
+                          </span>
+                          <span style={{ color: 'var(--text-3)', fontSize: 10 }}>
+                            {(f.size / 1024).toFixed(0)} KB
+                          </span>
+                          <button onClick={(ev) => { ev.stopPropagation(); removePrepFile(i) }}
+                            style={{
+                              background: 'transparent', border: 'none', cursor: 'pointer',
+                              color: 'var(--text-3)', fontSize: 14, padding: '0 4px',
+                            }}
+                            title="Убрать">×</button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {prepAvatarFiles.length > 0 && (
+                    <div style={{ marginTop: 6, display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+                      <button onClick={() => setPrepAvatarFiles([])}
+                        style={{
+                          background: 'none', border: 'none', color: 'var(--text-3)',
+                          cursor: 'pointer', fontSize: 11,
+                        }}>
+                        ✕ Очистить всё
+                      </button>
+                      {prepAvatarFiles.length < selectedIds.size && (
+                        <span style={{ fontSize: 11, color: 'var(--text-3)' }}>
+                          💡 Файлов ({prepAvatarFiles.length}) меньше чем акков ({selectedIds.size}) —
+                          некоторые файлы повторятся.
+                        </span>
+                      )}
+                    </div>
+                  )}
+                  {/* Удалить предыдущие фото профиля перед загрузкой новой */}
+                  <label style={{
+                    marginTop: 10, padding: '8px 10px', borderRadius: 6,
+                    background: prepDeletePrevProfileAvatar ? 'rgba(239,68,68,0.08)' : 'var(--bg-3)',
+                    border: `1px solid ${prepDeletePrevProfileAvatar ? 'rgba(239,68,68,0.35)' : 'var(--border)'}`,
+                    display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer',
+                  }}>
+                    <input type="checkbox"
+                      checked={prepDeletePrevProfileAvatar}
+                      onChange={e => setPrepDeletePrevProfileAvatar(e.target.checked)}
+                      style={{ marginTop: 2 }} />
+                    <div>
+                      <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>
+                        🗑 Удалить старые фото профиля
+                      </div>
+                      <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2, lineHeight: 1.4 }}>
+                        Перед uploadом новой аватарки удалит все существующие фото профиля.
+                        Оба действия — в одной сессии, пауза между ними 2-5 сек.
+                      </div>
+                    </div>
+                  </label>
+                </div>
+              )}
+            </div>
+
+            {/* Чек-бокс 2: имена */}
+            <div style={{
+              padding: 12, borderRadius: 8,
+              background: prepChangeNames ? 'rgba(139,92,246,0.08)' : 'var(--bg-2)',
+              border: `1px solid ${prepChangeNames ? 'var(--violet)' : 'var(--border)'}`,
+            }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13, fontWeight: 600 }}>
+                <input type="checkbox" checked={prepChangeNames}
+                  onChange={e => setPrepChangeNames(e.target.checked)} />
+                📝 Поменять имя и фамилию
+              </label>
+              {prepChangeNames && (
+                <div style={{ marginTop: 10 }}>
+                  <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 6 }}>
+                    По одному имени в строке. Формат: <code>Имя Фамилия</code> (фамилия опциональна).
+                    Каждому акку случайное из списка.
+                  </div>
+                  <textarea value={prepNamesText}
+                    onChange={e => setPrepNamesText(e.target.value)}
+                    placeholder={`Иван Петров\nАнна Соколова\nМария\nДмитрий Кузнецов`}
+                    style={{
+                      width: '100%', minHeight: 120, padding: 10,
+                      background: 'var(--bg-3)', border: '1px solid var(--border)',
+                      borderRadius: 6, color: 'var(--text)', fontSize: 12,
+                      fontFamily: 'monospace', resize: 'vertical',
+                    }} />
+                  {prepNamesText.trim() && (
+                    <div style={{ marginTop: 4, fontSize: 11, color: 'var(--text-3)' }}>
+                      Строк: {prepNamesText.split('\n').filter(s => s.trim()).length}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Чек-бокс 3: создать канал */}
+            <div style={{
+              padding: 12, borderRadius: 8,
+              background: prepCreateChannels ? 'rgba(139,92,246,0.08)' : 'var(--bg-2)',
+              border: `1px solid ${prepCreateChannels ? 'var(--violet)' : 'var(--border)'}`,
+            }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13, fontWeight: 600 }}>
+                <input type="checkbox" checked={prepCreateChannels}
+                  onChange={e => setPrepCreateChannels(e.target.checked)} />
+                📢 Создать канал у каждого акка
+              </label>
+              {prepCreateChannels && (
+                <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
+                    Создание идёт поэтапно: <b>создать → username → аватар → закрепить → disconnect → sleep 2с → reconnect → первый пост</b>.
+                    Каждому акку случайное название и (если есть) случайный аватар канала.
+                  </div>
+
+                  {/* Названия канала */}
+                  <div>
+                    <div style={{ fontSize: 11, color: 'var(--text-2)', marginBottom: 4, fontWeight: 600 }}>
+                      Названия каналов (одно на строку) *
+                    </div>
+                    <textarea value={prepChTitles}
+                      onChange={e => setPrepChTitles(e.target.value)}
+                      placeholder={`Крипто новости\nБизнес и финансы\nЛайфхаки дня\nНовости IT`}
+                      style={{
+                        width: '100%', minHeight: 80, padding: 8,
+                        background: 'var(--bg-3)', border: '1px solid var(--border)',
+                        borderRadius: 6, color: 'var(--text)', fontSize: 12,
+                        fontFamily: 'monospace', resize: 'vertical',
+                      }} />
+                    {prepChTitles.trim() && (
+                      <div style={{ marginTop: 2, fontSize: 10, color: 'var(--text-3)' }}>
+                        Строк: {prepChTitles.split('\n').filter(s => s.trim()).length}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Описания — многострочные, рандомизируются */}
+                  <div>
+                    <div style={{ fontSize: 11, color: 'var(--text-2)', marginBottom: 4, fontWeight: 600 }}>
+                      Описания канала (одно на строку — каждому акку случайное; опционально)
+                    </div>
+                    <textarea value={prepChDescriptions}
+                      onChange={e => setPrepChDescriptions(e.target.value)}
+                      placeholder={`Канал автора о жизни и работе\nПутевые заметки и мысли\nЛайфстайл + полезное\nПерсональный дневник`}
+                      style={{
+                        width: '100%', minHeight: 70, padding: 8,
+                        background: 'var(--bg-3)', border: '1px solid var(--border)',
+                        borderRadius: 6, color: 'var(--text)', fontSize: 12,
+                        fontFamily: 'monospace', resize: 'vertical',
+                      }} />
+                    {prepChDescriptions.trim() && (
+                      <div style={{ marginTop: 2, fontSize: 10, color: 'var(--text-3)' }}>
+                        Вариантов: {prepChDescriptions.split('\n').filter(s => s.trim()).length}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Первый пост — текст */}
+                  <div>
+                    <div style={{ fontSize: 11, color: 'var(--text-2)', marginBottom: 4, fontWeight: 600 }}>
+                      Первый пост — текст (общий, опционально — публикуется после reconnect)
+                    </div>
+                    <textarea value={prepChFirstPost}
+                      onChange={e => setPrepChFirstPost(e.target.value)}
+                      maxLength={4096}
+                      placeholder="Например: Всем привет 👋 Это мой канал"
+                      style={{
+                        width: '100%', minHeight: 50, padding: 8,
+                        background: 'var(--bg-3)', border: '1px solid var(--border)',
+                        borderRadius: 6, color: 'var(--text)', fontSize: 12, resize: 'vertical',
+                      }} />
+                  </div>
+
+                  {/* Первый пост — фото или видео (drag&drop) */}
+                  <div>
+                    <div style={{ fontSize: 11, color: 'var(--text-2)', marginBottom: 4, fontWeight: 600 }}>
+                      Первый пост — фото/видео (опционально; распределяется рандомно; текст выше идёт как подпись).
+                      <span style={{ fontWeight: 400, color: 'var(--text-3)' }}>
+                        {' '}Поддержка: jpg/png/webp/gif · mp4/mov/webm/mkv/avi/m4v.
+                      </span>
+                    </div>
+                    <div
+                      onClick={() => prepChPostFileInputRef.current?.click()}
+                      onDragOver={e => { e.preventDefault(); e.stopPropagation(); setPrepChPostDragOver(true) }}
+                      onDragEnter={e => { e.preventDefault(); e.stopPropagation(); setPrepChPostDragOver(true) }}
+                      onDragLeave={e => { e.preventDefault(); e.stopPropagation(); setPrepChPostDragOver(false) }}
+                      onDrop={e => {
+                        e.preventDefault(); e.stopPropagation(); setPrepChPostDragOver(false)
+                        addPrepChPostFiles(e.dataTransfer.files)
+                      }}
+                      style={{
+                        padding: 12, textAlign: 'center', cursor: 'pointer',
+                        border: `2px dashed ${prepChPostDragOver ? 'var(--violet)' : 'var(--border)'}`,
+                        borderRadius: 6,
+                        background: prepChPostDragOver ? 'rgba(139,92,246,0.10)' : 'var(--bg-3)',
+                        fontSize: 11, color: 'var(--text-2)',
+                        transition: 'all 0.15s ease',
+                      }}>
+                      {prepChPostPhotoFiles.length === 0
+                        ? (prepChPostDragOver ? '📥 Отпусти чтобы добавить' : '🖼️/🎬 Перетащи или кликни · фото или видео · распределится рандомно')
+                        : `✓ ${prepChPostPhotoFiles.length} файл(ов) — кликни/перетащи чтобы дополнить`}
+                    </div>
+                    {/* accept:
+                        - image/*, video/*  — стандартные MIME
+                        - .mov               — Safari/старые macOS иногда не выставляют video/quicktime,
+                                               нужно явное расширение чтобы диалог показал файл
+                        - .mkv/.avi/.m4v     — аналогично, часто без MIME */}
+                    <input ref={prepChPostFileInputRef} type="file"
+                      accept="image/*,video/*,.mov,.mkv,.avi,.m4v"
+                      multiple
+                      style={{ display: 'none' }}
+                      onChange={e => { addPrepChPostFiles(e.target.files); e.target.value = '' }} />
+                    {prepChPostPhotoFiles.length > 0 && (
+                      <div style={{
+                        marginTop: 6, maxHeight: 100, overflowY: 'auto',
+                        background: 'var(--bg-3)', borderRadius: 4, padding: 4,
+                      }}>
+                        {prepChPostPhotoFiles.map((f, i) => {
+                          const nameLower = (f.name || '').toLowerCase()
+                          const isVideo = (f.type || '').startsWith('video/') ||
+                            VIDEO_EXTS.some(ext => nameLower.endsWith(ext))
+                          const sizeMb = f.size / (1024 * 1024)
+                          return (
+                            <div key={`${f.name}-${f.size}-${i}`} style={{
+                              display: 'flex', alignItems: 'center', gap: 6,
+                              padding: '3px 6px', fontSize: 10,
+                            }}>
+                              <span style={{ color: 'var(--text-3)' }}>{isVideo ? '🎬' : '🖼'}</span>
+                              <span style={{ color: 'var(--text-2)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                {f.name}
+                              </span>
+                              <span style={{ color: 'var(--text-3)', fontSize: 9 }}>
+                                {sizeMb >= 1 ? `${sizeMb.toFixed(1)} MB` : `${(f.size / 1024).toFixed(0)} KB`}
+                              </span>
+                              <button onClick={(ev) => { ev.stopPropagation(); removePrepChPostFile(i) }}
+                                style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--text-3)', fontSize: 12 }}>×</button>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* ── Ручное распределение постов по акк-id ── */}
+                  <div style={{
+                    padding: 10, borderRadius: 8,
+                    background: prepChCustomPostsEnabled ? 'rgba(139,92,246,0.06)' : 'var(--bg-3)',
+                    border: `1px solid ${prepChCustomPostsEnabled ? 'var(--violet)' : 'var(--border)'}`,
+                  }}>
+                    <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' }}>
+                      <input type="checkbox"
+                        checked={prepChCustomPostsEnabled}
+                        onChange={e => setPrepChCustomPostsEnabled(e.target.checked)}
+                        style={{ marginTop: 2 }} />
+                      <div>
+                        <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>
+                          🎯 Разные посты для каждого акка (ручное распределение)
+                        </div>
+                        <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 3, lineHeight: 1.4 }}>
+                          Ты сам ставишь: для акка #1 — свой текст и фото/видео,
+                          для акка #2 — другое. Общий пост выше и рандомизация игнорятся
+                          для акков у которых задано ручное значение.
+                          Акки без ручного поста возьмут общий (если задан).
+                        </div>
+                      </div>
+                    </label>
+                    {prepChCustomPostsEnabled && (
+                      <div style={{
+                        marginTop: 10, maxHeight: 340, overflowY: 'auto',
+                        background: 'var(--bg-2)', borderRadius: 6, padding: 6,
+                        display: 'flex', flexDirection: 'column', gap: 6,
+                      }}>
+                        {selectedIds.size === 0 ? (
+                          <div style={{ fontSize: 11, color: 'var(--text-3)', padding: 8, textAlign: 'center' }}>
+                            Ни один акк не выбран — сначала отметь чекбоксами в списке акков
+                          </div>
+                        ) : (
+                          [...selectedIds].map(accId => {
+                            const acc = accounts.find(a => a.id === accId)
+                            const label = acc ? (acc.first_name ? `${acc.first_name} · ${acc.phone}` : acc.phone) : `#${accId}`
+                            const entry = prepChCustomPosts[accId] || { text: '', photoFile: null }
+                            return (
+                              <div key={accId} style={{
+                                padding: 8, borderRadius: 5, background: 'var(--bg-3)',
+                                border: '1px solid var(--border)',
+                              }}>
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                                  <code style={{ fontSize: 10, color: 'var(--text-2)' }}>{label}</code>
+                                  {(entry.text || entry.photoFile) && (
+                                    <button onClick={() => setPrepChCustomPosts(prev => {
+                                      const next = { ...prev }; delete next[accId]; return next
+                                    })} style={{
+                                      background: 'transparent', border: 'none', cursor: 'pointer',
+                                      color: 'var(--text-3)', fontSize: 10,
+                                    }}>✕ очистить</button>
+                                  )}
+                                </div>
+                                <textarea value={entry.text}
+                                  onChange={e => setPrepChCustomPosts(prev => ({
+                                    ...prev, [accId]: { ...(prev[accId] || {}), text: e.target.value }
+                                  }))}
+                                  placeholder="Текст поста для этого акка (опционально)"
+                                  maxLength={4096}
+                                  style={{
+                                    width: '100%', minHeight: 40, padding: 6,
+                                    background: 'var(--bg)', border: '1px solid var(--border)',
+                                    borderRadius: 4, color: 'var(--text)', fontSize: 11, resize: 'vertical',
+                                  }} />
+                                <div style={{ marginTop: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
+                                  <label style={{
+                                    padding: '3px 8px', borderRadius: 4, cursor: 'pointer',
+                                    background: 'var(--bg)', border: '1px solid var(--border)',
+                                    fontSize: 10, color: 'var(--text-2)',
+                                  }}>
+                                    📎 {entry.photoFile ? 'сменить' : 'фото/видео'}
+                                    <input type="file"
+                                      accept="image/*,video/*,.mov,.mkv,.avi,.m4v"
+                                      style={{ display: 'none' }}
+                                      onChange={e => {
+                                        const f = e.target.files?.[0]
+                                        if (!f) return
+                                        setPrepChCustomPosts(prev => ({
+                                          ...prev, [accId]: { ...(prev[accId] || {}), photoFile: f }
+                                        }))
+                                        e.target.value = ''
+                                      }} />
+                                  </label>
+                                  {entry.photoFile && (() => {
+                                    const nameLower = (entry.photoFile.name || '').toLowerCase()
+                                    const isVideo = (entry.photoFile.type || '').startsWith('video/') ||
+                                      VIDEO_EXTS.some(ext => nameLower.endsWith(ext))
+                                    const mb = entry.photoFile.size / (1024 * 1024)
+                                    return (
+                                      <>
+                                        <span style={{ fontSize: 10, color: 'var(--text-2)', flex: 1,
+                                          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                          {isVideo ? '🎬' : '🖼'} {entry.photoFile.name}
+                                        </span>
+                                        <span style={{ fontSize: 9, color: 'var(--text-3)' }}>
+                                          {mb >= 1 ? `${mb.toFixed(1)} MB` : `${(entry.photoFile.size / 1024).toFixed(0)} KB`}
+                                        </span>
+                                        <button onClick={() => setPrepChCustomPosts(prev => ({
+                                          ...prev, [accId]: { ...(prev[accId] || {}), photoFile: null }
+                                        }))} style={{
+                                          background: 'transparent', border: 'none', cursor: 'pointer',
+                                          color: 'var(--text-3)', fontSize: 12,
+                                        }}>×</button>
+                                      </>
+                                    )
+                                  })()}
+                                </div>
+                              </div>
+                            )
+                          })
+                        )}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Аватарки канала (drag-and-drop) */}
+                  <div>
+                    <div style={{ fontSize: 11, color: 'var(--text-2)', marginBottom: 4, fontWeight: 600 }}>
+                      Аватарки канала (опционально — если нужно поставить фото на канал)
+                    </div>
+                    <div
+                      onClick={() => prepChFileInputRef.current?.click()}
+                      onDragOver={e => { e.preventDefault(); e.stopPropagation(); setPrepChDragOver(true) }}
+                      onDragEnter={e => { e.preventDefault(); e.stopPropagation(); setPrepChDragOver(true) }}
+                      onDragLeave={e => { e.preventDefault(); e.stopPropagation(); setPrepChDragOver(false) }}
+                      onDrop={e => {
+                        e.preventDefault(); e.stopPropagation(); setPrepChDragOver(false)
+                        addPrepChFiles(e.dataTransfer.files)
+                      }}
+                      style={{
+                        padding: 12, textAlign: 'center', cursor: 'pointer',
+                        border: `2px dashed ${prepChDragOver ? 'var(--violet)' : 'var(--border)'}`,
+                        borderRadius: 6,
+                        background: prepChDragOver ? 'rgba(139,92,246,0.10)' : 'var(--bg-3)',
+                        fontSize: 11, color: 'var(--text-2)',
+                        transition: 'all 0.15s ease',
+                      }}>
+                      {prepChAvatarFiles.length === 0
+                        ? (prepChDragOver ? '📥 Отпусти чтобы добавить' : '🖼️ Перетащи или кликни · распределятся рандомно')
+                        : `✓ ${prepChAvatarFiles.length} файл(ов) — кликни/перетащи чтобы дополнить`}
+                    </div>
+                    <input ref={prepChFileInputRef} type="file" accept="image/*" multiple
+                      style={{ display: 'none' }}
+                      onChange={e => { addPrepChFiles(e.target.files); e.target.value = '' }} />
+                    {prepChAvatarFiles.length > 0 && (
+                      <div style={{
+                        marginTop: 6, maxHeight: 100, overflowY: 'auto',
+                        background: 'var(--bg-3)', borderRadius: 4, padding: 4,
+                      }}>
+                        {prepChAvatarFiles.map((f, i) => (
+                          <div key={`${f.name}-${f.size}-${i}`} style={{
+                            display: 'flex', alignItems: 'center', gap: 6,
+                            padding: '3px 6px', fontSize: 10,
+                          }}>
+                            <span style={{ color: 'var(--text-3)' }}>🖼</span>
+                            <span style={{ color: 'var(--text-2)', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                              {f.name}
+                            </span>
+                            <button onClick={(ev) => { ev.stopPropagation(); removePrepChFile(i) }}
+                              style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: 'var(--text-3)', fontSize: 12 }}>×</button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {/* Удалить старую аватарку канала перед uploadом новой.
+                        В fast-mode бесполезно (канал только создан), но
+                        оставлено для plan-mode когда set_channel_avatar
+                        может выполняться после существующего create_channel. */}
+                    <label style={{
+                      marginTop: 8, padding: '6px 10px', borderRadius: 6,
+                      background: prepDeletePrevChannelAvatar ? 'rgba(239,68,68,0.08)' : 'var(--bg-3)',
+                      border: `1px solid ${prepDeletePrevChannelAvatar ? 'rgba(239,68,68,0.35)' : 'var(--border)'}`,
+                      display: 'flex', alignItems: 'flex-start', gap: 6, cursor: 'pointer',
+                    }}>
+                      <input type="checkbox"
+                        checked={prepDeletePrevChannelAvatar}
+                        onChange={e => setPrepDeletePrevChannelAvatar(e.target.checked)}
+                        style={{ marginTop: 2 }} />
+                      <div>
+                        <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text)' }}>
+                          🗑 Удалить старую аватарку канала перед uploadом
+                        </div>
+                        <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2, lineHeight: 1.4 }}>
+                          В одной сессии: сначала снимет фото → пауза 2-5с → поставит новую. Актуально в plan-mode.
+                        </div>
+                      </div>
+                    </label>
+                  </div>
+
+                  {/* ── Публичный канал ── */}
+                  <div style={{
+                    padding: 10, borderRadius: 8,
+                    background: prepChPublic ? 'rgba(139,92,246,0.06)' : 'var(--bg-3)',
+                    border: `1px solid ${prepChPublic ? 'var(--violet)' : 'var(--border)'}`,
+                  }}>
+                    <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' }}>
+                      <input type="checkbox"
+                        checked={prepChPublic}
+                        onChange={e => setPrepChPublic(e.target.checked)}
+                        style={{ marginTop: 2 }} />
+                      <div>
+                        <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>
+                          🌍 Публичный канал (с @username)
+                        </div>
+                        <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 3, lineHeight: 1.4 }}>
+                          После создания канала попробует поставить @username из пула ниже.
+                          Если имя занято → добавит числовой суффикс (например
+                          <code style={{ background: 'var(--bg)', padding: '0 3px', borderRadius: 2 }}>mychannel</code>
+                          →
+                          <code style={{ background: 'var(--bg)', padding: '0 3px', borderRadius: 2 }}>mychannel4287</code>).
+                          Без чекбокса — приватный канал с t.me/+invite ссылкой.
+                        </div>
+                      </div>
+                    </label>
+                    {prepChPublic && (
+                      <div style={{ marginTop: 10 }}>
+                        <div style={{ fontSize: 11, color: 'var(--text-2)', marginBottom: 4, fontWeight: 600 }}>
+                          Пул username'ов (по одному на строку)
+                        </div>
+                        <textarea value={prepChUsernames}
+                          onChange={e => setPrepChUsernames(e.target.value)}
+                          placeholder={`mychannel\nnewsdaily\nlifeblog\ncryptocorner`}
+                          style={{
+                            width: '100%', minHeight: 70, padding: 8,
+                            background: 'var(--bg)', border: '1px solid var(--border)',
+                            borderRadius: 6, color: 'var(--text)', fontSize: 12,
+                            fontFamily: 'monospace', resize: 'vertical',
+                          }} />
+                        <div style={{ marginTop: 4, fontSize: 10, color: 'var(--text-3)', lineHeight: 1.4 }}>
+                          Правила Telegram: 5-32 символа, начинается с буквы,
+                          латиница/цифры/подчёркивание.
+                          Валидных: <b style={{ color: prepChValidUsernames.length > 0 ? 'var(--green)' : 'var(--red)' }}>
+                            {prepChValidUsernames.length}
+                          </b>
+                          {' '}из {prepChUsernames.split('\n').filter(s => s.trim()).length} введённых.
+                          Каждому акку — случайный из пула, при коллизии — суффикс.
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Pin */}
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--text-2)', cursor: 'pointer' }}>
+                    <input type="checkbox" checked={prepChPin}
+                      onChange={e => setPrepChPin(e.target.checked)} />
+                    📌 Закрепить канал в профиле (рекомендуется — выглядит как «личный канал автора»)
+                  </label>
+                </div>
+              )}
+            </div>
+
+            {/* Режим: fast / plan */}
+            <div style={{ padding: 12, borderRadius: 8, background: 'var(--bg-2)', border: '1px solid var(--border)' }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)', marginBottom: 8 }}>
+                🎛 Режим выполнения
+              </div>
+              <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+                <button type="button"
+                  onClick={() => setPrepMode('fast')}
+                  style={{
+                    flex: 1, padding: '10px 12px', borderRadius: 6, cursor: 'pointer',
+                    background: prepMode === 'fast' ? 'rgba(139,92,246,0.15)' : 'var(--bg-3)',
+                    border: `1px solid ${prepMode === 'fast' ? 'var(--violet)' : 'var(--border)'}`,
+                    color: 'var(--text)', fontSize: 12, textAlign: 'left',
+                  }}>
+                  <div style={{ fontWeight: 700 }}>⚡ Быстро</div>
+                  <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 3 }}>
+                    По одному коннекту на акк. Все действия за раз. Пауза между акками 60-180 сек.
+                  </div>
+                </button>
+                <button type="button"
+                  onClick={() => setPrepMode('plan')}
+                  style={{
+                    flex: 1, padding: '10px 12px', borderRadius: 6, cursor: 'pointer',
+                    background: prepMode === 'plan' ? 'rgba(139,92,246,0.15)' : 'var(--bg-3)',
+                    border: `1px solid ${prepMode === 'plan' ? 'var(--violet)' : 'var(--border)'}`,
+                    color: 'var(--text)', fontSize: 12, textAlign: 'left',
+                  }}>
+                  <div style={{ fontWeight: 700 }}>🗓 План (расписание) ⭐</div>
+                  <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 3 }}>
+                    N сессий на акк, действия разбиты во времени. Разные акки идут параллельно
+                    на разных прокси. Выглядит как «человек заходит в TG в разное время».
+                  </div>
+                </button>
+              </div>
+
+              {prepMode === 'fast' && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{ fontSize: 12, color: 'var(--text-2)' }}>Пауза между акками</span>
+                  <input type="number" value={prepMinDelay} min={10} max={3600}
+                    onChange={e => setPrepMinDelay(Math.max(10, Math.min(3600, parseInt(e.target.value || '60'))))}
+                    style={{ width: 70, padding: '5px 8px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text)', fontSize: 12 }} />
+                  <span style={{ fontSize: 12, color: 'var(--text-3)' }}>—</span>
+                  <input type="number" value={prepMaxDelay} min={prepMinDelay} max={3600}
+                    onChange={e => setPrepMaxDelay(Math.max(prepMinDelay, Math.min(3600, parseInt(e.target.value || '180'))))}
+                    style={{ width: 70, padding: '5px 8px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text)', fontSize: 12 }} />
+                  <span style={{ fontSize: 12, color: 'var(--text-2)' }}>сек</span>
+                  <div style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--text-3)' }}>
+                    ≈ {(() => {
+                      const avg = (prepMinDelay + prepMaxDelay) / 2
+                      const totalSec = selectedIds.size * avg
+                      if (totalSec < 60) return `${Math.round(totalSec)} сек`
+                      if (totalSec < 3600) return `${Math.round(totalSec / 60)} мин`
+                      const h = Math.floor(totalSec / 3600), m = Math.round((totalSec % 3600) / 60)
+                      return `${h}ч ${m}м`
+                    })()}
+                  </div>
+                </div>
+              )}
+
+              {prepMode === 'plan' && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ fontSize: 12, color: 'var(--text-2)', minWidth: 130 }}>
+                      Уложиться за (часов):
+                    </span>
+                    <input type="number" step="0.1" min={0.1} max={24}
+                      value={prepDurationHours}
+                      onChange={e => {
+                        setPrepDurationUserEdited(true)
+                        setPrepDurationHours(Math.max(0.1, Math.min(24, parseFloat(e.target.value || '0.5'))))
+                      }}
+                      style={{ width: 80, padding: '5px 8px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text)', fontSize: 12 }} />
+                    {prepRecommend && (
+                      <div style={{ marginLeft: 'auto', fontSize: 11 }}>
+                        <span style={{ color: 'var(--text-3)' }}>рекомендация: </span>
+                        <button type="button" onClick={() => {
+                          setPrepDurationUserEdited(false)
+                          setPrepDurationHours(prepRecommend.recommended_hours)
+                        }}
+                          style={{ background: 'none', border: 'none', color: 'var(--violet)', fontWeight: 600, cursor: 'pointer', fontSize: 11 }}>
+                          {prepRecommend.recommended_hours}ч
+                        </button>
+                        <span style={{ color: 'var(--text-3)' }}>
+                          {' '}(мин {prepRecommend.min_hours}ч)
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ fontSize: 12, color: 'var(--text-2)', minWidth: 130 }}>
+                      Сессий на акк:
+                    </span>
+                    <input type="number" min={1} max={6}
+                      value={prepSessionsPerAcc}
+                      onChange={e => setPrepSessionsPerAcc(Math.max(1, Math.min(6, parseInt(e.target.value || '3'))))}
+                      style={{ width: 80, padding: '5px 8px', background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 6, color: 'var(--text)', fontSize: 12 }} />
+                    <span style={{ fontSize: 11, color: 'var(--text-3)', marginLeft: 8 }}>
+                      действий распределится по сессиям в разном порядке для каждого акка
+                    </span>
+                  </div>
+                  <div style={{
+                    padding: '6px 10px', borderRadius: 6, fontSize: 11,
+                    background: 'rgba(61,214,140,0.06)', border: '1px dashed rgba(61,214,140,0.30)',
+                    color: 'var(--text-2)',
+                  }}>
+                    🕐 <b>{selectedIds.size}</b> акк(ов) × <b>{prepSessionsPerAcc}</b> сессий за <b>{prepDurationHours}ч</b> ≈
+                    {' '}{Math.round((selectedIds.size * prepSessionsPerAcc * 60) / (prepDurationHours * 60))} акк·сессий/час.
+                    Разные прокси идут параллельно, один прокси — по очереди.
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'space-between', alignItems: 'center' }}>
+              <button type="button"
+                onClick={() => {
+                  if (window.confirm('Очистить всю форму подготовки? Тексты, чекбоксы, имена, username\'ы — всё обнулится (файлы уже эфемерны).'))
+                    clearPrepForm()
+                }}
+                style={{
+                  background: 'transparent', border: 'none', cursor: 'pointer',
+                  color: 'var(--text-3)', fontSize: 11, textDecoration: 'underline',
+                }}
+                title="Форма автосохраняется в localStorage. Эта кнопка обнуляет всё.">
+                🗑 Очистить форму
+              </button>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <Button variant="ghost" onClick={() => setPrepModal(false)}>Отмена</Button>
+                <Button variant="primary" loading={prepStarting} onClick={handlePrepStart}>
+                  🚀 Запустить {prepMode === 'plan' ? 'план' : 'подготовку'}
+                </Button>
+              </div>
+            </div>
+          </div>
+        ) : (
+          /* Прогресс */
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            {prepProgress && prepProgress._mode !== 'plan' && (
+              /* ── FAST MODE PROGRESS ─────────────────────────── */
+              <>
+                <div style={{ fontSize: 13, color: 'var(--text)' }}>
+                  Статус: <b>{prepProgress.status === 'done' ? '✅ Готово' :
+                            prepProgress.status === 'queued' ? '⏳ В очереди…' :
+                            prepProgress.status === 'error' ? '❌ Ошибка' : '🔄 Работаем…'}</b>
+                </div>
+                <div style={{ background: 'var(--bg-2)', borderRadius: 8, padding: '10px 14px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 6 }}>
+                    <span style={{ fontSize: 12, color: 'var(--text-2)' }}>
+                      Обработано: <b>{prepProgress.done || 0}</b> / {prepProgress.total || 0}
+                    </span>
+                    <span style={{ fontSize: 11, color: 'var(--text-3)' }}>
+                      <span style={{ color: 'var(--green)' }}>{prepProgress.ok || 0} ok</span>
+                      {prepProgress.failed > 0 && (
+                        <span style={{ color: 'var(--red)', marginLeft: 8 }}>{prepProgress.failed} fail</span>
+                      )}
+                    </span>
+                  </div>
+                  <div style={{ height: 8, background: 'var(--bg-3)', borderRadius: 4, overflow: 'hidden' }}>
+                    <div style={{
+                      height: '100%',
+                      width: `${Math.min(100, ((prepProgress.done || 0) / Math.max(1, prepProgress.total || 1)) * 100)}%`,
+                      background: 'var(--violet)', transition: 'width 0.5s',
+                    }} />
+                  </div>
+                  {prepProgress.current_phone && prepProgress.status !== 'done' && (
+                    <div style={{ marginTop: 8, fontSize: 11, color: 'var(--text-3)' }}>
+                      Сейчас: <code style={{ background: 'var(--bg-3)', padding: '1px 5px', borderRadius: 3 }}>{prepProgress.current_phone}</code>
+                      {prepProgress.sleeping_sec > 0 && (
+                        <span style={{ marginLeft: 8 }}>💤 пауза {prepProgress.sleeping_sec}с</span>
+                      )}
+                    </div>
+                  )}
+                </div>
+                {prepProgress.results && prepProgress.results.length > 0 && (
+                  <div style={{
+                    maxHeight: 200, overflowY: 'auto',
+                    background: 'var(--bg-3)', borderRadius: 6, padding: 8,
+                    fontFamily: 'monospace', fontSize: 11,
+                  }}>
+                    {prepProgress.results.slice().reverse().map((r, i) => (
+                      <div key={i} style={{
+                        display: 'flex', gap: 8, padding: '3px 6px',
+                        color: r.success ? 'var(--text-2)' : 'var(--red)',
+                      }}>
+                        <span style={{ color: r.success ? 'var(--green)' : 'var(--red)' }}>
+                          {r.success ? '✓' : '✗'}
+                        </span>
+                        <span>{r.phone}</span>
+                        <span style={{ marginLeft: 'auto', opacity: 0.7 }}>
+                          {r.success ? (r.message || 'ok') : (r.error || 'err')}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+
+            {prepProgress && prepProgress._mode === 'plan' && (
+              /* ── PLAN MODE PROGRESS ─────────────────────────── */
+              <>
+                <div style={{ fontSize: 13, color: 'var(--text)' }}>
+                  {(() => {
+                    const phase = prepProgress.phase || (
+                      prepProgress.status === 'done' ? 'done' :
+                      prepProgress.status === 'idle' ? 'generating' :
+                      'running'
+                    )
+                    // Ближайшая pending-сессия для отображения "первая в HH:MM"
+                    let nextTs = null
+                    if (prepProgress.accounts) {
+                      for (const a of prepProgress.accounts) {
+                        for (const s of (a.sessions || [])) {
+                          if (['pending', 'scheduled'].includes(s.status)) {
+                            if (nextTs === null || s.connect_ts < nextTs) nextTs = s.connect_ts
+                          }
+                        }
+                      }
+                    }
+                    const nextTime = nextTs ? new Date(nextTs * 1000).toLocaleTimeString('ru-RU', {hour:'2-digit', minute:'2-digit'}) : null
+                    const now = Math.floor(Date.now() / 1000)
+                    const nextIn = nextTs ? Math.max(0, nextTs - now) : null
+                    const nextInStr = nextIn == null ? null :
+                      nextIn < 60 ? `${nextIn}с` :
+                      nextIn < 3600 ? `${Math.round(nextIn / 60)}м` :
+                      `${Math.floor(nextIn/3600)}ч ${Math.round((nextIn%3600)/60)}м`
+                    return (
+                      <>
+                        Статус: <b>
+                          {phase === 'generating' ? '🧠 Генерирую расписание сессий…' :
+                           phase === 'scheduled' ? `🗓 Запланировано${nextTime ? `, первая сессия в ${nextTime} (через ${nextInStr})` : ''}` :
+                           phase === 'running' ? '🔄 План идёт' :
+                           phase === 'cancelling' ? '🛑 Останавливаю…' :
+                           phase === 'cancelled' ? '⛔ Остановлено' :
+                           phase === 'done' ? '✅ Все сессии выполнены' :
+                           '🔄 План идёт…'}
+                        </b>
+                        {phase === 'generating' && (
+                          <div style={{ marginTop: 4, fontSize: 11, color: 'var(--text-3)' }}>
+                            Обычно занимает 1-3 секунды. Если висит &gt; 30 сек — Celery worker может быть не запущен.
+                          </div>
+                        )}
+                        {phase === 'cancelling' && (
+                          <div style={{ marginTop: 4, fontSize: 11, color: 'var(--text-3)' }}>
+                            Revoke отправлен в Celery — очередь чистится. Через 1-2 сек всё будет cancelled.
+                          </div>
+                        )}
+                        {['running', 'scheduled', 'cancelling'].includes(phase) && (
+                          <div style={{ marginTop: 8 }}>
+                            <Button variant="ghost" size="sm"
+                              loading={prepCancelling}
+                              disabled={phase === 'cancelling'}
+                              onClick={handlePrepPlanCancel}
+                              style={{ color: 'var(--red)' }}>
+                              🛑 Остановить план
+                            </Button>
+                          </div>
+                        )}
+                        {/* Дожать: показываем на done/cancelled если есть skipped/failed */}
+                        {['done', 'cancelled'].includes(phase) && prepProgress.totals && (
+                          (prepProgress.totals.sessions_failed || 0) +
+                          (prepProgress.totals.sessions_skipped || 0) > 0
+                        ) && (
+                          <div style={{ marginTop: 8 }}>
+                            <Button variant="primary" size="sm"
+                              loading={prepResuming}
+                              onClick={handlePrepPlanResume}>
+                              🔄 Дожать skipped/failed ({(prepProgress.totals.sessions_skipped || 0) + (prepProgress.totals.sessions_failed || 0)})
+                            </Button>
+                          </div>
+                        )}
+                        {/* Refix первого поста: показываем на done/running если в job'е был create_channels */}
+                        {prepProgress.meta?.config?.create_channels && (
+                          <div style={{ marginTop: 8, display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                            <Button variant="secondary" size="sm"
+                              loading={prepRefixingVideo}
+                              onClick={handlePrepRefixVideo}
+                              title="Заменить первый пост во всех каналах этого job'а на новое видео/фото. Полезно если .mov отправился как документ.">
+                              🎬 Перезалить первый пост
+                            </Button>
+                            <Button variant="secondary" size="sm"
+                              loading={prepRefixingAva}
+                              onClick={handlePrepRefixAva}
+                              title="Поставить/сменить аватарку у всех каналов этого job'а. Полезно если забыл включить чекбокс при запуске плана.">
+                              🖼 Аватарка канала
+                            </Button>
+                            <Button variant="secondary" size="sm"
+                              loading={prepRefixingAttach}
+                              onClick={handlePrepRefixAttach}
+                              title="Прикрепить созданный канал к профилю юзера (personal_channel — значок канала в профиле, не в закреплённых чатах). Файл не нужен.">
+                              🔗 Прикрепить канал в профиль
+                            </Button>
+                            <input ref={prepRefixFileInputRef} type="file"
+                              accept="image/*,video/*,.mov,.mkv,.avi,.m4v"
+                              style={{ display: 'none' }}
+                              onChange={e => {
+                                const f = e.target.files?.[0]
+                                if (!f) return
+                                const cap = window.prompt(
+                                  '🎬 Refix первого поста\n\n' +
+                                  `Файл: ${f.name} (${(f.size/(1024*1024)).toFixed(1)} MB)\n\n` +
+                                  'Каналы обхода: все где успел создаться канал в этом job\'е.\n' +
+                                  'Между акками — пауза 30-90 сек + IP throttle.\n\n' +
+                                  'Подпись под медиа (опционально):', ''
+                                )
+                                if (cap === null) { e.target.value = ''; return }
+                                handlePrepRefixVideoFile(f, cap)
+                                e.target.value = ''
+                              }} />
+                            <input ref={prepRefixAvaInputRef} type="file"
+                              accept="image/*"
+                              style={{ display: 'none' }}
+                              onChange={e => {
+                                const f = e.target.files?.[0]
+                                if (!f) return
+                                const delPrev = window.confirm(
+                                  '🖼 Refix аватарки канала\n\n' +
+                                  `Файл: ${f.name} (${(f.size/1024).toFixed(0)} KB)\n\n` +
+                                  'Ставится в ВСЕ каналы акков этого job\'а.\n' +
+                                  'Между акками — пауза 30-90 сек + IP throttle.\n\n' +
+                                  'Удалить старую аватарку сначала? (если каналы уже что-то имели)\n' +
+                                  '  OK = удалить старую → пауза 2-5 сек → поставить новую\n' +
+                                  '  Cancel = просто поставить новую поверх'
+                                )
+                                handlePrepRefixAvaFile(f, delPrev)
+                                e.target.value = ''
+                              }} />
+                          </div>
+                        )}
+                        {/* ── Прогресс refix'ов (avatar + video) ── */}
+                        {['avatar', 'video', 'attach'].map(kind => {
+                          const rp = prepRefixProgress[kind]
+                          if (!rp || rp.status === 'idle') return null
+                          const label =
+                            kind === 'avatar' ? '🖼 Аватарки каналов'
+                            : kind === 'video' ? '🎬 Первый пост'
+                            : '🔗 Прикрепление канала в профиль'
+                          const done = rp.done || 0
+                          const total = rp.total || 0
+                          const ok = rp.ok || 0
+                          const fail = rp.failed || 0
+                          const pct = total > 0 ? Math.round((done / total) * 100) : 0
+                          const isDone = rp.status === 'done'
+                          const isError = rp.status === 'error'
+                          const isCancelled = rp.status === 'cancelled'
+                          const isStale = !!rp.stale
+                          const bgColor = isDone ? 'rgba(61,214,140,0.08)'
+                                        : isError ? 'rgba(248,81,73,0.10)'
+                                        : isCancelled ? 'rgba(150,150,150,0.10)'
+                                        : 'rgba(139,92,246,0.08)'
+                          const borderColor = isDone ? 'rgba(61,214,140,0.35)'
+                                            : isError ? 'rgba(248,81,73,0.45)'
+                                            : isCancelled ? 'rgba(150,150,150,0.35)'
+                                            : 'rgba(139,92,246,0.35)'
+                          const titleIcon = isDone ? '✅'
+                                          : isError ? '❌'
+                                          : isCancelled ? '⏹'
+                                          : '🔄'
+                          return (
+                            <div key={kind} style={{
+                              marginTop: 8, padding: '8px 12px', borderRadius: 6,
+                              background: bgColor,
+                              border: `1px solid ${borderColor}`,
+                              fontSize: 11,
+                            }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                                <b style={{ color: 'var(--text)' }}>
+                                  {titleIcon} {label} · {done}/{total} акк
+                                </b>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                                  <span style={{ color: 'var(--text-3)' }}>
+                                    <span style={{ color: 'var(--green)' }}>{ok} ok</span>
+                                    {fail > 0 && <span style={{ color: 'var(--red)', marginLeft: 8 }}>{fail} fail</span>}
+                                  </span>
+                                  {(isError || isDone || isCancelled) && (
+                                    <button
+                                      onClick={() => setPrepRefixProgress(prev => {
+                                        const next = { ...prev }; delete next[kind]; return next
+                                      })}
+                                      title="Закрыть баннер"
+                                      style={{
+                                        background: 'none', border: 'none',
+                                        color: 'var(--text-3)', cursor: 'pointer',
+                                        fontSize: 14, padding: '0 4px', lineHeight: 1,
+                                      }}
+                                    >✕</button>
+                                  )}
+                                </div>
+                              </div>
+                              {isError && (
+                                <div style={{ color: 'var(--red)', marginTop: 4, marginBottom: 4 }}>
+                                  {isStale ? '⚠ Воркер умер, задача прервана. ' : ''}
+                                  {rp.error || 'Ошибка выполнения. Запусти заново.'}
+                                </div>
+                              )}
+                              <div style={{ height: 4, background: 'var(--bg-3)', borderRadius: 2, overflow: 'hidden' }}>
+                                <div style={{
+                                  height: '100%', width: `${pct}%`,
+                                  background: isDone ? 'var(--green)' : 'var(--violet)',
+                                  transition: 'width 0.5s',
+                                }} />
+                              </div>
+                              {!isDone && rp.current_phone && (
+                                <div style={{ marginTop: 4, color: 'var(--text-3)' }}>
+                                  Сейчас: <code style={{ background: 'var(--bg-3)', padding: '1px 4px', borderRadius: 3 }}>{rp.current_phone}</code>
+                                  {rp.sleeping_sec > 0 && <span style={{ marginLeft: 6 }}>💤 пауза {rp.sleeping_sec}с</span>}
+                                </div>
+                              )}
+                              {/* Список последних результатов + retry статус */}
+                              {rp.results && rp.results.length > 0 && (
+                                <div style={{
+                                  marginTop: 6, maxHeight: 150, overflowY: 'auto',
+                                  background: 'var(--bg-3)', borderRadius: 4, padding: 4,
+                                  fontSize: 10, fontFamily: 'monospace',
+                                }}>
+                                  {rp.results.slice().reverse().map((r, i) => {
+                                    const reason = r.reason || ''
+                                    const isRetrying = reason.includes('(retry ') || reason.includes('жду и повторю')
+                                    const isFlood = reason.toLowerCase().includes('floodwait') ||
+                                                    reason.toLowerCase().includes('wait of')
+                                    let icon = r.ok ? '✓' : '✗'
+                                    let color = r.ok ? 'var(--green)' : 'var(--red)'
+                                    if (isRetrying) { icon = '🔁'; color = '#f97316' }
+                                    else if (isFlood && !r.ok) { icon = '⏰'; color = '#eab308' }
+                                    return (
+                                      <div key={i} style={{
+                                        display: 'flex', gap: 6, padding: '2px 4px',
+                                        color: r.ok ? 'var(--text-2)' : (isRetrying ? '#f97316' : 'var(--red)'),
+                                      }}>
+                                        <span style={{ color }}>{icon}</span>
+                                        <span>{r.phone || `acc:${r.acc_id}`}</span>
+                                        {r.attempts > 1 && (
+                                          <span style={{ color: 'var(--text-3)', marginLeft: 2 }}>×{r.attempts}</span>
+                                        )}
+                                        {reason && (
+                                          <span style={{ marginLeft: 'auto', opacity: 0.7 }}>
+                                            {reason.slice(0, 60)}
+                                          </span>
+                                        )}
+                                      </div>
+                                    )
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          )
+                        })}
+                      </>
+                    )
+                  })()}
+                </div>
+                {prepProgress.totals && (
+                  <div style={{ background: 'var(--bg-2)', borderRadius: 8, padding: '10px 14px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6, fontSize: 12, color: 'var(--text-2)' }}>
+                      <span>Сессий: <b>{prepProgress.totals.sessions_done}</b> / {prepProgress.totals.sessions_total}</span>
+                      <span style={{ display: 'flex', gap: 8 }}>
+                        <span style={{ color: 'var(--green)' }}>{prepProgress.totals.sessions_done} ok</span>
+                        {prepProgress.totals.sessions_failed > 0 && (
+                          <span style={{ color: 'var(--red)' }}>{prepProgress.totals.sessions_failed} fail</span>
+                        )}
+                        {(prepProgress.totals.sessions_skipped || 0) > 0 && (
+                          <span style={{ color: '#94a3b8' }}>{prepProgress.totals.sessions_skipped} skip</span>
+                        )}
+                        <span style={{ color: 'var(--text-3)' }}>{prepProgress.totals.sessions_pending} ждут</span>
+                      </span>
+                    </div>
+                    <div style={{ height: 8, background: 'var(--bg-3)', borderRadius: 4, overflow: 'hidden' }}>
+                      <div style={{
+                        height: '100%',
+                        width: `${Math.min(100, ((prepProgress.totals.sessions_done || 0) / Math.max(1, prepProgress.totals.sessions_total || 1)) * 100)}%`,
+                        background: 'var(--violet)', transition: 'width 0.5s',
+                      }} />
+                    </div>
+                    {prepProgress.meta?.target_duration_sec && (
+                      <div style={{ marginTop: 6, fontSize: 11, color: 'var(--text-3)' }}>
+                        🕐 Целевое время: {Math.round(prepProgress.meta.target_duration_sec / 3600 * 10) / 10}ч ·
+                        {' '}{prepProgress.totals.accounts_total} акк ·
+                        {' '}начато {new Date(prepProgress.meta.start_ts * 1000).toLocaleTimeString('ru-RU', {hour:'2-digit', minute:'2-digit'})}
+                      </div>
+                    )}
+                  </div>
+                )}
+                {prepProgress.accounts && prepProgress.accounts.length > 0 && (
+                  <div style={{
+                    maxHeight: 320, overflowY: 'auto',
+                    background: 'var(--bg-3)', borderRadius: 6, padding: 4,
+                    fontSize: 11,
+                  }}>
+                    {prepProgress.accounts.map(a => (
+                      <div key={a.account_id} style={{
+                        padding: '6px 8px', borderBottom: '1px solid var(--bg-2)',
+                      }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+                          <code style={{ background: 'var(--bg-2)', padding: '1px 5px', borderRadius: 3, fontSize: 11 }}>
+                            {a.phone}
+                          </code>
+                          <span style={{ fontSize: 10, color: 'var(--text-3)' }}>
+                            <span style={{ color: 'var(--green)' }}>{a.sessions_done}</span>
+                            {' / '}
+                            {a.sessions_total} сессий
+                            {a.sessions_failed > 0 && (
+                              <span style={{ color: 'var(--red)', marginLeft: 4 }}>({a.sessions_failed} fail)</span>
+                            )}
+                          </span>
+                        </div>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                          {a.sessions.map((s, i) => {
+                            const nowMs = Date.now()
+                            const isPast = s.connect_ts * 1000 < nowMs
+                            const lateSec = isPast ? Math.floor((nowMs - s.connect_ts * 1000) / 1000) : 0
+                            const time = new Date(s.connect_ts * 1000).toLocaleTimeString('ru-RU', {hour:'2-digit', minute:'2-digit'})
+                            // Стили по статусу.
+                            //   failed_retry — сессия падала, Celery retry
+                            //     запланировал повтор. Оранжевый.
+                            //   late (pending + past connect_ts) — жёлтый
+                            //     (не запустилась вовремя, ждёт своей очереди
+                            //      или worker занят).
+                            // Терминальные статусы (без retry):
+                            //   done            — успех
+                            //   failed          — упало во время выполнения
+                            //   failed_permanent — legacy (со старых job'ов)
+                            //   skipped         — прокси/акк был занят, пропущено (без retry!)
+                            //   not_authorized  — сессия акка мертва
+                            //   cancelled       — юзер нажал стоп
+                            const isFailed = s.status === 'failed' || s.status === 'failed_permanent'
+                            const isSkipped = s.status === 'skipped'
+                            const isNotAuth = s.status === 'not_authorized'
+                            const isCancelled = s.status === 'cancelled'
+                            const bg = s.status === 'done' ? 'rgba(61,214,140,0.15)'
+                                     : isFailed ? 'rgba(239,68,68,0.15)'
+                                     : s.status === 'running' ? 'rgba(139,92,246,0.15)'
+                                     : isCancelled ? 'rgba(148,148,148,0.15)'
+                                     : isSkipped ? 'rgba(148,163,184,0.15)'
+                                     : isNotAuth ? 'rgba(239,68,68,0.10)'
+                                     : isPast ? 'rgba(234,179,8,0.15)' : 'var(--bg-2)'
+                            const color = s.status === 'done' ? 'var(--green)'
+                                       : isFailed ? 'var(--red)'
+                                       : s.status === 'running' ? 'var(--violet)'
+                                       : isCancelled ? 'var(--text-3)'
+                                       : isSkipped ? '#94a3b8'
+                                       : isNotAuth ? 'var(--red)'
+                                       : isPast ? '#eab308' : 'var(--text-3)'
+                            const icon = s.status === 'done' ? '✓'
+                                       : isFailed ? '✗'
+                                       : s.status === 'running' ? '⏳'
+                                       : isCancelled ? '⛔'
+                                       : isSkipped ? '⤵'
+                                       : isNotAuth ? '🔒'
+                                       : isPast ? '⏱' : '○'
+                            // Строим tooltip: время, actions, статус, причина
+                            const tipLines = []
+                            tipLines.push(`Время: ${new Date(s.connect_ts * 1000).toLocaleString('ru-RU')}`)
+                            tipLines.push(`Действия: ${(s.actions || []).join(', ')}`)
+                            if (s.status === 'done') {
+                              tipLines.push('✓ Готово')
+                              if (s.error) tipLines.push(`⚠ ${s.error}`)  // частичный успех
+                            } else if (isFailed) {
+                              tipLines.push(`✗ Провалено: ${s.error || 'unknown'}`)
+                            } else if (s.status === 'running') {
+                              tipLines.push('⏳ Идёт')
+                            } else if (isCancelled) {
+                              tipLines.push('⛔ Отменено')
+                              if (s.error) tipLines.push(s.error)
+                            } else if (isSkipped) {
+                              tipLines.push('⤵ Пропущено (без retry)')
+                              if (s.error) tipLines.push(s.error)
+                            } else if (isNotAuth) {
+                              tipLines.push('🔒 Сессия акка мертва')
+                              if (s.error) tipLines.push(s.error)
+                            } else if (isPast) {
+                              tipLines.push(`⏱ Опоздание ${lateSec < 60 ? lateSec + 'с' : Math.round(lateSec/60) + 'мин'}`)
+                              tipLines.push('Worker ещё не подхватил задачу (обычно означает что celery воркер перегружен)')
+                            } else {
+                              tipLines.push('○ Ждёт своего слота')
+                            }
+                            return (
+                              <span key={i} title={tipLines.join('\n')}
+                                style={{
+                                  padding: '2px 6px', borderRadius: 3, background: bg, color,
+                                  fontSize: 10, whiteSpace: 'nowrap', cursor: 'help',
+                                }}>
+                                {icon} {time} ({s.actions_count})
+                              </span>
+                            )
+                          })}
+                        </div>
+                        {/* Проблемные сессии — отдельная строка снизу с последней ошибкой */}
+                        {(() => {
+                          const problems = a.sessions.filter(s =>
+                            s.error || s.status === 'failed_retry' || s.status === 'failed_permanent' ||
+                            (s.status !== 'done' && s.status !== 'running' && s.connect_ts * 1000 < Date.now())
+                          )
+                          if (problems.length === 0) return null
+                          const lastProblem = problems[problems.length - 1]
+                          const nowMs = Date.now()
+                          let msg = ''
+                          if (lastProblem.status === 'cancelled') {
+                            msg = `⛔ Отменено — ${lastProblem.error || 'пользователем'}`
+                          } else if (lastProblem.status === 'skipped') {
+                            msg = `⤵ Пропущено — ${lastProblem.error || 'прокси/акк был занят'}`
+                          } else if (lastProblem.status === 'not_authorized') {
+                            msg = `🔒 ${lastProblem.error || 'Сессия акка мертва — переимпортируй'}`
+                          } else if (lastProblem.status === 'failed' || lastProblem.status === 'failed_permanent') {
+                            msg = `✗ Провалено — ${lastProblem.error || 'ошибка при выполнении'}`
+                          } else if (lastProblem.error) {
+                            msg = `⚠ ${lastProblem.error}`
+                          } else if (lastProblem.connect_ts * 1000 < nowMs) {
+                            const lateSec = Math.floor((nowMs - lastProblem.connect_ts * 1000) / 1000)
+                            const lateStr = lateSec < 60 ? `${lateSec}с` : `${Math.round(lateSec/60)}мин`
+                            msg = `⏱ Опоздание ${lateStr} — обычно из-за занятого прокси (акк ждёт освобождения IP-lock)`
+                          }
+                          if (!msg) return null
+                          const isRetry = lastProblem.status === 'failed_retry'
+                          const isFail = lastProblem.status === 'failed_permanent'
+                          const bg = isFail ? 'rgba(239,68,68,0.08)'
+                                   : isRetry ? 'rgba(249,115,22,0.08)'
+                                   : 'rgba(234,179,8,0.06)'
+                          const bd = isFail ? 'rgba(239,68,68,0.30)'
+                                   : isRetry ? 'rgba(249,115,22,0.30)'
+                                   : 'rgba(234,179,8,0.30)'
+                          return (
+                            <div style={{
+                              marginTop: 4, padding: '3px 8px', fontSize: 10,
+                              background: bg, border: `1px solid ${bd}`,
+                              borderRadius: 3, color: 'var(--text-2)',
+                            }}>
+                              {msg}
+                            </div>
+                          )
+                        })()}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'space-between' }}>
+              <Button variant="ghost" size="sm"
+                onClick={() => {
+                  if (prepPollRef.current) clearInterval(prepPollRef.current)
+                  setPrepJobId(null)
+                  setPrepProgress(null)
+                  // Модалка не закрывается — снова config-view
+                }}
+                title="Забыть этот job и открыть форму для нового">
+                ⟳ Новый job
+              </Button>
+              <Button variant="ghost" onClick={() => {
+                // НЕ снимаем polling — job продолжается в фоне,
+                // будет виден через floating badge
+                setPrepModal(false)
+              }}>
+                {prepProgress?.status === 'done' ? 'Закрыть' : 'Закрыть (job продолжится)'}
+              </Button>
+            </div>
+          </div>
+        )}
       </Modal>
     </div>
   )

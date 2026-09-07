@@ -100,3 +100,28 @@ async def get_api_key(
         return key
 
     return ""
+
+
+async def get_api_keys_pool(
+    db: AsyncSession,
+    user_id: int,
+    provider: str,
+) -> list[str]:
+    """Возвращает ВСЕ активные ключи юзера для провайдера (для ротации при 429).
+    Default-ключ идёт первым. Если в БД пусто — fallback на env (одиночный ключ)."""
+    provider = provider.lower().strip()
+    creds = (await db.execute(
+        select(ServiceCredential).where(
+            ServiceCredential.user_id == user_id,
+            ServiceCredential.provider == provider,
+            ServiceCredential.is_active == True,
+        ).order_by(ServiceCredential.is_default.desc(), ServiceCredential.id.asc())
+    )).scalars().all()
+    keys = [c.api_key for c in creds if c.api_key]
+    if keys:
+        return keys
+    env_var = ENV_MAP.get(provider)
+    if env_var:
+        k = os.getenv(env_var, "")
+        return [k] if k else []
+    return []

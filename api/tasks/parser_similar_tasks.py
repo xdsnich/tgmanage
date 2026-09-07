@@ -168,6 +168,13 @@ async def _get_entity_safe(client, username, max_flood_wait=60):
 
 async def _run_similar_crawler(user_id: int, account_id: int, params: dict):
     import redis
+    # Держим под рукой: используется в except при проверке пригодности,
+    # а импорт внутри try подвёл бы — если бы упал он сам, ветка обработки
+    # сломалась бы на NameError.
+    from telethon.errors import FloodWaitError as _FW_sc
+
+    class _CacheHit_sc(Exception):
+        """Вердикт нашёлся в кэше — выходим из блока проверки без запроса."""
 
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     r = redis.from_url(redis_url)
@@ -190,6 +197,22 @@ async def _run_similar_crawler(user_id: int, account_id: int, params: dict):
     # Если отключено, ждём wait + flood_cooldown_sec перед ретраем.
     stop_on_flood = bool(params.get("stop_on_flood", True))
     flood_cooldown_sec = int(params.get("flood_cooldown_sec", 300))
+
+    # ── Проверять пригодность прямо в обходе ──────────────────────
+    # Паутинка и так резолвит канал, чтобы узнать название и охват.
+    # Добавить к этому GetFullChannel — один лишний запрос, зато канал
+    # сразу попадает в базу с готовым вердиктом. Иначе после обхода
+    # накапливаются десятки тысяч непроверенных, и отдельный прогон
+    # разгребает их сутками.
+    # Порог по размеру обязателен: тратить запрос на канал в двести
+    # подписчиков смысла нет, а флуд он приближает так же, как крупный.
+    check_caps = bool(params.get("check_caps", False))
+    caps_min_subs = int(params.get("caps_min_subs", 5000))
+    # Ниже этого порога канал вообще не сохраняем. Рекомендации Telegram
+    # тянут вперемешку и крупные, и совсем мелкие; складывать в базу всё
+    # подряд — потом опять чистить десятки тысяч бесполезных записей, как
+    # было с картами сайта.
+    min_subs = int(params.get("min_subs", 0))
 
     # Start event
     start_time = time.time()
@@ -305,6 +328,13 @@ async def _run_similar_crawler(user_id: int, account_id: int, params: dict):
                     subs = getattr(chat, 'participants_count', 0) or 0
                     title = getattr(chat, 'title', chat.username) or chat.username
 
+                    if min_subs and subs < min_subs:
+                        # мелочь не сохраняем, но по ней всё равно можно
+                        # пойти вглубь — её рекомендации бывают крупными
+                        if depth + 1 < max_depth:
+                            queue.append((chat.username, depth + 1))
+                        continue
+
                     channel_data = {
                         "channel_id": chat.id,
                         "username": chat.username,
@@ -316,11 +346,68 @@ async def _run_similar_crawler(user_id: int, account_id: int, params: dict):
                         "source": "similar",
                     }
 
+                    # Пригодность выясняем до сохранения, чтобы записать
+                    # канал сразу с вердиктом.
+                    if check_caps and subs >= caps_min_subs:
+                        try:
+                            from telethon.tl.functions.channels import (
+                                GetFullChannelRequest as _GFC_sc)
+                            from utils.channel_caps import (
+                                extract_caps_from_full as _extract_sc,
+                                record_caps as _record_sc,
+                                get_cap as _getcap_sc)
+                            from utils.db_pool import async_session as _S_sc
+
+                            # ── Сначала спрашиваем кэш ───────────────────
+                            # Свойства канала общие для всех аккаунтов, и
+                            # вердикт по нему мог быть вынесен раньше — в
+                            # том числе по каналу, который потом удалили из
+                            # списка как непригодный. Кэш переживает такое
+                            # удаление, а обход рано или поздно приводит к
+                            # этому каналу снова. Без этой проверки мы жгли
+                            # запрос на то, что уже знаем: таких вердиктов
+                            # накоплено под шестнадцать тысяч, и каждый
+                            # лишний GetFull приближает флуд.
+                            async with _S_sc() as _db_sc:
+                                _known = await _getcap_sc(_db_sc, chat.username)
+                            if _known is not None:
+                                channel_data["has_comments"] = bool(
+                                    _known.get("commentable"))
+                                raise _CacheHit_sc
+
+                            _full = await client(_GFC_sc(chat))
+                            _caps = _extract_sc(_full, None)
+                            async with _S_sc() as _db_sc:
+                                _v = await _record_sc(_db_sc, chat.username, _caps,
+                                                      account_id=account_id,
+                                                      source="similar")
+                                await _db_sc.commit()
+                            channel_data["has_comments"] = bool(
+                                (_v or {}).get("commentable"))
+                        except _CacheHit_sc:
+                            # Вердикт взят из кэша — запрос в Telegram не нужен.
+                            pass
+                        except _FW_sc as _fw_sc:
+                            # Флуд на проверке — не роняем обход, просто
+                            # перестаём проверять до конца прогона.
+                            logger.warning(
+                                f"[similar] FloodWait на проверке @{chat.username}: "
+                                f"{_fw_sc.seconds}s — дальше только собираем"
+                            )
+                            check_caps = False
+                        except Exception as _e_sc:
+                            logger.debug(
+                                f"[similar] проверка @{chat.username}: "
+                                f"{type(_e_sc).__name__}")
+
                     is_new = await _save_channel(user_id, channel_data)
                     if is_new:
                         saved_count += 1
                         seed_stats[root_seed] = seed_stats.get(root_seed, 0) + 1
-                        logger.info(f"  + @{chat.username} ({subs}) [d={depth + 1}]")
+                        logger.info(
+                            f"  + @{chat.username} ({subs}) [d={depth + 1}]"
+                            + ("  писать можно" if channel_data.get("has_comments") else "")
+                        )
 
                     if depth + 1 < max_depth:
                         queue.append((chat.username, depth + 1))
@@ -397,13 +484,21 @@ async def _check_activity_via_web(username: str, active_hours: int) -> tuple[boo
         return True, "web: помилка парсингу"
 
 async def _check_channel_has_comments(client, username) -> tuple[bool, int]:
+    """(commentable, flood_wait_seconds).
+
+    ── 2026-08-22 ───────────────────────────────────────────────
+    Было: читаем последний пост и смотрим replies.comments. Это давало
+    только «обсуждения включены» и вдобавок ложные отрицания — у свежего
+    поста тред мог быть ещё не создан, и живой канал уезжал в мусор.
+
+    Стало: GetFullChannel — столько же запросов (get_entity + один вызов),
+    но ответ надёжнее и сразу содержит join_request и default_banned_rights.
+    Каналы «только по заявке» и «писать запрещено» отсеиваются здесь же.
+    """
     from telethon.errors import FloodWaitError, UsernameNotOccupiedError, ChannelPrivateError
+    from utils.channel_caps import check_and_record
     try:
         entity = await client.get_entity(username)
-        msgs = await client.get_messages(entity, limit=1)
-        if msgs and msgs[0].replies and getattr(msgs[0].replies, 'comments', False):
-            return (True, 0)
-        return (False, 0)
     except FloodWaitError as e:
         return (False, e.seconds)
     except (UsernameNotOccupiedError, ChannelPrivateError):
@@ -411,6 +506,11 @@ async def _check_channel_has_comments(client, username) -> tuple[bool, int]:
     except Exception as e:
         logger.warning(f"[verify] @{username}: {str(e)[:100]}")
         return (False, 0)
+
+    ok, fw, caps = await check_and_record(client, entity, username, source="parser_similar")
+    if not ok and caps.get("reason") and caps.get("reason") != "no_discussion":
+        logger.info(f"[verify] @{username}: отсеян — {caps['reason']}")
+    return (ok, fw)
 
 import aiohttp
 import re

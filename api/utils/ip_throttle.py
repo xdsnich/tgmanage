@@ -12,7 +12,11 @@ utils/ip_throttle.py — Per-IP cooldown lock (Redis-based).
   иначе на одном IP всё равно соберётся pile-up.
 
 ENV:
-  IP_COOLDOWN_SEC=900            (15 минут, дефолт)
+  IP_COOLDOWN_SEC=600            (10 минут, дефолт — было 900/15мин,
+                                  но при 5+ акках на IP это создавало
+                                  циклы ip_cooldown и потерю сессий,
+                                  инцидент 2026-07-14 → 126 smart_comment
+                                  выкинуто из 285 запланированных за день)
   IP_COOLDOWN_JITTER_SEC=120     (random ±0..120с к TTL, чтобы окна
                                   не выравнивались по минутным тикам)
   IP_THROTTLE_DISABLED=1         (для emergency/dev — отключить совсем)
@@ -27,7 +31,7 @@ from utils.redis_pool import get_redis as _get_redis
 
 logger = logging.getLogger(__name__)
 
-IP_COOLDOWN_SEC = int(os.getenv("IP_COOLDOWN_SEC", "900"))           # 15 мин
+IP_COOLDOWN_SEC = int(os.getenv("IP_COOLDOWN_SEC", "600"))           # 10 мин
 IP_COOLDOWN_JITTER_SEC = int(os.getenv("IP_COOLDOWN_JITTER_SEC", "120"))
 IP_THROTTLE_DISABLED = os.getenv("IP_THROTTLE_DISABLED", "0").lower() in ("1", "true", "yes")
 
@@ -83,6 +87,50 @@ def acquire_ip_lock(proxy_obj: Any, ttl: Optional[int] = None) -> bool:
     except Exception as e:
         logger.warning(f"[ip_throttle] redis error ({host}:{port}): {e}")
         return True  # fail-open — не блокируем работу при упавшем Redis
+
+
+def refresh_ip_lock(proxy_obj: Any, ttl: Optional[int] = None) -> bool:
+    """Продлить удержание IP.
+
+    acquire_ip_lock ставит замок на IP_COOLDOWN_SEC (10 минут). Этого хватает
+    обычной сессии, но не длинной работе: проверка каналов держит аккаунт
+    25-40 минут, замок за это время истекает, и на тот же IP заходит кампания
+    — получаются два одновременных подключения с одного адреса, ровно то,
+    от чего механизм и защищает.
+    Поэтому долгие задачи обязаны периодически продлевать замок.
+
+    Здесь SET без NX: вызывающий уже владеет замком, и его задача — не
+    захватить, а удержать.
+    """
+    hp = _extract_host_port(proxy_obj)
+    if not hp or IP_THROTTLE_DISABLED:
+        return True
+    host, port = hp
+    actual_ttl = (ttl if ttl is not None else IP_COOLDOWN_SEC) +                  random.randint(0, IP_COOLDOWN_JITTER_SEC)
+    try:
+        _get_redis().set(_proxy_key(host, port), "1", ex=actual_ttl)
+        return True
+    except Exception as e:
+        logger.warning(f"[ip_throttle] refresh error ({host}:{port}): {e}")
+        return False
+
+
+def release_ip_lock(proxy_obj: Any) -> bool:
+    """Освободить IP сразу, не дожидаясь истечения замка.
+
+    Нужно длинным задачам: закончив работу, они должны вернуть адрес, иначе
+    кампания зря прождёт остаток десятиминутного окна.
+    """
+    hp = _extract_host_port(proxy_obj)
+    if not hp or IP_THROTTLE_DISABLED:
+        return True
+    host, port = hp
+    try:
+        _get_redis().delete(_proxy_key(host, port))
+        logger.debug(f"[ip_throttle] 🔓 {host}:{port} освобождён")
+        return True
+    except Exception:
+        return False
 
 
 def get_ip_cooldown_remaining(proxy_obj: Any) -> int:

@@ -9,12 +9,60 @@ const NAV = [
   { to: '/commenting', emoji: '◇', label: 'Комментинг', color: '#ff6b35' },
   { to: '/warmup', emoji: '◐', label: 'Прогрев', color: '#3dd68c' },
   { to: '/reactions', emoji: '◑', label: 'Реакции', color: '#ff3d9a' },
+  { to: '/leomatch', emoji: '❤', label: 'Leomatch', color: '#ff3d9a' },
   { to: '/parser', emoji: '◍', label: 'Парсер', color: '#3d8bff' },
   { to: '/tasks', emoji: '◌', label: 'Задачи', color: '#e3a13f' },
   { to: '/analytics', emoji: '◈', label: 'Аналитика', color: '#00c2b2' },
   { to: '/api-keys', emoji: '◇', label: 'API ключи', color: '#ff6b35' },
   { to: '/settings', emoji: '◎', label: 'Настройки', color: '#888' },
 ]
+
+// ── Знак ufo.gram ──────────────────────────────────────────────────
+// Тарелка с орбитальным кольцом. Кольцо медленно вращается, корпус чуть
+// покачивается — движение фоновое, взгляд не тянет.
+// Размеры те же, что у прежней буквы «G»: 32 пикселя со скруглением 8,
+// чтобы вёрстка боковой панели не поехала.
+function UfoMark({ size = 32 }) {
+  return (
+    <div
+      style={{
+        width: size, height: size, borderRadius: size / 4, flexShrink: 0,
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        background: 'linear-gradient(135deg, #7c4dff 0%, #4de8ff 100%)',
+      }}
+      aria-hidden="true"
+    >
+      <svg viewBox="0 0 32 32" width={size * 0.72} height={size * 0.72}>
+        {/* Кольцо орбиты. Вращение эллипса читается как облёт по кругу. */}
+        <ellipse
+          cx="16" cy="17" rx="13" ry="5"
+          fill="none" stroke="#ffffff" strokeWidth="1.6" opacity="0.55"
+          style={{
+            transformOrigin: '16px 17px',
+            animation: 'ufo-orbit 9s linear infinite',
+          }}
+        />
+        {/* Корпус и купол */}
+        <g style={{ animation: 'ufo-bob 3.4s ease-in-out infinite' }}>
+          <ellipse cx="16" cy="16.5" rx="7.5" ry="2.8" fill="#fff" />
+          <path d="M12 15.4a4 4 0 0 1 8 0z" fill="#fff" />
+          <circle cx="16" cy="17.4" r="0.9" fill="#7c4dff" />
+        </g>
+      </svg>
+      <style>{`
+        @keyframes ufo-orbit { to { transform: rotate(360deg); } }
+        @keyframes ufo-bob {
+          0%, 100% { transform: translateY(0); }
+          50%      { transform: translateY(-0.7px); }
+        }
+        @media (prefers-reduced-motion: reduce) {
+          svg ellipse, svg g { animation: none !important; }
+        }
+      `}</style>
+    </div>
+  )
+}
+
 
 export default function Layout({ children }) {
   const { user, logout } = useAuthStore()
@@ -39,25 +87,18 @@ export default function Layout({ children }) {
           <div style={{
             display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4,
           }}>
-            {/* JetBrains-style logo mark */}
-            <div style={{
-              width: 32, height: 32, borderRadius: 8, flexShrink: 0,
-              background: 'linear-gradient(135deg, #7c4dff 0%, #ff3d9a 100%)',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: 14, fontWeight: 800, color: '#fff', fontFamily: 'var(--font-mono)',
-            }}>G</div>
+            <UfoMark size={32} />
             <div>
               <div style={{
-                fontFamily: 'var(--font-sans)', fontSize: 15, fontWeight: 800,
+                fontFamily: 'var(--font-sans)', fontSize: 16, fontWeight: 700,
                 color: 'var(--text)', letterSpacing: '-0.03em',
               }}>
-                Gram<span style={{
-                  background: 'linear-gradient(135deg, #7c4dff, #ff3d9a)',
-                  WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent',
-                }}>GPT</span>
+                {/* Точка посередине — главный приём знака: она делит слово
+                    и держит акцентный цвет луча. */}
+                ufo<span style={{ color: '#4de8ff' }}>.</span>gram
               </div>
-              <div style={{ fontSize: 10, color: 'var(--text-3)', letterSpacing: '0.04em' }}>
-                MANAGER v0.7
+              <div style={{ fontSize: 10, color: 'var(--text-3)', letterSpacing: '0.06em' }}>
+                v1.0
               </div>
             </div>
           </div>

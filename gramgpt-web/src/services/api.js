@@ -160,6 +160,62 @@ export const accountsAPI = {
   bulkExportTDataCancel: (jobId) =>
     api.post('/accounts/bulk/export-tdata/cancel', null, { params: { job_id: jobId } }),
 
+  // ── Подготовка (аватарки + имена, разнесённо во времени) ──
+  bulkPrepare: (formData) =>
+    api.post('/accounts/bulk/prepare', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 60000,
+    }),
+  bulkPrepareProgress: (jobId) =>
+    api.get('/accounts/bulk/prepare/progress', { params: { job_id: jobId } }),
+  bulkPreparePlanProgress: (jobId) =>
+    api.get('/accounts/bulk/prepare-plan/progress', { params: { job_id: jobId } }),
+  bulkPreparePlanRecommend: (nAccounts, nActionsPerAcc = 4) =>
+    api.get('/accounts/bulk/prepare-plan/recommend', {
+      params: { n_accounts: nAccounts, n_actions_per_acc: nActionsPerAcc }
+    }),
+  bulkPreparePlanCancel: (jobId) =>
+    api.post('/accounts/bulk/prepare-plan/cancel', null, { params: { job_id: jobId } }),
+  bulkPreparePlanList: () =>
+    api.get('/accounts/bulk/prepare-plan/list'),
+  bulkPreparePlanRefixProgress: (jobId, kind) =>
+    api.get('/accounts/bulk/prepare-plan/refix-progress', {
+      params: { job_id: jobId, kind },
+    }),
+  bulkPreparePlanRefixChannelAvatar: (formData) =>
+    api.post('/accounts/bulk/prepare-plan/refix-channel-avatar', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 60000,
+    }),
+  bulkPreparePlanRefixFirstPost: (formData) =>
+    api.post('/accounts/bulk/prepare-plan/refix-first-post', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 60000,
+    }),
+  bulkPreparePlanRefixAttachChannel: (jobId) => {
+    const fd = new FormData()
+    fd.append('job_id', jobId)
+    return api.post('/accounts/bulk/prepare-plan/refix-attach-channel', fd, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    })
+  },
+  bulkPreparePlanRefixCancel: (jobId, kind) => {
+    const fd = new FormData();
+    fd.append('job_id', jobId);
+    fd.append('kind', kind);
+    return api.post('/accounts/bulk/prepare-plan/refix-cancel', fd, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    });
+  },
+  bulkPreparePlanResume: (jobId, hours = 1.0, sessionsPerAcc = 2) =>
+    api.post('/accounts/bulk/prepare-plan/resume', null, {
+      params: {
+        job_id: jobId,
+        target_duration_hours: hours,
+        sessions_per_acc: sessionsPerAcc,
+      },
+    }),
+
   importTData: (file, proxyId = null) => {
     const form = new FormData()
     form.append('file', file)
@@ -382,13 +438,37 @@ export const importAPI = {
 
 // ── PARSER ───────────────────────────────────────────────────
 export const parserAPI = {
-  list: () => api.get('/parser/channels'),
+  // Страницами: сервер отдаёт limit штук начиная с offset, а общее
+  // количество кладёт в заголовок X-Total-Count. Раньше тянули всё
+  // разом — при 35 тысячах каналов вкладка висла на каждом обновлении.
+  list: (params) => api.get('/parser/channels', { params }),
+  // Сводка по ВСЕЙ базе: список приезжает страницами, и счётчики наверху
+  // иначе показывали бы размер страницы вместо размера базы.
+  stats: (params) => api.get('/parser/channels/stats', { params }),
   search: (data) => api.post('/parser/search', data, { timeout: 120000 }),
   searchProgress: () => api.get('/parser/search/progress'),
   searchStop: () => api.post('/parser/search/stop'),
+  // ── Multi-account поиск ──
+  searchMulti: (data) => api.post('/parser/search/multi', data, { timeout: 120000 }),
+  searchMultiProgress: (jobId) =>
+    api.get('/parser/search/multi/progress', { params: { job_id: jobId } }),
+  searchMultiStop: (jobId) =>
+    api.post('/parser/search/multi/stop', null, { params: { job_id: jobId } }),
+  searchMultiCooldowns: () => api.get('/parser/search/multi/cooldowns'),
+  searchMultiCooldownClear: (accountId) =>
+    api.post('/parser/search/multi/cooldowns/clear', null, {
+      params: { account_id: accountId },
+    }),
+  searchMultiActive: () => api.get('/parser/search/multi/active'),
+  searchMultiReset: (jobId) =>
+    api.post('/parser/search/multi/reset', null, { params: { job_id: jobId } }),
   delete: (id) => api.delete(`/parser/channels/${id}`),
   clearAll: () => api.delete('/parser/channels'),
   exportCSV: () => api.get('/parser/export', { responseType: 'blob' }),
+  // filters: { source, folder, only_with_comments, min_subscribers, max_subscribers, format }
+  exportChannels: (filters = {}) =>
+    api.get('/parser/export', { params: filters, responseType: 'blob' }),
+  exportCounts: () => api.get('/parser/export/counts'),
   importList: (channels) => api.post('/parser/import', { channels }),
   folders: () => api.get('/parser/folders'),
   folderChannels: (name) => api.get(`/parser/folders/${encodeURIComponent(name)}/channels`),
@@ -397,9 +477,19 @@ export const parserAPI = {
   similarStart: (data) => api.post('/parser/similar/start', data, { timeout: 30000 }),
   similarProgress: () => api.get('/parser/similar/progress'),
   similarStop: () => api.post('/parser/similar/stop'),
+  // ── Multi-акк паутинка ──
+  similarMultiStart: (data) => api.post('/parser/similar/multi', data, { timeout: 30000 }),
+  similarMultiProgress: (jobId) =>
+    api.get('/parser/similar/multi/progress', { params: { job_id: jobId } }),
+  similarMultiActive: () => api.get('/parser/similar/multi/active'),
+  similarMultiStop: (jobId) =>
+    api.post('/parser/similar/multi/stop', null, { params: { job_id: jobId } }),
+  similarMultiReset: (jobId) =>
+    api.post('/parser/similar/multi/reset', null, { params: { job_id: jobId } }),
   whitelist: (minRate = 0, sortBy = 'pass_rate') =>
     api.get('/parser/whitelist', { params: { min_rate: minRate, sort_by: sortBy } }),
   whitelistDelete: (id) => api.delete(`/parser/whitelist/${id}`),
+  whitelistWipe: () => api.delete('/parser/whitelist'),
   statsOverview: () => api.get('/parser/stats/overview'),
   keywordGeos: () => api.get('/parser/keywords/geos'),
   keywordExpand: (data) => api.post('/parser/keywords/expand', data),
@@ -478,6 +568,20 @@ export const commentingAPI = {
   stop: (id) =>
     api.post(`/commenting/campaigns/${id}/stop`),
 
+  restart: (id) =>
+    api.post(`/commenting/campaigns/${id}/restart`),
+
+  rebuildPlan: (id) =>
+    api.post(`/commenting/campaigns/${id}/rebuild-plan`),
+
+  diagnostics: (id) =>
+    api.get(`/commenting/campaigns/${id}/diagnostics`),
+
+  backfillDiscussions: (id) =>
+    api.post(`/commenting/campaigns/${id}/backfill-discussions`),
+  backfillDiscussionsProgress: (id) =>
+    api.get(`/commenting/campaigns/${id}/backfill-discussions/progress`),
+
   addChannels: (id, channels) =>
     api.post(`/commenting/campaigns/${id}/channels`, { channels }),
 
@@ -503,8 +607,16 @@ export const commentingAPI = {
   activity: (id, limit = 50) =>
     api.get(`/commenting/campaigns/${id}/activity`, { params: { limit } }),
 
-  plans: (id, day = null) =>
-    api.get(`/commenting/campaigns/${id}/plans`, { params: day ? { day } : {} }),
+  // withSessions=false — только счётчики по дням, без поминутного
+  // расписания: оно занимает почти весь объём ответа, а нужно лишь для
+  // раскрытого дня, который догружается отдельно с day=N.
+  plans: (id, day = null, withSessions = true) =>
+    api.get(`/commenting/campaigns/${id}/plans`, {
+      params: {
+        ...(day ? { day } : {}),
+        ...(withSessions ? {} : { with_sessions: false }),
+      },
+    }),
 }
 
 // ── API APPS (Telegram api_id/api_hash) ──────────────────────
@@ -622,6 +734,28 @@ export const diagnosticsAPI = {
 
   accountChannels: (accountId) =>
     api.get(`/diagnostics/account-channels/${accountId}`, { timeout: 60000 }),
+}
+
+// ── LEOMATCH (массовый онбординг в @leomatchbot) ─────────────
+export const leomatchAPI = {
+  uploadPhotos: (files) => {
+    const fd = new FormData()
+    for (const f of files) fd.append('files', f)
+    return api.post('/leomatch/photos', fd, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 120000,
+    })
+  },
+  createTask: (payload) => api.post('/leomatch/tasks', payload),
+  listTasks: () => api.get('/leomatch/tasks'),
+  getTask: (id) => api.get(`/leomatch/tasks/${id}`),
+  startTask: (id) => api.post(`/leomatch/tasks/${id}/start`),
+  fixPrivacy: (id) => api.post(`/leomatch/tasks/${id}/fix-privacy`),
+  replacePhotos: (id) => api.post(`/leomatch/tasks/${id}/replace-photos`),
+  sendLikes: (id, cfg) => api.post(`/leomatch/tasks/${id}/send-likes`, cfg),
+  likesStatus: (id) => api.get(`/leomatch/tasks/${id}/likes-status`),
+  likesStop: (id) => api.post(`/leomatch/tasks/${id}/likes-stop`),
+  deleteTask: (id) => api.delete(`/leomatch/tasks/${id}`),
 }
 
 export default api

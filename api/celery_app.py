@@ -66,7 +66,15 @@ celery_app = Celery(
         "tasks.plan_executor",
         "tasks.parser_tasks",
         "tasks.parser_similar_tasks",   # ← ДОБАВЛЕНО: crawler похожих каналов
+        "tasks.parser_multi_tasks",     # ← Мульти-акк парсер с random concurrency
+        "tasks.parser_similar_multi_tasks",  # ← Мульти-акк паутинка (crawler)
+        "tasks.backfill_discussions",   # ← Догнать discussion-подписки постфактум
+        "tasks.subscription_discovery", # ← Сканирование существующих подписок акка (anti-ban)
         "tasks.web_scraper_tasks",      # ← ДОБАВЛЕНО: Camoufox web scraper
+        "tasks.leomatch_onboarding",    # ← Массовый онбординг в @leomatchbot
+        "tasks.channel_probe",          # ← Свойства каналов (2 read-only запроса)
+        "tasks.bulk_channel_check",     # ← Массовая проверка каналов по прокси
+        "tasks.quarantine_probe",       # ← Проверка каналов карантинными аккаунтами
     ]
 )
 
@@ -84,6 +92,7 @@ celery_app.conf.update(
 
         # Bulk-операции (импорт TData, 2FA batch и т.п.)
         "tasks.bulk_tasks.*":            {"queue": "bulk_actions"},
+        "tasks.backfill_discussions.*":  {"queue": "bulk_actions"},
 
         # ПЛАНЫ КАМПАНИЙ — самые важные, отдельная очередь
         # для предсказуемой latency. Дальше всё масштабируется по ней.
@@ -97,7 +106,12 @@ celery_app.conf.update(
         # чтобы не блокировали planning/commenting
         "tasks.parser_tasks.*":          {"queue": "parsers"},
         "tasks.parser_similar_tasks.*":  {"queue": "parsers"},
+        "tasks.parser_multi_tasks.*":    {"queue": "parsers"},
+        "tasks.parser_similar_multi_tasks.*": {"queue": "parsers"},
         "tasks.web_scraper_tasks.*":     {"queue": "parsers"},
+        "tasks.channel_probe.*":         {"queue": "parsers"},
+        "tasks.bulk_channel_check.*":    {"queue": "parsers"},
+        "tasks.quarantine_probe.*":      {"queue": "parsers"},
 
         # Подписки — отдельно, бывают long-running
         "tasks.subscribe_tasks.*":       {"queue": "subscribe"},
@@ -106,6 +120,9 @@ celery_app.conf.update(
         "tasks.ai_tasks.*":              {"queue": "ai_dialogs"},
         "tasks.commenting_tasks.*":      {"queue": "ai_dialogs"},
         "tasks.comment_executor.*":      {"queue": "ai_dialogs"},
+
+        # Массовый онбординг в @leomatchbot — batch может идти 20-40 мин
+        "tasks.leomatch_onboarding.*":   {"queue": "bulk_actions"},
     },
 
     result_expires=3600,
@@ -147,6 +164,30 @@ celery_app.conf.update(
             "task": "tasks.plan_executor.dispatch_plans",
             "schedule": 60.0,                  # каждые 60 секунд
             "options": {"queue": "plans"},
+        },
+        # ── ОТКЛЮЧЕНО 2026-08-24 ─────────────────────────────────
+        # dispatch-channel-probe бил по 40 каналов на аккаунт каждые 30 мин,
+        # то есть до 1920 проверок в сутки на аккаунт. Реальный безопасный
+        # предел по ResolveUsername оказался около 150-200: замер 23.08 —
+        # acc#210 шёл 49 проверок/час и словил FLOOD_WAIT на 5 часов, а
+        # аккаунты на 8-33/час выжили при том же суточном объёме.
+        # Заменено на tasks.bulk_channel_check.run_bulk_check — там темп
+        # ограничен, аккаунты одного IP идут по очереди, разные IP параллельно.
+        # Запускается вручную, не по расписанию.
+        #
+        # "dispatch-channel-probe": {
+        #     "task": "tasks.channel_probe.dispatch_probe",
+        #     "schedule": 1800.0,
+        #     "options": {"queue": "parsers"},
+        # },
+        "dispatch-prep-plan-sessions": {
+            # Диспетчер prep-plan (⚙ Подготовка → 🗓 План).
+            # Пере-выкидывает scheduled сессии с прошедшим connect_ts.
+            # Нужно потому что Celery send_task(countdown=N) хранит
+            # задачи в памяти воркера — на рестарте они теряются.
+            "task": "tasks.bulk_tasks.dispatch_prep_plan_sessions",
+            "schedule": 60.0,
+            "options": {"queue": "bulk_actions"},
         },
         # dispatch-warmups ОТКЛЮЧЁН: родной warmup_v2-движок больше не исполняет
         # прогрев. Прогрев теперь гоняет plan_executor (см. dispatch-plans),

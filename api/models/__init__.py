@@ -15,6 +15,7 @@ from .comment_queue import CommentQueue
 from .account_behavior import AccountBehavior
 from .service_credential import ServiceCredential
 from .account_connection import AccountConnection
+from .leomatch_onboarding import LeomatchOnboardingTask, LeomatchOnboardingItem
 __all__ = [
     "User", "RefreshToken", "PlanEnum",
     "TelegramAccount", "AccountStatus", "AccountRole",

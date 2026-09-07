@@ -32,10 +32,12 @@ export default function WebScraperPanel() {
   const [humanize, setHumanize] = useState(true)
   const [headless, setHeadless] = useState(true)
   // Движок браузера. localStorage — чтобы выбор пережил F5.
-  //   camoufox — patched Firefox с fresh context per URL (текущий дефолт).
   //   cloak    — CloakBrowser с persistent-профилем на каждый прокси
   //              (fingerprint и cookies копятся между запусками).
-  const [engine, setEngine] = useLocalStorageState('web_scraper_engine', 'camoufox')
+  //              Дефолт: TGStat пропускает "вернувшегося юзера" без челленджей.
+  //   camoufox — patched Firefox с fresh context per URL (fallback).
+  // Ключ _v2 — чтобы сбросить кешированный 'camoufox' у существующих юзеров.
+  const [engine, setEngine] = useLocalStorageState('web_scraper_engine_v2', 'cloak')
 
   // TGStat режим
   const [tgstatOptions, setTgstatOptions] = useState({ countries: [], targets: [] })
@@ -49,6 +51,21 @@ export default function WebScraperPanel() {
   // оставит только каналы с открытыми комментами) ИЛИ 'chats'
   // (рейтинг discussion-групп напрямую).
   const [tgstatTarget, setTgstatTarget] = useState('channels')
+  // Источник кандидатов:
+  //   'rating'  — /ratings/channels{/category}?sort=members (топ-100 на URL,
+  //               качественные каналы, ограниченный охват).
+  //   'sitemap' — TGStat sitemap.xml (~10k каналов global + ~1-10k на каждый
+  //               geo). Огромный пул, Stage 2 фильтрует по linked_chat.
+  const [source, setSource] = useLocalStorageState('web_scraper_source', 'rating')
+  // Автопродолжение: как только job закончился с saved>0, автоматом стартуем
+  // следующий батч (dedup гарантирует что каждый раз берутся новые кандидаты
+  // из sitemap). Стоп: 2 подряд пустых батча ИЛИ кнопка «⏹ остановить авто».
+  const [autoContinue, setAutoContinue] = useLocalStorageState('web_scraper_auto_continue', false)
+  const [autoBatchNumber, setAutoBatchNumber] = useState(0)
+  const [autoTotalSaved, setAutoTotalSaved] = useState(0)
+  // Референс на pending setTimeout автозапуска — чтобы можно было отменить
+  const autoContinueTimerRef = useRef(null)
+  const emptyBatchesInARowRef = useRef(0)
   const [onlyWithComments, setOnlyWithComments] = useState(true)
   const [pagesPerGeo, setPagesPerGeo] = useState(1)
   const [includeGlobal, setIncludeGlobal] = useState(true)
@@ -128,6 +145,10 @@ export default function WebScraperPanel() {
           // Терминальный статус — можно очистить localStorage чтобы
           // следующий reload не тянул уже завершённое.
           try { localStorage.removeItem(LS_KEY) } catch {}
+
+          // Автопродолжение обрабатывается отдельным useEffect на
+          // изменение progress.status — иначе замыкание polling ловит
+          // stale значения autoContinue/autoBatchNumber.
         }
       } catch (e) { console.error('progress poll', e) }
     }, intervalMs)
@@ -156,25 +177,31 @@ export default function WebScraperPanel() {
     } catch (e) { console.error(e) }
   }
 
-  const loadAggregate = async (id, minSubs = aggregateMinSubs) => {
+  const loadAggregate = async (id, minSubs = aggregateMinSubs, opts = {}) => {
     // Guard: без job_id бэк отдаст 422 (job_id required). Бывает когда
     // юзер кликает "Пересчитать" после reload страницы — стейт jobId
     // пропал, а кнопка "Пересчитать" ещё видна.
     if (!id) {
-      showToast('Нет активного job_id — запусти скрейпинг или выбери из истории', 'err')
+      if (!opts.silent) {
+        showToast('Нет активного job_id — запусти скрейпинг или выбери из истории', 'err')
+      }
       return
     }
-    setAggregating(true)
+    // silent=true: авторефреш во время running — не показываем спиннер и
+    // не тостим при ошибке. Ошибки локально видны в console.
+    if (!opts.silent) setAggregating(true)
     try {
       const { data } = await parserAPI.webScrapeTgstatAggregate(id, onlyWithComments, minSubs)
       setAggregated(data)
     } catch (e) {
       console.error(e)
-      const detail = e?.response?.data?.detail
-      const msg = typeof detail === 'string' ? detail : 'Агрегация не удалась'
-      showToast(msg, 'err')
+      if (!opts.silent) {
+        const detail = e?.response?.data?.detail
+        const msg = typeof detail === 'string' ? detail : 'Агрегация не удалась'
+        showToast(msg, 'err')
+      }
     } finally {
-      setAggregating(false)
+      if (!opts.silent) setAggregating(false)
     }
   }
 
@@ -257,24 +284,153 @@ export default function WebScraperPanel() {
     }
   }, [liveLogLines])
 
+  // ── Авто-refresh списка проверенных во время скрейпа ────────────
+  // Инкрементальный save_watcher в бэке отчитывается двумя счётчиками:
+  //   stage2.saved_new + saved_updated — только каналы с комментами
+  //   stage2.checked_total — все проверенные (с комментами и без)
+  // В зависимости от режима смотрим тот или другой.
+  const lastRefreshTriggerRef = useRef(0)
+  useEffect(() => {
+    if (mode !== 'tgstat') return
+    if (!jobId) return
+    // В режиме "только с комментами" триггер = saved (только эти каналы
+    // видны в списке). В "все проверенные" = checked_total.
+    let trigger
+    if (onlyWithComments) {
+      trigger = (progress?.stage2?.saved_new || 0) + (progress?.stage2?.saved_updated || 0)
+    } else {
+      trigger = progress?.stage2?.checked_total || 0
+    }
+    if (trigger > lastRefreshTriggerRef.current) {
+      lastRefreshTriggerRef.current = trigger
+      // silent — без спиннера и тостов, чтобы не спамить каждые 20 сек
+      loadAggregate(jobId, aggregateMinSubs, { silent: true })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [progress?.stage2?.saved_new, progress?.stage2?.saved_updated,
+      progress?.stage2?.checked_total, jobId, mode, onlyWithComments])
+
+  // Сбрасываем "видел на прошлом job'е" счётчик когда стартуем новый job
+  // или меняется режим фильтрации
+  useEffect(() => {
+    lastRefreshTriggerRef.current = 0
+  }, [jobId, onlyWithComments])
+
+  // Реагируем на переключение фильтра — сразу перезагружаем aggregate
+  useEffect(() => {
+    if (!jobId) return
+    loadAggregate(jobId, aggregateMinSubs, { silent: true })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onlyWithComments])
+
+  // ── Автопродолжение ──────────────────────────────────────────────
+  // Держим ref на актуальный handleStart и autoContinue, чтобы
+  // useEffect на progress.status не тянул stale closures.
+  const handleStartRef = useRef(null)
+  const autoContinueRef = useRef(autoContinue)
+  useEffect(() => { autoContinueRef.current = autoContinue }, [autoContinue])
+  // Триггерится когда status становится 'done'. Работает только для
+  // tgstat режима + source=sitemap (для rating автопродолжение бессмысленно —
+  // топ-100 фиксированный, каждый следующий батч будет теми же каналами).
+  const lastHandledJobRef = useRef(null)
+  useEffect(() => {
+    if (!autoContinueRef.current) return
+    if (!progress || progress.status !== 'done') return
+    if (mode !== 'tgstat') return
+    // Триггерим один раз на каждый job_id — иначе рендер после
+    // setAutoBatchNumber снова зайдёт сюда.
+    if (lastHandledJobRef.current === jobId) return
+    lastHandledJobRef.current = jobId
+
+    const savedNew = progress?.stage2?.saved_new || 0
+    const savedUpd = progress?.stage2?.saved_updated || 0
+    const savedTotal = savedNew + savedUpd
+    setAutoTotalSaved(prev => prev + savedTotal)
+
+    if (savedTotal === 0) {
+      emptyBatchesInARowRef.current += 1
+      if (emptyBatchesInARowRef.current >= 2) {
+        showToast('🔄 Авто-стоп: 2 подряд пустых батча. Всё что могли — спарсили.', 'ok')
+        setAutoBatchNumber(0)
+        emptyBatchesInARowRef.current = 0
+        return
+      }
+    } else {
+      emptyBatchesInARowRef.current = 0
+    }
+
+    const nextBatch = autoBatchNumber + 1
+    setAutoBatchNumber(nextBatch)
+    showToast(`🔄 Батч #${nextBatch}: +${savedTotal}. Следующий через 25 сек…`, 'ok')
+    if (autoContinueTimerRef.current) clearTimeout(autoContinueTimerRef.current)
+    autoContinueTimerRef.current = setTimeout(() => {
+      autoContinueTimerRef.current = null
+      if (autoContinueRef.current && handleStartRef.current) {
+        handleStartRef.current({ silent: true })
+      }
+    }, 25000)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [progress?.status, jobId, mode])
+
+  // Cleanup pending autoContinue timer on unmount
+  useEffect(() => () => {
+    if (autoContinueTimerRef.current) clearTimeout(autoContinueTimerRef.current)
+  }, [])
+
+  const cancelAutoContinue = () => {
+    setAutoContinue(false)
+    if (autoContinueTimerRef.current) {
+      clearTimeout(autoContinueTimerRef.current)
+      autoContinueTimerRef.current = null
+    }
+    setAutoBatchNumber(0)
+    emptyBatchesInARowRef.current = 0
+    showToast('Автопродолжение выключено', 'ok')
+  }
+
   // Сколько URL будет сгенерировано — для preview.
-  // Логика: 1 URL на страну + 1 URL глобальный (если включён), × N категорий (или 1 если нет).
+  // rating:  1 URL на страну + 1 URL глобальный (если включён), × N категорий (или 1 если нет).
+  // sitemap: 1 URL на страну + 1 глобальный (если включён), КАТЕГОРИИ НЕ УЧАСТВУЮТ.
   const tgstatUrlsCount = (() => {
     let base = selectedCountries.length
     if (includeGlobal || base === 0) base += 1
+    if (source === 'sitemap') return base
     const catsMult = Math.max(1, selectedCategories.length)
     return base * catsMult
   })()
 
+  // Ориентировочная оценка сколько КАНДИДАТОВ Stage 2 получит из выбранных
+  // источников. Помогает юзеру понять почему max_channels=500 vs потолок пула.
+  const estimatedCandidates = (() => {
+    if (source === 'sitemap') {
+      // приблизительно по замерам 2026-07-04:
+      const perCountry = { global: 9852, ir: 9852, in: 3276, kz: 2592,
+                            by: 906, ua: 4791, cn: 6918, uz: 9624,
+                            kg: 555, et: 3057, ru: 0 /* 403 */ }
+      let total = 0
+      if (includeGlobal || selectedCountries.length === 0) total += perCountry.global
+      for (const cc of selectedCountries) {
+        total += perCountry[cc.toLowerCase()] || 0
+      }
+      // overlap между странами и global ~30% — консервативная оценка
+      return Math.floor(total * 0.75)
+    }
+    return tgstatUrlsCount * 100  // rating: ~100 каналов на URL
+  })()
+
   // ── handlers ────────────────────────────────────────────────────
 
-  const handleStart = async () => {
+  const handleStart = async (opts = {}) => {
+    // opts.silent === true — вызов от autoContinue: пропускаем confirm'ы,
+    // пул-предупреждения (юзер уже согласился при первом запуске).
+    const silent = opts.silent === true
+
     // Защита от двойного запуска. Если уже есть активный job с
     // running/queued/starting статусом — предупреждаем. Второй параллельный
     // скрейп через тот же пул прокси = удвоенная нагрузка на TGStat и
     // повышенный риск WAF-блока.
     const activeStatus = progress?.status
-    if (jobId && ['queued', 'starting', 'running'].includes(activeStatus)) {
+    if (!silent && jobId && ['queued', 'starting', 'running'].includes(activeStatus)) {
       const ok = confirm(
         `Уже идёт скрейпинг job ${jobId.slice(0, 8)}… (статус: ${activeStatus}).\n\n` +
         'Запуск второго параллельно НАГРУЖАЕТ TGStat через те же прокси\n' +
@@ -294,7 +450,7 @@ export default function WebScraperPanel() {
       )
       return
     }
-    if (effectivePoolSize < 10) {
+    if (!silent && effectivePoolSize < 10) {
       const ok = confirm(
         `В пуле только ${effectivePoolSize} прокси. Архитектура рассчитана на 34 узла.\n\n` +
         `С меньшим пулом cooldown будет давить — узлы быстро уйдут в простой.\n\n` +
@@ -318,6 +474,7 @@ export default function WebScraperPanel() {
           only_with_comments: true,
           pages_per_geo: 1,                  // 1 страница хватает на 100 кандидатов
           include_global: selectedCountries.length === 0,
+          source,                            // 'rating' | 'sitemap'
           max_channels: maxChannels,
           skip_recently_checked_days: skipRecentDays,
           max_workers: maxWorkers,
@@ -361,9 +518,25 @@ export default function WebScraperPanel() {
     }
   }
 
+  // Держим ref на актуальный handleStart для useEffect автопродолжения.
+  // useEffect не может напрямую вызывать handleStart (stale closure),
+  // поэтому обновляем ref на каждый render.
+  useEffect(() => { handleStartRef.current = handleStart })
+
   const handleStop = async () => {
     if (!jobId) return
     if (!confirm('Остановить скрейпинг? Уже сделанные результаты сохранятся.')) return
+    // Ручной стоп = выключаем и авто-продолжение, чтобы через 25 сек
+    // не стартанул новый батч.
+    if (autoContinue || autoContinueTimerRef.current) {
+      setAutoContinue(false)
+      if (autoContinueTimerRef.current) {
+        clearTimeout(autoContinueTimerRef.current)
+        autoContinueTimerRef.current = null
+      }
+      setAutoBatchNumber(0)
+      emptyBatchesInARowRef.current = 0
+    }
     setStopping(true)
     setStoppingSince(Date.now())
     try {
@@ -569,8 +742,8 @@ export default function WebScraperPanel() {
               проверим — есть ли открытые комменты. ~30-60 сек на канал
               (зависит от прокси).
             </div>
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-              {[10, 30, 50, 100, 200].map(n => (
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              {[50, 100, 300, 500, 1000, 2000].map(n => (
                 <button key={n} onClick={() => setMaxChannels(n)} disabled={isRunning} style={{
                   padding: '8px 14px', borderRadius: 8,
                   background: maxChannels === n ? 'rgba(139,92,246,0.15)' : 'var(--bg)',
@@ -581,17 +754,37 @@ export default function WebScraperPanel() {
                 }}>{n}</button>
               ))}
               <input type="number" value={maxChannels}
-                min={1} max={500} disabled={isRunning}
-                onChange={e => setMaxChannels(Math.max(1, Math.min(500, parseInt(e.target.value || '30'))))}
+                min={1} max={2000} disabled={isRunning}
+                onChange={e => setMaxChannels(Math.max(1, Math.min(2000, parseInt(e.target.value || '30'))))}
                 style={{
-                  width: 80, padding: '8px 10px', borderRadius: 8,
+                  width: 90, padding: '8px 10px', borderRadius: 8,
                   background: 'var(--bg)', border: '1px solid var(--border)',
                   color: 'var(--text)', fontSize: 13, fontWeight: 600,
                 }} />
               <span style={{ fontSize: 11, color: 'var(--text-3)' }}>
-                ≈ {Math.round(maxChannels * 0.7)} мин на 30 проксях
+                {/* Реалистичная оценка на 34 проксях с break_probability=0.25 и cooldown 60-120s.
+                    Средне: 1 канал ~ 8-12 сек полезной работы + 30% времени в паузах.
+                    Формула: max_channels * 0.15 мин ≈ практика при 34 IP. */}
+                ≈ {(() => {
+                  const mins = maxChannels * 0.15;
+                  if (mins < 60) return `${Math.round(mins)} мин`;
+                  const h = Math.floor(mins / 60);
+                  const m = Math.round(mins % 60);
+                  return `${h}ч ${m}м`;
+                })()} на 34 проксях
               </span>
             </div>
+            {maxChannels >= 500 && (
+              <div style={{
+                marginTop: 6, padding: '6px 10px', borderRadius: 6,
+                background: 'rgba(139,92,246,0.06)',
+                border: '1px dashed rgba(139,92,246,0.30)',
+                fontSize: 11, color: 'var(--text-2)',
+              }}>
+                💡 Большой батч: не закрывай окно (можешь свернуть). Прогресс сохраняется в
+                Redis + инкрементальные сейвы каждые 20 сек. Кнопка «Стоп» реагирует за 1-2 сек.
+              </div>
+            )}
 
             <div style={{ marginTop: 12, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
               <span style={{ fontSize: 12, color: 'var(--text-2)', fontWeight: 600 }}>
@@ -623,6 +816,109 @@ export default function WebScraperPanel() {
                   : `(каналы из TgstatCheckedChannel за последние ${skipRecentDays} дней будут пропущены)`}
               </span>
             </div>
+          </div>
+
+          {/* Источник кандидатов */}
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)', marginBottom: 4 }}>
+              1½. Источник кандидатов
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 8 }}>
+              Откуда программа берёт список каналов для Stage 2 проверки:
+            </div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <button type="button" disabled={isRunning}
+                onClick={() => setSource('rating')}
+                style={{
+                  flex: '1 1 300px', textAlign: 'left', padding: 10, borderRadius: 8,
+                  background: source === 'rating' ? 'rgba(139,92,246,0.12)' : 'var(--bg)',
+                  border: `1px solid ${source === 'rating' ? 'var(--violet)' : 'var(--border)'}`,
+                  color: 'var(--text)', cursor: isRunning ? 'not-allowed' : 'pointer',
+                }}>
+                <div style={{ fontSize: 13, fontWeight: 700 }}>🏆 Рейтинг (топ-100)</div>
+                <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 3 }}>
+                  /ratings/channels/{'{category}'}?sort=members — качественные топы,
+                  максимум 100 каналов на URL. Категории умножают охват.
+                </div>
+              </button>
+              <button type="button" disabled={isRunning}
+                onClick={() => setSource('sitemap')}
+                style={{
+                  flex: '1 1 300px', textAlign: 'left', padding: 10, borderRadius: 8,
+                  background: source === 'sitemap' ? 'rgba(61,214,140,0.10)' : 'var(--bg)',
+                  border: `1px solid ${source === 'sitemap' ? 'var(--green)' : 'var(--border)'}`,
+                  color: 'var(--text)', cursor: isRunning ? 'not-allowed' : 'pointer',
+                }}>
+                <div style={{ fontSize: 13, fontWeight: 700 }}>🗺 Sitemap (~10-50k) ⭐</div>
+                <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 3 }}>
+                  TGStat sitemap.xml — все индексированные каналы. Категории не
+                  применяются, страны = отдельные национальные sitemap'ы.
+                  Огромный пул, Stage 2 фильтрует по linked_chat.
+                </div>
+              </button>
+            </div>
+            {source === 'sitemap' && (
+              <>
+                <div style={{
+                  marginTop: 8, padding: '6px 10px', borderRadius: 6,
+                  background: 'rgba(61,214,140,0.06)',
+                  border: '1px dashed rgba(61,214,140,0.30)',
+                  fontSize: 11, color: 'var(--text-2)',
+                }}>
+                  📊 Оценка: до <b style={{ color: 'var(--green)' }}>{estimatedCandidates.toLocaleString()}</b> кандидатов
+                  из {tgstatUrlsCount} sitemap-файлов.
+                  Stage 2 проверит первые <b>{maxChannels}</b> из них.
+                </div>
+                <label style={{
+                  marginTop: 8, display: 'flex', alignItems: 'flex-start', gap: 8,
+                  padding: '8px 12px', borderRadius: 6,
+                  background: autoContinue ? 'rgba(139,92,246,0.08)' : 'var(--bg)',
+                  border: `1px solid ${autoContinue ? 'var(--violet)' : 'var(--border)'}`,
+                  cursor: 'pointer',
+                }}>
+                  <input type="checkbox" checked={autoContinue}
+                    onChange={e => setAutoContinue(e.target.checked)}
+                    style={{ marginTop: 3 }}
+                  />
+                  <div>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text)' }}>
+                      🔄 Автопродолжение — парсить весь sitemap батчами по {maxChannels}
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 3, lineHeight: 1.4 }}>
+                      Как только батч закончился — через 25 сек стартует следующий.
+                      dedup (TgstatCheckedChannel) гарантирует что каждый следующий батч берёт
+                      новые каналы. Стоп: 2 подряд пустых батча ИЛИ жми «Остановить».
+                      Оценка полного прогона:
+                      {' '}<b>~{(() => {
+                        const totalBatches = Math.ceil(estimatedCandidates / Math.max(1, maxChannels))
+                        const mins = totalBatches * (maxChannels * 0.15 + 0.5)
+                        if (mins < 60) return `${Math.round(mins)} мин`
+                        const h = Math.floor(mins / 60)
+                        const m = Math.round(mins % 60)
+                        return `${h}ч ${m}м`
+                      })()}</b> ({Math.ceil(estimatedCandidates / Math.max(1, maxChannels))} батчей).
+                    </div>
+                  </div>
+                </label>
+                {autoContinue && autoBatchNumber > 0 && (
+                  <div style={{
+                    marginTop: 6, padding: '6px 10px', borderRadius: 6,
+                    background: 'rgba(139,92,246,0.10)',
+                    border: '1px solid rgba(139,92,246,0.35)',
+                    fontSize: 11, color: 'var(--text-1)',
+                    display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
+                  }}>
+                    <span>🔄 Батч <b>#{autoBatchNumber}</b> в очереди · всего сохранено: <b style={{ color: 'var(--green)' }}>{autoTotalSaved}</b> каналов</span>
+                    <button type="button" onClick={cancelAutoContinue}
+                      style={{
+                        marginLeft: 'auto', padding: '3px 10px', borderRadius: 5, fontSize: 11,
+                        background: 'transparent', border: '1px solid var(--border)',
+                        color: 'var(--text-2)', cursor: 'pointer',
+                      }}>⏹ выключить авто</button>
+                  </div>
+                )}
+              </>
+            )}
           </div>
 
           {/* 2. Откуда */}
@@ -667,10 +963,12 @@ export default function WebScraperPanel() {
             )}
           </div>
 
-          {/* Категории — умножают кандидатов */}
-          <div style={{ marginTop: 12 }}>
+          {/* Категории — умножают кандидатов. Только для source=rating. */}
+          <div style={{ marginTop: 12, opacity: source === 'sitemap' ? 0.4 : 1 }}>
             <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)', marginBottom: 4 }}>
-              3. Категории <span style={{ color: 'var(--text-3)', fontWeight: 400, fontSize: 11 }}>(опционально)</span>
+              3. Категории <span style={{ color: 'var(--text-3)', fontWeight: 400, fontSize: 11 }}>
+                {source === 'sitemap' ? '(не применяются к sitemap)' : '(опционально)'}
+              </span>
             </div>
             <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 8 }}>
               Каждая категория = свой топ-100 каналов ({(tgstatOptions.categories || []).length} шт). Комбинируется со странами:
@@ -683,7 +981,7 @@ export default function WebScraperPanel() {
                 return (
                   <button key={c.slug}
                     onClick={() => toggle(selectedCategories, setSelectedCategories)(c.slug)}
-                    disabled={isRunning}
+                    disabled={isRunning || source === 'sitemap'}
                     style={{
                       display: 'flex', alignItems: 'center', gap: 5,
                       padding: '5px 9px', borderRadius: 16,
@@ -824,8 +1122,8 @@ export default function WebScraperPanel() {
                 onChange={e => setEngine(e.target.value)}
                 style={{ padding: '4px 6px', fontSize: 12, background: 'var(--bg-2)', color: 'var(--text-1)', border: '1px solid var(--border)', borderRadius: 4 }}
               >
-                <option value="camoufox">Camoufox (fresh ctx per URL)</option>
-                <option value="cloak">CloakBrowser (persistent profile per proxy)</option>
+                <option value="cloak">CloakBrowser — persistent profile per proxy ⭐</option>
+                <option value="camoufox">Camoufox — fresh ctx per URL (fallback)</option>
               </select>
               <label style={{ fontSize: 12, color: 'var(--text-2)', display: 'flex', gap: 6, alignItems: 'center' }}>
                 <input type="checkbox" checked={humanize} disabled={isRunning} onChange={e => setHumanize(e.target.checked)} /> humanize
@@ -1004,11 +1302,25 @@ export default function WebScraperPanel() {
               <span>⏭ Пропущено (уже проверены ≤{progress.dedup.skip_days || 0}д): <b style={{ color: '#eab308' }}>{progress.dedup.skipped_already_checked || 0}</b></span>
               <span>▶ К проверке во Stage 2: <b style={{ color: 'var(--violet)' }}>{progress.dedup.stage2_will_process || 0}</b></span>
               {progress.dedup.stage2_will_process === 0 && progress.dedup.skipped_already_checked > 0 && (
-                <span style={{ color: '#eab308', width: '100%', marginTop: 4, display: 'block' }}>
-                  ⚠ <b>Все {progress.dedup.skipped_already_checked} кандидатов уже проверялись за последние {progress.dedup.skip_days || 30} дней.</b>
-                  Stage 2 не будет ничего парсить.
-                  Нажми <b>⟳ Пересканить всё</b> в настройках (skip=0) чтобы пройти по ним заново.
-                </span>
+                <div style={{
+                  width: '100%', marginTop: 8, padding: 14, borderRadius: 8,
+                  background: 'rgba(239,68,68,0.12)',
+                  border: '2px solid rgba(239,68,68,0.55)',
+                  color: 'var(--text-1)', fontSize: 13, lineHeight: 1.55,
+                }}>
+                  <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 6, color: '#ef4444' }}>
+                    🛑 Stage 2 не запустился — все {progress.dedup.skipped_already_checked} кандидатов из Stage 1 уже в БД
+                  </div>
+                  <div style={{ marginBottom: 8 }}>
+                    Ты выбрал те же URL что и раньше → TGStat отдал те же топ-{progress.dedup.skipped_already_checked} каналов → все они уже проверены за последние {progress.dedup.skip_days || 30} дней.
+                  </div>
+                  <div style={{ fontWeight: 600, marginBottom: 4 }}>Что делать (по одному из трёх):</div>
+                  <ol style={{ margin: '4px 0 0 20px', padding: 0 }}>
+                    <li><b>Выбрать категории</b> в секции «3. Категории» — crypto/business/games/…. Каждая = свой топ-100.</li>
+                    <li><b>Добавить страны</b> в секции «2. Страны» — IR/IN/KAZ и т.д. Каждая = свой поддомен.</li>
+                    <li><b>⟳ Пересканить всё</b> — «Расширенные настройки» → skip=0. Пройдём по тем же каналам заново.</li>
+                  </ol>
+                </div>
               )}
               {progress.dedup.stage2_will_process > 0 && progress.dedup.stage2_will_process <= 1 && progress.dedup.skipped_already_checked > 5 && (
                 <span style={{ color: '#eab308' }}>
@@ -1018,16 +1330,32 @@ export default function WebScraperPanel() {
             </div>
           )}
 
-          {/* Итог Stage 2: разбивка что реально попало в parsed_channels */}
-          {progress.stage2 && (progress.stage2.saved_new > 0 || progress.stage2.saved_updated > 0 || progress.stage2.saved > 0) && (
+          {/* Итог Stage 2: живые / dead / в БД. checked_alive и dead
+              приходят из watcher-а live; with/without_comments — тоже. */}
+          {progress.stage2 && (
+            (progress.stage2.checked_total || 0) > 0 ||
+            (progress.stage2.saved_new || 0) > 0 ||
+            (progress.stage2.saved_updated || 0) > 0
+          ) && (
             <div style={{
               marginTop: 10, padding: '8px 12px', borderRadius: 6,
               background: 'rgba(61,214,140,0.08)', border: '1px solid rgba(61,214,140,0.25)',
               fontSize: 12, color: 'var(--text-2)', display: 'flex', gap: 14, flexWrap: 'wrap',
             }}>
               <span>💾 В БД: <b style={{ color: 'var(--green)' }}>+{progress.stage2.saved_new || 0}</b> новых</span>
-              <span>🔄 <b>{progress.stage2.saved_updated || 0}</b> обновлено (уже были)</span>
-              <span>📊 Всего с комментами: {progress.stage2.with_comments || 0} / без: {progress.stage2.without_comments || 0}</span>
+              <span>🔄 <b>{progress.stage2.saved_updated || 0}</b> обновлено</span>
+              {(progress.stage2.checked_alive != null || progress.stage2.alive_with_comments != null) && (
+                <span>
+                  📊 Живых: <b>{progress.stage2.checked_alive || 0}</b>
+                  {' '}(с ком.: <b style={{ color: 'var(--green)' }}>{progress.stage2.alive_with_comments || 0}</b>,
+                  {' '}без: {progress.stage2.alive_without_comments || 0})
+                </span>
+              )}
+              {(progress.stage2.dead || 0) > 0 && (
+                <span style={{ color: 'var(--text-3)' }}>
+                  💀 404: <b>{progress.stage2.dead}</b>
+                </span>
+              )}
             </div>
           )}
 
@@ -1053,12 +1381,36 @@ export default function WebScraperPanel() {
       {/* Aggregated TGStat results */}
       {aggregated && (
         <Card style={{ padding: 14 }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-            <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>
-              📊 Каналов с открытыми комментами: {aggregated.channels_count}
-              <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--text-3)', marginLeft: 10 }}>
-                из {aggregated.rows_read} срезов{aggregated.skipped_no_guess ? `, пропущено ${aggregated.skipped_no_guess} чатов без угаданного канала` : ''}
-              </span>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, flexWrap: 'wrap', gap: 8 }}>
+            <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+              {/* Табы: с комментами / все проверенные */}
+              <button onClick={() => setOnlyWithComments(true)}
+                style={{
+                  padding: '5px 12px', fontSize: 12, fontWeight: 600,
+                  background: onlyWithComments ? 'rgba(139,92,246,0.15)' : 'transparent',
+                  border: `1px solid ${onlyWithComments ? 'var(--violet)' : 'var(--border)'}`,
+                  color: onlyWithComments ? 'var(--text)' : 'var(--text-3)',
+                  borderRadius: 5, cursor: 'pointer',
+                }}>
+                ✅ С комментами
+              </button>
+              <button onClick={() => setOnlyWithComments(false)}
+                style={{
+                  padding: '5px 12px', fontSize: 12, fontWeight: 600,
+                  background: !onlyWithComments ? 'rgba(139,92,246,0.15)' : 'transparent',
+                  border: `1px solid ${!onlyWithComments ? 'var(--violet)' : 'var(--border)'}`,
+                  color: !onlyWithComments ? 'var(--text)' : 'var(--text-3)',
+                  borderRadius: 5, cursor: 'pointer',
+                }}>
+                🔎 Все проверенные ({
+                  // Приоритет: rows_read из /aggregate (реально живых, дедуп + skip dead).
+                  // Fallback на progress.stage2.checked_alive (live-watcher).
+                  aggregated.rows_read || progress?.stage2?.checked_alive || 0
+                })
+              </button>
+              {aggregating && (
+                <span style={{ fontSize: 11, color: 'var(--text-3)', marginLeft: 6 }}>обновляю…</span>
+              )}
             </div>
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
               <label style={{ fontSize: 11, color: 'var(--text-3)' }}>min подписчиков:</label>
@@ -1071,10 +1423,39 @@ export default function WebScraperPanel() {
                 }}
               />
               <button onClick={() => loadAggregate(jobId, aggregateMinSubs)}
+                title="Обновляется автоматически каждые ~20 сек — эта кнопка только для форс-обновления"
                 style={{ background: 'var(--bg-2)', border: '1px solid var(--border)', color: 'var(--text-2)', padding: '4px 10px', borderRadius: 5, cursor: 'pointer', fontSize: 11 }}
-              >Пересчитать</button>
+              >⟳</button>
               <Button variant="secondary" onClick={handleDownloadCSV}>📤 CSV</Button>
             </div>
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--text-3)', marginBottom: 6 }}>
+            {onlyWithComments ? (
+              <>
+                📊 Каналов с открытыми комментами: <b style={{ color: 'var(--text)' }}>{aggregated.with_comments_count ?? aggregated.channels_count}</b>
+                {aggregated.rows_read ? <> · из {aggregated.rows_read} живых</> : null}
+                {(aggregated.dead_count || 0) > 0 && (
+                  <span style={{ marginLeft: 8, color: '#ef4444' }}>
+                    · 💀 {aggregated.dead_count} отфильтровано как 404
+                  </span>
+                )}
+              </>
+            ) : (
+              <>
+                🔎 Живых каналов: <b style={{ color: 'var(--text)' }}>{aggregated.rows_read || aggregated.channels.length}</b>
+                {(aggregated.with_comments_count ?? aggregated.channels_count) > 0 && (
+                  <> · <span style={{ color: 'var(--green)' }}>{aggregated.with_comments_count ?? aggregated.channels_count} с комментами</span></>
+                )}
+                {(aggregated.without_comments_count ?? 0) > 0 && (
+                  <> · {aggregated.without_comments_count} без</>
+                )}
+                {(aggregated.dead_count || 0) > 0 && (
+                  <span style={{ marginLeft: 8, color: '#ef4444' }}>
+                    · 💀 {aggregated.dead_count} отфильтровано как 404
+                  </span>
+                )}
+              </>
+            )}
           </div>
 
           {aggregated.channels_count > 0 && (
@@ -1096,21 +1477,38 @@ export default function WebScraperPanel() {
 
           {aggregated.channels.length === 0 ? (
             <div style={{ fontSize: 12, color: 'var(--text-3)', padding: 20, textAlign: 'center' }}>
-              Каналы под фильтр не нашлись. Попробуй снять «только с комментами» или снизить min подписчиков.
+              {onlyWithComments
+                ? 'Каналы с комментами не нашлись. Переключись на «🔎 Все проверенные» или снизь min подписчиков.'
+                : 'Пока ничего не проверено — жди начала Stage 2 или снизь min подписчиков.'}
             </div>
           ) : (
             <div style={{ maxHeight: 480, overflowY: 'auto', border: '1px solid var(--border)', borderRadius: 6 }}>
               <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
                 <thead style={{ position: 'sticky', top: 0, background: 'var(--bg-2)', zIndex: 1 }}>
                   <tr>
-                    <Th>#</Th><Th>Канал</Th><Th>Название</Th>
+                    <Th>#</Th>
+                    {!onlyWithComments && <Th>💬</Th>}
+                    <Th>Канал</Th><Th>Название</Th>
                     <Th>Подписчики</Th><Th>Discussion-чат</Th><Th>Категория</Th>
                   </tr>
                 </thead>
                 <tbody>
                   {aggregated.channels.slice(0, 500).map((c, i) => (
-                    <tr key={c.username} style={{ borderTop: '1px solid var(--border)' }}>
+                    <tr key={c.username} style={{
+                      borderTop: '1px solid var(--border)',
+                      // Слегка тусклее если без комментов — визуально сразу видно
+                      opacity: (!onlyWithComments && !c.has_comments) ? 0.55 : 1,
+                    }}>
                       <Td muted>{i + 1}</Td>
+                      {!onlyWithComments && (
+                        <Td>
+                          {c.has_comments ? (
+                            <span title="Комменты открыты" style={{ color: 'var(--green)' }}>✅</span>
+                          ) : (
+                            <span title="Комменты закрыты" style={{ color: 'var(--text-3)' }}>✗</span>
+                          )}
+                        </Td>
+                      )}
                       <Td>
                         <a href={`https://t.me/${c.username.replace('@','')}`} target="_blank" rel="noreferrer"
                           style={{ color: 'var(--violet)', textDecoration: 'none' }}>

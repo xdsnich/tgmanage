@@ -17,6 +17,11 @@ from .context_pool import BrowserContextPool
 from .checkpoint import JSONLCheckpoint
 from .tgstat_extractor import tgstat_channels_extractor
 from .tgstat_urls import build_urls, GEO_LANGUAGES, GEO_CATEGORIES, GEO_COUNTRIES
+from .tgstat_sitemap import (
+    sitemap_urls_for,
+    tgstat_sitemap_extractor,
+    COUNTRY_SITEMAPS as SITEMAP_COUNTRIES,
+)
 
 __all__ = [
     "WebScraper",
@@ -26,6 +31,9 @@ __all__ = [
     "BrowserContextPool",
     "JSONLCheckpoint",
     "tgstat_channels_extractor",
+    "tgstat_sitemap_extractor",
+    "sitemap_urls_for",
+    "SITEMAP_COUNTRIES",
     "build_urls",
     "GEO_LANGUAGES",
     "GEO_CATEGORIES",

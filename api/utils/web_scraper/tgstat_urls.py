@@ -29,6 +29,7 @@ tgstat_urls.py — генератор URL для TGStat.
   значит на канале можно писать комменты.
 """
 
+import os
 from typing import Iterable
 from urllib.parse import urlencode
 
@@ -112,6 +113,14 @@ GEO_LANGUAGES: list[dict] = GEO_COUNTRIES
 #                ← вот это и есть "каналы с открытыми комментами"
 
 
+# Хосты, которые проверенно отказывают нашим прокси. Ссылки на них не
+# строятся вовсе: один такой домен способен выжечь весь пул узлов, потому
+# что каждый его отказ = остывание прокси на 15-20 минут.
+DEAD_HOSTS = set(
+    h.strip() for h in os.getenv("TGSTAT_DEAD_HOSTS", "tgstat.ru").split(",") if h.strip()
+)
+
+
 def _country_host(cc: str) -> str:
     """Возвращает host для страны на TGStat.
 
@@ -123,6 +132,14 @@ def _country_host(cc: str) -> str:
     """
     cc = cc.upper()
     if cc == "RU":
+        # ⚠ 2026-08-26: tgstat.ru отдаёт 403 на КАЖДЫЙ запрос через наши прокси.
+        # Замер: 35 попыток — 35 отказов, при том что tgstat.com с тех же узлов
+        # дал 35 успехов из 35. Хуже того, каждый 403 отправляет прокси в
+        # остывание, и 35 подряд выжгли весь пул из 36 узлов: остальные девять
+        # страновых поддоменов остались непройденными, задача встала на
+        # no_available_node.
+        # Домен исключён из RU_HOSTS_OK, см. build_urls — страна RU просто
+        # пропускается, пока не найдётся способ туда достучаться.
         return "tgstat.ru"
     if cc == "UA":
         return "uk.tgstat.com"
@@ -200,6 +217,11 @@ def build_urls(
     # Категории комбинируются: {host}/ratings/channels/{cat}?sort=members
     for cc in countries_list:
         host = _country_host(cc)
+        if host in DEAD_HOSTS:
+            # Не строим ссылки на заведомо отказывающие домены: каждый их
+            # отказ уводит прокси в остывание и в итоге останавливает всю
+            # очередь (см. комментарий в _country_host).
+            continue
         if categories_list:
             for cat in categories_list:
                 _add(f"https://{host}{_paths_for_category(cat)}?sort=members")

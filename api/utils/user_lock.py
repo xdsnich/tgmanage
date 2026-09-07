@@ -39,12 +39,35 @@ SLOT_TTL_SECONDS = 1800  # 30 минут — защита от утечек ес
 def acquire_user_slot(user_id: int, max_concurrent: int = DEFAULT_MAX_PER_USER) -> bool:
     """Atomic acquire — True если слот взят, False если юзер на лимите.
     Использует INCR (атомарный) + откат при превышении.
+
+    TTL ставится ТОЛЬКО при первом инкременте с 0→1 (или когда TTL == -1).
+    Иначе каждый acquire сбрасывал бы TTL и «зависший» счётчик после краша
+    процесса без release НИКОГДА не exipre'ился (инцидент 2026-07-13).
     """
     try:
         r = _get_redis()
         key = f"{_PREFIX}{user_id}"
         current = r.incr(key)
-        r.expire(key, SLOT_TTL_SECONDS)
+        # Ставим TTL ТОЛЬКО если его не было (только что создали key).
+        # `EXPIRE ... NX` — фича Redis 7.0+. На старом сервере (здесь 3.0.504)
+        # он отвечает ResponseError "wrong number of arguments for 'expire'".
+        #
+        # ── ФИКС 2026-08-22 ───────────────────────────────────────
+        # Ловился только TypeError (случай старого redis-py), а прилетал
+        # ResponseError от старого СЕРВЕРА. Исключение уходило во внешний
+        # except → fail-open, то есть acquire_user_slot ВСЕГДА возвращал
+        # True и лимит одновременных сессий не работал вообще. Плюс ключ
+        # оставался без TTL (наблюдалось user_slots:2 с ttl=-1) — ради
+        # этого в dispatch_plans пришлось держать отдельный санитайзер.
+        try:
+            r.expire(key, SLOT_TTL_SECONDS, nx=True)
+        except Exception:
+            # Старый сервер/клиент — ставим TTL только если он не установлен.
+            try:
+                if r.ttl(key) < 0:
+                    r.expire(key, SLOT_TTL_SECONDS)
+            except Exception:
+                pass
         if current > max_concurrent:
             # Откатываем — другой воркер уже занял последний слот
             r.decr(key)

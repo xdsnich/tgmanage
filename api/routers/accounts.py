@@ -966,6 +966,1109 @@ async def bulk_export_tdata(
 
 
 # ══════════════════════════════════════════════════════════════
+# BULK PREPARE — аватарки + имена, разнесённо во времени
+# ══════════════════════════════════════════════════════════════
+
+def _bulk_prepare_progress_key(user_id: int, job_id: str) -> str:
+    return f"bulk:prepare:{job_id}:progress"
+
+
+@router.get("/bulk/prepare/progress")
+async def bulk_prepare_progress(
+    job_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Прогресс bulk-подготовки. Polled фронтом каждые 2-3 сек."""
+    from utils.redis_pool import get_redis
+    import json as _json
+    r = get_redis()
+    # Ключ пишет task (см. bulk_tasks._publish_prepare_progress) —
+    # там пока без user_id префикса. Дублируем формат.
+    raw = r.get(f"bulk:prepare:{job_id}:progress")
+    if not raw:
+        return {"status": "idle"}
+    try:
+        return _json.loads(raw)
+    except Exception:
+        return {"status": "idle"}
+
+
+@router.post("/bulk/prepare")
+async def bulk_prepare_start(
+    account_ids: str = Form(...),                # JSON array: "[1,2,3]"
+    change_avatars: str = Form("false"),         # "true" | "false"
+    delete_previous_profile_avatar: str = Form("false"),  # удалить старые фото профиля перед upload'ом новой
+    change_names: str = Form("false"),
+    create_channels: str = Form("false"),
+    delete_previous_channel_avatar: str = Form("false"),  # только для plan-mode: удалить старую аватарку канала перед upload'ом
+    names_text: str = Form(""),                  # многострочный: "First Last\nFirst2 Last2\n"
+    channel_titles_text: str = Form(""),         # одна строка = один вариант названия
+    # Описания: одна строка = один вариант описания. Каждому акку — случайное.
+    # Если строка одна — общее для всех.
+    channel_descriptions_text: str = Form(""),
+    # Legacy single-line description — оставлено для совместимости старых клиентов
+    channel_description: str = Form(""),
+    channel_first_post: str = Form(""),
+    # Публичный канал: если true — после create_channel вызываем UpdateUsername
+    # с рандомным кандидатом из channel_usernames_text. При UsernameOccupied
+    # пробуем с числовым суффиксом (auto-fallback).
+    channel_public: str = Form("false"),
+    channel_usernames_text: str = Form(""),   # одна строка = один кандидат
+    # Явное распределение постов по акк-id (не рандомно):
+    #   JSON вида: [
+    #     {"account_id": 42, "text": "Пост Ивана", "photo_filename": "myvid.mov"},
+    #     {"account_id": 58, "text": "Пост Пети",  "photo_filename": null},
+    #   ]
+    # Если задан → перекрывает channel_first_post и рандомизацию по акку.
+    # Файлы приходят в channel_post_files, матчатся по photo_filename.
+    channel_posts_json: str = Form("[]"),
+    channel_pin: str = Form("true"),
+    # Простой режим (fast):
+    min_delay_sec: int = Form(60),
+    max_delay_sec: int = Form(180),
+    # Plan-режим (расписание с несколькими сессиями на акк):
+    plan_mode: str = Form("false"),
+    target_duration_hours: float = Form(2.0),
+    sessions_per_acc: int = Form(3),
+    files: list[UploadFile] = File(default=[]),                # аватарки профиля
+    channel_avatar_files: list[UploadFile] = File(default=[]), # аватарки каналов
+    channel_post_files: list[UploadFile] = File(default=[]),   # фото для первого поста
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Запуск «подготовки» для N аккаунтов (аватарка + имя).
+
+    Всё РАНДОМИЗИРУЕТСЯ:
+      - Порядок аккаунтов перемешивается
+      - Каждому акку случайная аватарка из загруженных (файлов может быть меньше — повторы)
+      - Каждому акку случайное имя/фамилия из списка
+
+    Задержки:
+      - Между акками: uniform(min_delay_sec, max_delay_sec) — юзер задаёт (дефолт 60-180с)
+      - Per-IP: если следующий акк на том же прокси и IP ещё в TTL — акк уходит в конец очереди
+
+    Возвращает job_id, дальше клиент poll'ит /bulk/prepare/progress.
+    """
+    import json as _json
+    import uuid as _uuid
+    from pathlib import Path
+
+    # ── Парс входных данных ──────────────────────────────────
+    try:
+        ids = _json.loads(account_ids)
+        assert isinstance(ids, list) and all(isinstance(i, int) for i in ids)
+    except Exception:
+        raise HTTPException(status_code=400, detail="account_ids должен быть JSON-массивом чисел")
+    if not ids:
+        raise HTTPException(status_code=400, detail="Не выбран ни один аккаунт")
+    if len(ids) > 500:
+        raise HTTPException(status_code=400, detail=f"Слишком много ({len(ids)} > 500)")
+
+    do_avatars = change_avatars.lower() in ("true", "1", "yes")
+    do_names = change_names.lower() in ("true", "1", "yes")
+    do_channels = create_channels.lower() in ("true", "1", "yes")
+    do_delete_prev_profile = delete_previous_profile_avatar.lower() in ("true", "1", "yes")
+    do_delete_prev_channel = delete_previous_channel_avatar.lower() in ("true", "1", "yes")
+    if not do_avatars and not do_names and not do_channels:
+        raise HTTPException(status_code=400, detail="Ничего не выбрано: ни аватарки, ни имена, ни каналы")
+
+    # ── Валидация: акки принадлежат юзеру ────────────────────
+    r = await db.execute(
+        select(TelegramAccount).where(
+            TelegramAccount.id.in_(ids),
+            TelegramAccount.user_id == current_user.id,
+        )
+    )
+    accounts = r.scalars().all()
+    owned = {a.id for a in accounts}
+    not_owned = [i for i in ids if i not in owned]
+    if not_owned:
+        raise HTTPException(status_code=403, detail=f"Не ваши аккаунты: {not_owned}")
+
+    # ── Сохраняем загруженные аватарки на диск ───────────────
+    job_id = _uuid.uuid4().hex
+    avatar_paths: list[str] = []
+    if do_avatars:
+        if not files:
+            raise HTTPException(status_code=400, detail="change_avatars=true, но файлы не переданы")
+        # api/routers/accounts.py → api/ → repo root → data/tmp/bulk_prepare/{job_id}/
+        tmp_dir = Path(__file__).resolve().parent.parent.parent / "data" / "tmp" / "bulk_prepare" / job_id
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        for idx, f in enumerate(files):
+            # Санитаризуем имя файла
+            safe = f"avatar_{idx:03d}_{Path(f.filename or 'img').name.replace('/', '_')}"
+            dst = tmp_dir / safe
+            content = await f.read()
+            if not content:
+                continue
+            dst.write_bytes(content)
+            avatar_paths.append(str(dst))
+        if not avatar_paths:
+            raise HTTPException(status_code=400, detail="Ни один файл аватарки не удалось сохранить")
+
+    # ── Парсим имена из текста ───────────────────────────────
+    # Формат: одна строка = одно имя (First Last) или разделитель " | " для точности:
+    # "Иван" | "Петр Иванов" | "Мария Кузьмина"
+    names: list[dict] = []
+    if do_names:
+        for raw_line in (names_text or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)  # split первым пробелом
+            first = parts[0][:64]
+            last = parts[1][:64] if len(parts) > 1 else ""
+            names.append({"first_name": first, "last_name": last})
+        if not names:
+            raise HTTPException(status_code=400, detail="change_names=true, но список имён пуст")
+
+    # ── Каналы: парсим названия + сохраняем аватарки каналов ─
+    channel_cfg = None
+    if do_channels:
+        titles = [ln.strip()[:128] for ln in (channel_titles_text or "").splitlines() if ln.strip()]
+        if not titles:
+            raise HTTPException(status_code=400, detail="create_channels=true, но список названий каналов пуст")
+
+        # Описания: многострочный список, если пустой — legacy single-line
+        descriptions = [ln.strip()[:255]
+                        for ln in (channel_descriptions_text or "").splitlines()
+                        if ln.strip()]
+        if not descriptions and channel_description.strip():
+            descriptions = [channel_description.strip()[:255]]
+        if not descriptions:
+            descriptions = [""]  # пусто — тоже валидно (у канала может не быть описания)
+
+        # Аватарки канала — опционально
+        ch_avatar_paths: list[str] = []
+        if channel_avatar_files:
+            tmp_dir_ch = Path(__file__).resolve().parent.parent.parent / "data" / "tmp" / "bulk_prepare" / job_id / "ch_avatars"
+            tmp_dir_ch.mkdir(parents=True, exist_ok=True)
+            for idx, f in enumerate(channel_avatar_files):
+                safe = f"ch_ava_{idx:03d}_{Path(f.filename or 'img').name.replace('/', '_')}"
+                dst = tmp_dir_ch / safe
+                content = await f.read()
+                if not content:
+                    continue
+                dst.write_bytes(content)
+                ch_avatar_paths.append(str(dst))
+
+        # Фото/видео для первого поста — опционально.
+        # ch_post_photo_paths — общий пул для рандомизации (когда custom не задан).
+        # filename_to_path — маппинг original filename → путь на диске.
+        # Нужен чтобы channel_posts_json мог сослаться на файл по его
+        # имени которое видит юзер в браузере.
+        ch_post_photo_paths: list[str] = []
+        filename_to_path: dict[str, str] = {}
+        if channel_post_files:
+            tmp_dir_post = Path(__file__).resolve().parent.parent.parent / "data" / "tmp" / "bulk_prepare" / job_id / "ch_post_photos"
+            tmp_dir_post.mkdir(parents=True, exist_ok=True)
+            for idx, f in enumerate(channel_post_files):
+                orig = Path(f.filename or f"post_{idx}").name.replace("/", "_")
+                safe = f"post_{idx:03d}_{orig}"
+                dst = tmp_dir_post / safe
+                content = await f.read()
+                if not content:
+                    continue
+                dst.write_bytes(content)
+                ch_post_photo_paths.append(str(dst))
+                # По оригинальному имени — приоритет первому вхождению.
+                # Если юзер загрузил 2 файла с одним именем, второй будет
+                # проигнорирован при маппинге (в общий пул попадут оба).
+                filename_to_path.setdefault(orig, str(dst))
+
+        # Парсим ручное распределение постов по акк-id.
+        # Если валиден и не пуст — сохраняем в channel_cfg.custom_posts_by_acc.
+        # Ключи в этом dict — строки (JSON serializable). В task'ах приводим
+        # к str(acc_id) при lookup'е.
+        custom_posts_by_acc: dict = {}
+        try:
+            arr = _json.loads(channel_posts_json)
+            if isinstance(arr, list):
+                for item in arr:
+                    if not isinstance(item, dict):
+                        continue
+                    aid = item.get("account_id")
+                    if aid is None:
+                        continue
+                    text = (item.get("text") or "")[:4096]
+                    photo_filename = item.get("photo_filename")
+                    photo_path = filename_to_path.get(photo_filename) if photo_filename else None
+                    if not text and not photo_path:
+                        # Пустая запись — нечего постить.
+                        continue
+                    custom_posts_by_acc[str(aid)] = {
+                        "text": text,
+                        "photo_path": photo_path,
+                    }
+        except Exception:
+            # Кривой JSON — молча игнорируем, работаем в старом режиме
+            custom_posts_by_acc = {}
+
+        # Публичный канал + пул username'ов
+        do_public = channel_public.lower() in ("true", "1", "yes")
+        public_usernames: list[str] = []
+        if do_public:
+            import re as _re
+            uname_re = _re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
+            for raw_ln in (channel_usernames_text or "").splitlines():
+                u = raw_ln.strip().lstrip("@")
+                if not u:
+                    continue
+                if not uname_re.match(u):
+                    # Telegram: 5-32 char, начинается с буквы, [A-Za-z0-9_]
+                    # Молча скипаем — юзер увидит меньшее число сохранённых.
+                    continue
+                if u not in public_usernames:
+                    public_usernames.append(u)
+            if not public_usernames:
+                raise HTTPException(
+                    status_code=400,
+                    detail="channel_public=true, но нет валидных username'ов "
+                           "(5-32 символа, начинается с буквы, только "
+                           "латиница/цифры/подчёркивание)"
+                )
+
+        channel_cfg = {
+            "enabled": True,
+            "titles": titles,
+            "descriptions": descriptions,
+            "first_post": (channel_first_post or "")[:4096],
+            "avatar_paths": ch_avatar_paths,
+            "post_photo_paths": ch_post_photo_paths,
+            "custom_posts_by_acc": custom_posts_by_acc,   # {"42": {text, photo_path}, ...}
+            "public": do_public,
+            "public_usernames": public_usernames,
+            "pin": channel_pin.lower() in ("true", "1", "yes"),
+            "reconnect_pause_sec": 2,
+        }
+
+    # ── Санитаризация задержек ───────────────────────────────
+    min_d = max(10, min(int(min_delay_sec), 3600))
+    max_d = max(min_d, min(int(max_delay_sec), 3600))
+
+    # ── Режим: fast (последовательный) vs plan (расписание) ──
+    use_plan_mode = plan_mode.lower() in ("true", "1", "yes")
+
+    # ── Запуск Celery task ───────────────────────────────────
+    from celery_app import celery_app
+    accounts_payload = [{"id": a.id, "phone": a.phone} for a in accounts]
+
+    # Флаг «удалить предыдущее» применяется только когда соотв. смена включена
+    do_delete_prev_profile = do_delete_prev_profile and do_avatars
+    do_delete_prev_channel = do_delete_prev_channel and do_channels
+
+    if use_plan_mode:
+        # Собираем конфиг для планировщика.
+        # Минимум 300 сек (5 мин) — юзер может хотеть тестировать на 2 акках быстро.
+        # Максимум 24 часа.
+        target_duration_sec = int(max(300, min(target_duration_hours * 3600, 86400)))
+        sessions_per_acc_safe = max(1, min(int(sessions_per_acc), 6))
+        plan_config = {
+            "target_duration_sec": target_duration_sec,
+            "sessions_per_acc": sessions_per_acc_safe,
+            "change_names": do_names,
+            "names": names,
+            "change_avatars": do_avatars,
+            "profile_avatar_paths": avatar_paths,
+            "create_channels": do_channels,
+            "channel_titles": (channel_cfg or {}).get("titles", []),
+            "channel_descriptions": (channel_cfg or {}).get("descriptions", []),
+            "channel_first_post": (channel_cfg or {}).get("first_post", ""),
+            "channel_avatar_paths": (channel_cfg or {}).get("avatar_paths", []),
+            "channel_post_photo_paths": (channel_cfg or {}).get("post_photo_paths", []),
+            "custom_posts_by_acc": (channel_cfg or {}).get("custom_posts_by_acc", {}),
+            "channel_public": (channel_cfg or {}).get("public", False),
+            "channel_public_usernames": (channel_cfg or {}).get("public_usernames", []),
+            "channel_pin": bool((channel_cfg or {}).get("pin", True)),
+            "delete_previous_profile_avatar": do_delete_prev_profile,
+            "delete_previous_channel_avatar": do_delete_prev_channel,
+        }
+        # ── Публикуем начальный meta ДО отправки задачи в Celery ──
+        # Иначе UI до окончания generate_plan (Celery task warm-up) сидит
+        # на `status: "idle"` без объяснений. Юзер думает что зависло.
+        # Meta потом дополнится в prep_plan_start_bulk (total_sessions_scheduled).
+        from utils.redis_pool import get_redis
+        import json as _json_r
+        import time as _t_r
+        init_meta = {
+            "job_id": job_id,
+            "status": "queued",
+            "phase": "generating",  # generating → scheduled → running → done
+            "start_ts": int(_t_r.time()),
+            "target_duration_sec": target_duration_sec,
+            "sessions_per_acc": sessions_per_acc_safe,
+            "total_accounts": len(accounts_payload),
+            "account_ids": [a["id"] for a in accounts_payload],
+            "total_sessions_scheduled": 0,
+            "total_actions_scheduled": 0,
+            "config": {
+                "change_names": do_names,
+                "change_avatars": do_avatars,
+                "create_channels": do_channels,
+            },
+        }
+        get_redis().setex(
+            f"prep_plan:{job_id}:meta", 7 * 86400,
+            _json_r.dumps(init_meta, ensure_ascii=False),
+        )
+        # Стартуем планировщик — он сам разошлёт сессии
+        task = celery_app.send_task(
+            "tasks.bulk_tasks.prep_plan_start_bulk",
+            args=[accounts_payload, job_id, plan_config],
+            queue="bulk_actions",
+        )
+    else:
+        task = celery_app.send_task(
+            "tasks.bulk_tasks.prepare_accounts_bulk",
+            args=[
+                accounts_payload, job_id, avatar_paths, names,
+                min_d, max_d, channel_cfg, do_delete_prev_profile,
+            ],
+            queue="bulk_actions",
+        )
+
+    # ── Инициальный snapshot в Redis ─────────────────────────
+    from utils.redis_pool import get_redis
+    import time as _t
+    get_redis().setex(
+        f"bulk:prepare:{job_id}:progress",
+        86400,
+        _json.dumps({
+            "status": "queued", "job_id": job_id,
+            "total": len(accounts_payload), "done": 0, "ok": 0, "failed": 0,
+            "current_phone": "",
+            "config": {
+                "avatars_count": len(avatar_paths),
+                "names_count": len(names),
+                "min_delay_sec": min_d, "max_delay_sec": max_d,
+            },
+            "ts": int(_t.time()),
+        }, ensure_ascii=False),
+    )
+
+    return {
+        "job_id": job_id, "task_id": task.id,
+        "mode": "plan" if use_plan_mode else "fast",
+        "total": len(accounts_payload),
+        "avatars_count": len(avatar_paths),
+        "names_count": len(names),
+        "create_channels": do_channels,
+        "channel_titles_count": len(channel_cfg["titles"]) if channel_cfg else 0,
+        "channel_avatars_count": len(channel_cfg["avatar_paths"]) if channel_cfg else 0,
+        "min_delay_sec": min_d, "max_delay_sec": max_d,
+        "est_total_sec": (
+            int(target_duration_hours * 3600) if use_plan_mode
+            else len(accounts_payload) * (min_d + max_d) // 2
+        ),
+        "plan_mode": use_plan_mode,
+        "target_duration_hours": target_duration_hours if use_plan_mode else None,
+        "sessions_per_acc": sessions_per_acc if use_plan_mode else None,
+    }
+
+
+@router.get("/bulk/prepare-plan/progress")
+async def bulk_prepare_plan_progress(
+    job_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Агрегированный прогресс plan-mode job'а: собирает per-account state
+    из Redis и возвращает snapshot для UI.
+
+    Формат:
+      {
+        "status": "running" | "done" | "idle",
+        "meta": {...},
+        "accounts": [
+          {
+            "account_id": 1, "phone": "+1...",
+            "sessions": [
+              {"idx": 0, "connect_ts": ..., "status": "done",
+               "results": [...], "actions_count": 3},
+              ...
+            ],
+            "sessions_done": 2, "sessions_total": 3,
+          },
+          ...
+        ],
+        "totals": {"sessions_done": N, "sessions_total": M, "actions_done": ..., ...}
+      }
+    """
+    from utils.redis_pool import get_redis
+    import json as _json
+    r = get_redis()
+
+    meta_raw = r.get(f"prep_plan:{job_id}:meta")
+    if not meta_raw:
+        return {"status": "idle"}
+    try:
+        meta = _json.loads(meta_raw)
+    except Exception:
+        return {"status": "idle"}
+
+    account_ids = meta.get("account_ids") or []
+    accounts_out = []
+    total_sessions = 0
+    total_done = 0
+    total_failed = 0
+    total_pending = 0
+    for acc_id in account_ids:
+        plan_raw = r.get(f"prep_plan:{job_id}:acc:{acc_id}")
+        if not plan_raw:
+            continue
+        try:
+            plan = _json.loads(plan_raw)
+        except Exception:
+            continue
+        sessions_summary = []
+        sess_done = sess_failed = sess_pending = sess_skipped = 0
+        for s in plan.get("sessions", []):
+            st = s.get("status", "pending")
+            if st == "done":
+                sess_done += 1
+            elif st in ("failed", "failed_permanent", "not_authorized"):
+                sess_failed += 1
+            elif st in ("skipped", "cancelled"):
+                sess_skipped += 1
+            elif st == "scheduled" and s.get("reschedule_count", 0) > 0:
+                # Reschedule-in-flight: считаем как pending (ещё будет сработка)
+                sess_pending += 1
+            else:
+                sess_pending += 1
+            sessions_summary.append({
+                "idx": s.get("idx"),
+                "connect_ts": s.get("connect_ts"),
+                "status": st,
+                "actions_count": len(s.get("actions", [])),
+                "actions": [a.get("type") for a in s.get("actions", [])],
+                "results": s.get("results", []),
+                "error": s.get("error"),
+                "attempts": s.get("attempts", 0),
+                "started_at": s.get("started_at"),
+                "finished_at": s.get("finished_at"),
+            })
+        total_sessions += len(sessions_summary)
+        total_done += sess_done
+        total_failed += sess_failed
+        total_pending += sess_pending
+        accounts_out.append({
+            "account_id": acc_id,
+            "phone": plan.get("phone"),
+            "sessions": sessions_summary,
+            "sessions_total": len(sessions_summary),
+            "sessions_done": sess_done,
+            "sessions_failed": sess_failed,
+            "sessions_skipped": sess_skipped,
+        })
+
+    # Phase computation:
+    #   - total_sessions == 0 → meta есть, но плана ещё нет = "generating"
+    #     (Celery task warm-up или всё ещё генерит расписание)
+    #   - total_sessions > 0 и все pending и первая сессия ещё не пришла = "scheduled"
+    #   - есть running/done сессия = "running"
+    #   - all done/failed = "done"
+    # Проверяем cancel-флаг: если стоит, phase = "cancelled"
+    is_cancelled = bool(r.get(f"prep_plan:{job_id}:cancel"))
+    # Возраст job'а: если stale (>5 мин) и sessions=0 — план либо провалил
+    # генерацию, либо per-acc plan-ключи истекли по TTL. В обоих случаях
+    # это не "generating", а "done" — иначе UI показывает бейдж вечно.
+    import time as _t
+    _age = int(_t.time()) - int(meta.get("start_ts") or 0)
+    _STALE_SEC = 300
+    if is_cancelled and total_pending == 0:
+        phase = "cancelled"
+        status = "cancelled"
+    elif is_cancelled:
+        phase = "cancelling"
+        status = "running"
+    elif total_sessions == 0:
+        if _age < _STALE_SEC:
+            phase = "generating"
+            status = "queued"
+        else:
+            phase = "done"
+            status = "done"
+    elif total_pending == 0 and not is_cancelled:
+        phase = "done"
+        status = "done"
+    else:
+        # Ищем ближайшую pending сессию
+        earliest_pending = None
+        any_running_or_done = False
+        for a in accounts_out:
+            for s in a["sessions"]:
+                if s["status"] in ("running", "done"):
+                    any_running_or_done = True
+                if s["status"] not in ("done", "failed_permanent"):
+                    if earliest_pending is None or s["connect_ts"] < earliest_pending:
+                        earliest_pending = s["connect_ts"]
+        if any_running_or_done:
+            phase = "running"
+        else:
+            phase = "scheduled"
+        status = "running"
+
+    # Обновляем phase в meta для будущих poll'ов
+    if meta.get("phase") != phase:
+        meta["phase"] = phase
+        try:
+            r.setex(f"prep_plan:{job_id}:meta", 7 * 86400,
+                    _json.dumps(meta, ensure_ascii=False))
+        except Exception:
+            pass
+
+    total_skipped = sum(a.get("sessions_skipped", 0) for a in accounts_out)
+    return {
+        "status": status,
+        "phase": phase,
+        "meta": meta,
+        "accounts": accounts_out,
+        "totals": {
+            "sessions_total": total_sessions,
+            "sessions_done": total_done,
+            "sessions_failed": total_failed,
+            "sessions_skipped": total_skipped,
+            "sessions_pending": total_pending,
+            "accounts_total": len(accounts_out),
+        },
+    }
+
+
+@router.get("/bulk/prepare-plan/recommend")
+async def bulk_prepare_plan_recommend(
+    n_accounts: int,
+    n_actions_per_acc: int = 4,
+    current_user: User = Depends(get_current_user),
+):
+    """Рекомендация target_duration исходя из размера батча."""
+    from tasks.prep_plan import recommend_duration
+    return recommend_duration(n_accounts, n_actions_per_acc)
+
+
+@router.get("/bulk/prepare-plan/list")
+async def bulk_prepare_plan_list(
+    current_user: User = Depends(get_current_user),
+):
+    """Список всех prep-plan job'ов юзера, живых в Redis (TTL 7 дней).
+
+    Нужен фронту чтобы:
+      1) На mount AccountsPage подхватить active job если нет в localStorage
+      2) Показать историю недавних planов чтобы юзер мог вернуться и
+         посмотреть progress/дожать skipped
+
+    Возвращает job'ы отсортированными по start_ts DESC. Не фильтруем по
+    user_id — meta не хранит владельца. В prep-plan это не критично т.к.
+    аккаунты фильтруются по user_id при выполнении action'ов.
+    Улучшение на будущее: класть user_id в meta и фильтровать.
+    """
+    from utils.redis_pool import get_redis
+    import json as _json
+    from sqlalchemy import select as _sel
+    r = get_redis()
+
+    # Загружаем ID акков юзера чтобы отфильтровать чужие job'ы:
+    # если ни один account_id в meta.account_ids не принадлежит юзеру —
+    # это чужой job, скрываем.
+    from models.account import TelegramAccount
+    from database import get_db as _get_db  # noqa: F401
+    from utils.db_pool import async_session as Session
+    async with Session() as db:
+        rows = (await db.execute(
+            _sel(TelegramAccount.id).where(TelegramAccount.user_id == current_user.id)
+        )).all()
+    user_acc_ids = {r[0] for r in rows}
+
+    jobs = []
+    for meta_key in r.scan_iter(match="prep_plan:*:meta"):
+        raw = r.get(meta_key)
+        if not raw:
+            continue
+        try:
+            meta = _json.loads(raw)
+        except Exception:
+            continue
+        # Фильтр по user_id
+        job_acc_ids = set(meta.get("account_ids") or [])
+        if job_acc_ids and not (job_acc_ids & user_acc_ids):
+            continue
+        job_id = meta.get("job_id")
+        if not job_id:
+            continue
+        # Считаем короткую сводку по статусам
+        done_c = failed_c = skipped_c = pending_c = 0
+        for acc_id in meta.get("account_ids") or []:
+            plan_raw = r.get(f"prep_plan:{job_id}:acc:{acc_id}")
+            if not plan_raw:
+                continue
+            try:
+                plan = _json.loads(plan_raw)
+            except Exception:
+                continue
+            for s in plan.get("sessions", []):
+                st = s.get("status", "pending")
+                if st == "done": done_c += 1
+                elif st in ("failed", "failed_permanent", "not_authorized"): failed_c += 1
+                elif st in ("skipped", "cancelled"): skipped_c += 1
+                else: pending_c += 1
+        total = done_c + failed_c + skipped_c + pending_c
+        # Phase: если pending есть → running, иначе done
+        is_cancelled = bool(r.get(f"prep_plan:{job_id}:cancel"))
+        # Возраст job'а — нужен чтобы отличить свежую генерацию (< 5 мин)
+        # от stale meta (per-acc plan-ключи истекли по TTL).
+        import time as _t
+        _age = int(_t.time()) - int(meta.get("start_ts") or 0)
+        _STALE_SEC = 300     # 5 мин — генерация завершается за секунды
+        if is_cancelled and pending_c == 0:
+            phase = "cancelled"
+        elif is_cancelled:
+            phase = "cancelling"
+        elif total == 0:
+            # Различаем реально-генерящийся (свежий) vs stale meta от вчера.
+            # stale → "done" чтобы UI-бейдж исчез и loadPrepPlanList его не
+            # подхватывал в auto-adopt.
+            phase = "generating" if _age < _STALE_SEC else "done"
+        elif pending_c == 0:
+            phase = "done"
+        else:
+            phase = "running"
+        jobs.append({
+            "job_id": job_id,
+            "resumed_from": meta.get("resumed_from"),
+            "start_ts": meta.get("start_ts", 0),
+            "target_duration_sec": meta.get("target_duration_sec"),
+            "total_accounts": meta.get("total_accounts") or len(meta.get("account_ids", [])),
+            "phase": phase,
+            "sessions_total": total,
+            "sessions_done": done_c,
+            "sessions_failed": failed_c,
+            "sessions_skipped": skipped_c,
+            "sessions_pending": pending_c,
+            "config": meta.get("config", {}),
+        })
+    jobs.sort(key=lambda j: j["start_ts"], reverse=True)
+    return {"jobs": jobs}
+
+
+@router.get("/bulk/prepare-plan/refix-progress")
+async def bulk_prepare_plan_refix_progress(
+    job_id: str,
+    kind: str,  # 'avatar' | 'video'
+    current_user: User = Depends(get_current_user),
+):
+    """Прогресс refix task'и (avatar/video/attach). UI поллит каждые ~3 сек.
+
+    Auto-stale detection: если status=running, но heartbeat (ts в snapshot)
+    старше 120 сек — воркер, скорее всего, умер (крашнулся, рестарт celery,
+    OOM). Возвращаем status='error' + reason, чтобы UI не крутился вечно
+    и юзер мог запустить заново. Snapshot в Redis тоже обновляем:
+      1) чтобы больше не показывался как stale
+      2) чтобы _refix_check_no_duplicate пропустил новый запуск
+    """
+    from utils.redis_pool import get_redis
+    import json as _json, time as _t
+    if kind not in ("avatar", "video", "attach"):
+        raise HTTPException(status_code=400, detail="kind должен быть 'avatar', 'video' или 'attach'")
+    r = get_redis()
+    prog_key = f"refix:{job_id}:{kind}:progress"
+    raw = r.get(prog_key)
+    if not raw:
+        return {"status": "idle"}
+    try:
+        d = _json.loads(raw)
+    except Exception:
+        return {"status": "idle"}
+    # Stale check
+    if d.get("status") == "running":
+        ts = int(d.get("ts") or 0)
+        age = int(_t.time()) - ts
+        if age > 120:
+            d["status"] = "error"
+            d["stale"] = True
+            d["error"] = (
+                f"Воркер не отвечает {age}с — вероятно упал (рестарт celery, "
+                f"crash или OOM). Прогресс {d.get('done',0)}/{d.get('total',0)} "
+                f"сохранён. Запусти задачу заново — она пропустит уже сделанные."
+            )
+            try:
+                r.setex(prog_key, 3600, _json.dumps(d, ensure_ascii=False))
+            except Exception:
+                pass
+    return d
+
+
+@router.post("/bulk/prepare-plan/refix-cancel")
+async def bulk_prepare_plan_refix_cancel(
+    job_id: str = Form(...),
+    kind: str = Form(...),  # 'avatar' | 'video' | 'attach'
+    current_user: User = Depends(get_current_user),
+):
+    """Отменяет активную refix-задачу. Ставит Redis-флаг, воркер видит
+    его на ближайшей итерации / после текущего sleep и корректно
+    завершается — уже начатый акк доделывает, следующих не запускает."""
+    from utils.redis_pool import get_redis
+    if kind not in ("avatar", "video", "attach"):
+        raise HTTPException(status_code=400, detail="kind должен быть 'avatar', 'video' или 'attach'")
+    r = get_redis()
+    # TTL 1 час — на случай если задача сама не почистит (крашнулась и т.п.)
+    r.setex(f"refix:{job_id}:{kind}:cancel", 3600, "1")
+    return {"ok": True, "message": f"Отмена refix ({kind}) для job={job_id[:8]} отправлена"}
+
+
+def _refix_check_no_duplicate(r, job_id: str, kind: str):
+    """Проверяет что нет уже активного refix-таска для (job, kind).
+    Активный = progress-ключ есть, status='running', и обновлялся < 90с
+    назад (свежий heartbeat). Иначе бросает HTTP 409.
+
+    Причина: при двойном клике на кнопку получали ДВА celery-таска для
+    одного job'а, они писали в один Redis progress-ключ по очереди → UI
+    показывал скачущий счётчик 8 → 5 → 8 → ..., аккаунты обрабатывались
+    повторно.
+    """
+    import json as _json, time as _t
+    prog_key = f"refix:{job_id}:{kind}:progress"
+    raw = r.get(prog_key)
+    if not raw:
+        return
+    try:
+        d = _json.loads(raw)
+    except Exception:
+        return
+    if d.get("status") != "running":
+        return
+    ts = int(d.get("ts") or 0)
+    if _t.time() - ts > 90:
+        # stale heartbeat — предыдущий воркер умер, можно запускать новый
+        return
+    done = d.get("done", 0); total = d.get("total", 0)
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"Уже идёт refix ({kind}) для этого job'а: {done}/{total} акк. "
+            f"Дождись окончания или нажми Стоп на баннере прогресса."
+        ),
+    )
+
+
+@router.post("/bulk/prepare-plan/refix-channel-avatar")
+async def bulk_prepare_plan_refix_channel_avatar(
+    job_id: str = Form(...),
+    delay_min_sec: int = Form(30),
+    delay_max_sec: int = Form(90),
+    delete_previous: str = Form("false"),
+    photo_file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
+    """Ставит аватарку каналам старого prep-plan job'а.
+
+    Юзкейс: юзер забыл включить аватарку канала при запуске плана.
+    Хочет добавить одним файлом на все ~70 каналов постфактум.
+    """
+    from utils.redis_pool import get_redis
+    from pathlib import Path
+    r = get_redis()
+
+    if not r.get(f"prep_plan:{job_id}:meta"):
+        raise HTTPException(status_code=404, detail="Job не найден")
+
+    _refix_check_no_duplicate(r, job_id, "avatar")
+
+    tmp_dir = Path(__file__).resolve().parent.parent.parent / "data" / "tmp" / "bulk_prepare" / job_id / "refix_ava"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    safe = f"refix_ava_{Path(photo_file.filename or 'img').name.replace('/', '_')}"
+    dst = tmp_dir / safe
+    content = await photo_file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Пустой файл")
+    dst.write_bytes(content)
+
+    do_del = delete_previous.lower() in ("true", "1", "yes")
+
+    from celery_app import celery_app
+    task = celery_app.send_task(
+        "tasks.bulk_tasks.refix_channel_avatar_bulk",
+        args=[job_id, str(dst),
+              max(5, min(int(delay_min_sec), 3600)),
+              max(int(delay_min_sec), min(int(delay_max_sec), 3600)),
+              do_del],
+        queue="bulk_actions",
+    )
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "task_id": task.id,
+        "file_saved": str(dst),
+        "delete_previous": do_del,
+        "message": "Refix аватарок запущен — процесс идёт в фоне",
+    }
+
+
+@router.post("/bulk/prepare-plan/refix-attach-channel")
+async def bulk_prepare_plan_refix_attach_channel(
+    job_id: str = Form(...),
+    delay_min_sec: int = Form(30),
+    delay_max_sec: int = Form(90),
+    current_user: User = Depends(get_current_user),
+):
+    """Прикрепить созданный канал к профилю юзера (personal_channel).
+
+    Юзкейс: подготовка запускалась без «прикрепить канал в профиль» — сейчас
+    хочу добавить постфактум ко всем ~70 акаунтам. Файл не нужен, просто
+    job_id — берём канал из ctx и вызываем UpdatePersonalChannelRequest.
+    """
+    from utils.redis_pool import get_redis
+    r = get_redis()
+    if not r.get(f"prep_plan:{job_id}:meta"):
+        raise HTTPException(status_code=404, detail="Job не найден")
+
+    _refix_check_no_duplicate(r, job_id, "attach")
+
+    from celery_app import celery_app
+    task = celery_app.send_task(
+        "tasks.bulk_tasks.refix_attach_channel_bulk",
+        args=[job_id,
+              max(5, min(int(delay_min_sec), 3600)),
+              max(int(delay_min_sec), min(int(delay_max_sec), 3600))],
+        queue="bulk_actions",
+    )
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "task_id": task.id,
+        "message": "Прикрепление каналов запущено — процесс идёт в фоне",
+    }
+
+
+@router.post("/bulk/prepare-plan/refix-first-post")
+async def bulk_prepare_plan_refix_first_post(
+    job_id: str = Form(...),
+    caption: str = Form(""),
+    delay_min_sec: int = Form(30),
+    delay_max_sec: int = Form(90),
+    video_file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+):
+    """Перезаливает первый пост в каналах старого prep-plan job'а.
+
+    Юзкейс: .mov отправился как документ (без hachoir → серый квадрат
+    вместо превью). Пофиксили helper — теперь можно вернуться к старым
+    каналам, удалить кривой пост и залить новый нормально.
+
+    В теле: job_id (form) + video_file (upload). Один и тот же файл
+    отправится во ВСЕ каналы акков этого job'а. Между акками — рандом
+    пауза 30-90 сек + per-IP throttle.
+    """
+    from utils.redis_pool import get_redis
+    import json as _json
+    from pathlib import Path
+    r = get_redis()
+
+    meta_raw = r.get(f"prep_plan:{job_id}:meta")
+    if not meta_raw:
+        raise HTTPException(status_code=404, detail="Job не найден")
+
+    _refix_check_no_duplicate(r, job_id, "video")
+
+    # Сохраняем файл на диск (переиспользуется всеми акками этого job'а)
+    tmp_dir = Path(__file__).resolve().parent.parent.parent / "data" / "tmp" / "bulk_prepare" / job_id / "refix"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    safe = f"refix_{Path(video_file.filename or 'media').name.replace('/', '_')}"
+    dst = tmp_dir / safe
+    content = await video_file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Пустой файл")
+    dst.write_bytes(content)
+
+    from celery_app import celery_app
+    task = celery_app.send_task(
+        "tasks.bulk_tasks.refix_first_post_bulk",
+        args=[job_id, str(dst), caption,
+              max(5, min(int(delay_min_sec), 3600)),
+              max(int(delay_min_sec), min(int(delay_max_sec), 3600))],
+        queue="bulk_actions",
+    )
+    return {
+        "ok": True,
+        "job_id": job_id,
+        "task_id": task.id,
+        "file_saved": str(dst),
+        "message": "Refix запущен — процесс идёт в фоне, следующая сессия через 30-90 сек",
+    }
+
+
+@router.post("/bulk/prepare-plan/resume")
+async def bulk_prepare_plan_resume(
+    job_id: str,                          # старый job_id
+    target_duration_hours: float = 1.0,   # за сколько дожать
+    sessions_per_acc: int = 2,
+    current_user: User = Depends(get_current_user),
+):
+    """«Дожать» prep-plan job.
+
+    Собирает недоделанные (skipped/failed/cancelled) сессии из старого
+    job'а и планирует их в НОВОМ job'е. Возвращает new_job_id.
+
+    Не трогает done-сессии и акки с not_authorized (мёртвая сессия акка).
+    """
+    from utils.redis_pool import get_redis
+    import json as _json
+    import uuid as _uuid
+    r = get_redis()
+
+    old_meta_raw = r.get(f"prep_plan:{job_id}:meta")
+    if not old_meta_raw:
+        raise HTTPException(status_code=404, detail="Старый job не найден")
+
+    new_job_id = _uuid.uuid4().hex
+    target_duration_sec = int(max(300, min(target_duration_hours * 3600, 86400)))
+    sess_per_acc = max(1, min(int(sessions_per_acc), 6))
+
+    # Публикуем начальный meta (как в /prepare) чтобы UI сразу видел
+    import time as _t
+    init_meta = {
+        "job_id": new_job_id,
+        "resumed_from": job_id,
+        "status": "queued",
+        "phase": "generating",
+        "start_ts": int(_t.time()),
+        "target_duration_sec": target_duration_sec,
+        "sessions_per_acc": sess_per_acc,
+        "total_accounts": 0,   # заполнится в task'е
+        "account_ids": [],
+        "total_sessions_scheduled": 0,
+        "total_actions_scheduled": 0,
+    }
+    r.setex(f"prep_plan:{new_job_id}:meta", 7 * 86400,
+            _json.dumps(init_meta, ensure_ascii=False))
+
+    from celery_app import celery_app
+    task = celery_app.send_task(
+        "tasks.bulk_tasks.resume_prep_plan_bulk",
+        args=[job_id, new_job_id, target_duration_sec, sess_per_acc],
+        queue="bulk_actions",
+    )
+    return {
+        "ok": True,
+        "old_job_id": job_id,
+        "new_job_id": new_job_id,
+        "task_id": task.id,
+        "target_duration_sec": target_duration_sec,
+        "sessions_per_acc": sess_per_acc,
+    }
+
+
+@router.post("/bulk/prepare-plan/cancel")
+async def bulk_prepare_plan_cancel(
+    job_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """FORCE остановка plan-mode job'а.
+
+    Что делает:
+      1. Ставит cancel-флаг в Redis (страховка на случай race condition)
+      2. **REVOKE все запланированные Celery-задачи** — с terminate=True
+         они моментально удаляются из очереди Celery и никогда не
+         сработают. Даже уже запущенные workers получают сигнал.
+      3. Сразу помечает ВСЕ pending/scheduled/waiting сессии в plan
+         как `cancelled` (без ожидания worker'а).
+      4. Уже полностью запущенные Telethon-действия (create_channel и т.д.)
+         могут доработать до конца — если они не в `await` в момент
+         terminate, худшее что случится — оборванный socket. Telegram
+         обычно ok с этим.
+    """
+    from utils.redis_pool import get_redis
+    import json as _json
+    import time as _t
+    r = get_redis()
+
+    # Meta проверим что job существует
+    meta_raw = r.get(f"prep_plan:{job_id}:meta")
+    if not meta_raw:
+        raise HTTPException(status_code=404, detail="Job не найден или устарел")
+    try:
+        meta = _json.loads(meta_raw)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Meta корраптнута")
+
+    # ── Шаг 1: cancel-флаг (защита от гонки) ─────────────
+    r.setex(f"prep_plan:{job_id}:cancel", 7 * 86400, "1")
+
+    # ── Шаг 2: revoke всех task_id ────────────────────────
+    revoked_count = 0
+    task_ids_raw = r.get(f"prep_plan:{job_id}:task_ids")
+    if task_ids_raw:
+        try:
+            task_ids = _json.loads(task_ids_raw)
+        except Exception:
+            task_ids = []
+        if task_ids:
+            from celery_app import celery_app
+            # revoke(list, terminate=True) удаляет pending + шлёт SIGTERM
+            # уже работающим (Windows: kill процесса воркера, Celery его
+            # автоматически перезапускает).
+            try:
+                celery_app.control.revoke(task_ids, terminate=True, signal='SIGTERM')
+                revoked_count = len(task_ids)
+            except Exception as e:
+                logging.getLogger(__name__).warning(
+                    f"[cancel] revoke fail: {e}"
+                )
+
+    # ── Шаг 3: помечаем все pending/scheduled/waiting сессии cancelled ──
+    account_ids = meta.get("account_ids") or []
+    cancelled_count = 0
+    running_count = 0
+    done_count = 0
+    for acc_id in account_ids:
+        plan_raw = r.get(f"prep_plan:{job_id}:acc:{acc_id}")
+        if not plan_raw:
+            continue
+        try:
+            plan = _json.loads(plan_raw)
+        except Exception:
+            continue
+        changed = False
+        for s in plan.get("sessions", []):
+            st = s.get("status")
+            if st in ("done", "failed", "failed_permanent", "not_authorized", "cancelled", "skipped"):
+                if st == "done":
+                    done_count += 1
+                continue
+            if st == "running":
+                # Оставляем как есть — если revoke убил worker, сессия
+                # окажется в подвешенном состоянии, но при следующем
+                # аттемпте (нет retry — не будет) она просто пропадёт.
+                # Помечаем cancelled чтобы UI показывал.
+                running_count += 1
+            s["status"] = "cancelled"
+            s["error"] = "Отменено пользователем (force)"
+            s["finished_at"] = int(_t.time())
+            cancelled_count += 1
+            changed = True
+        if changed:
+            r.setex(f"prep_plan:{job_id}:acc:{acc_id}", 7 * 86400,
+                    _json.dumps(plan, ensure_ascii=False))
+
+    # ── Шаг 4: обновляем meta ────────────────────────────
+    meta["cancelled_at"] = int(_t.time())
+    meta["cancelled_by"] = current_user.id
+    meta["phase"] = "cancelled"
+    r.setex(f"prep_plan:{job_id}:meta", 7 * 86400,
+            _json.dumps(meta, ensure_ascii=False))
+
+    return {
+        "ok": True,
+        "revoked_tasks": revoked_count,
+        "cancelled_sessions": cancelled_count,
+        "was_running": running_count,
+        "already_done": done_count,
+        "message": (
+            f"Остановлено. Revoke: {revoked_count} задач(и) из Celery-очереди, "
+            f"помечено cancelled: {cancelled_count} сессий "
+            f"(из них уже работало {running_count})."
+        ),
+    }
+
+
+# ══════════════════════════════════════════════════════════════
 # IMPORT TDATA (одиночный ZIP)
 # ══════════════════════════════════════════════════════════════
 

@@ -14,7 +14,7 @@ import random
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -95,9 +95,23 @@ async def list_parsed_channels(
     folder: Optional[str] = None,
     min_subscribers: Optional[int] = None,
     only_with_comments: bool = False,
+    only_unchecked: bool = False,
+    sort: str = "subs",
+    limit: Optional[int] = None,
+    offset: int = 0,
+    response: Response = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """Каналы пользователя. Отдаётся страницами.
+
+    Раньше endpoint возвращал ВСЁ разом. При 35 тысячах каналов это
+    мегабайты JSON на каждое открытие вкладки и на каждое автообновление
+    раз в пятнадцать секунд — страница висла, а свежие находки паутинки
+    появлялись только после полной перезагрузки.
+    Теперь: limit/offset, а общее число едет в заголовке X-Total-Count,
+    чтобы интерфейс знал, сколько ещё подгружать.
+    """
     from models.channel_ban_stats import ChannelBanStats
 
     q = select(ParsedChannel).where(ParsedChannel.user_id == current_user.id)
@@ -106,31 +120,163 @@ async def list_parsed_channels(
     if min_subscribers is not None:
         q = q.where(ParsedChannel.subscribers >= min_subscribers)
     if only_with_comments:
-        q = q.where(ParsedChannel.has_comments == True)
-    q = q.order_by(ParsedChannel.subscribers.desc())
+        # ── «С комментами» значит «можно писать», а не «есть обсуждение» ──
+        # Раньше фильтр смотрел только на has_comments — флаг от парсера,
+        # означающий наличие привязанной группы обсуждений. Замер 25.08:
+        # из 4311 каналов с этим флагом 971 (23%) оказались непригодны —
+        # 534 пускают только по заявке, 273 вообще без обсуждения, 99 с
+        # запретом на запись. Такие каналы попадали в выборку и занимали
+        # слоты комментариев, сгорая на исполнении.
+        # Теперь опираемся на кэш свойств: показываем то, куда РЕАЛЬНО
+        # можно писать. Непроверенные оставляем — они кандидаты, их ещё
+        # предстоит проверить, и в UI они помечены отдельно.
+        from models.channel_capability import ChannelCapability
+        _bad = select(ChannelCapability.channel_username).where(
+            ChannelCapability.commentable == False  # noqa: E712
+        )
+        q = q.where(
+            ParsedChannel.has_comments == True,
+            ParsedChannel.username.notin_(_bad),
+        )
+    if only_unchecked:
+        # «Непроверенные» — те, по кому вердикта ещё нет вовсе.
+        # Раньше этот фильтр жил только в браузере и потому врал: он видел
+        # лишь загруженный кусок списка, а не всю базу.
+        from models.channel_capability import ChannelCapability as _CC
+        q = q.where(ParsedChannel.username.notin_(
+            select(_CC.channel_username)))
+    # По умолчанию — крупные сверху. Но паутинка приносит каналы от 50
+    # тысяч, а на первой странице по размеру стоят от 420 тысяч: свежие
+    # находки не видно вовсе, пока не долистаешь. Поэтому есть второй
+    # порядок — по времени находки.
+    q = (q.order_by(ParsedChannel.added_at.desc().nullslast())
+         if sort == "new" else q.order_by(ParsedChannel.subscribers.desc()))
+
+    # Считаем общее число до нарезки — интерфейсу нужно знать, сколько всего.
+    total = (await db.execute(
+        select(func.count()).select_from(q.subquery()))).scalar() or 0
+
+    if limit:
+        q = q.offset(max(0, offset)).limit(min(int(limit), 5000))
 
     result = await db.execute(q)
     channels = result.scalars().all()
 
-    # ── Загружаем pass_rate для всех каналов одним запросом ──
+    # ── Справочники к выданной странице ──────────────────────────
+    # Три таблицы дополняют каналы: проходимость, живучесть комментов и
+    # вердикт проверки. Раньше каждая читалась ЦЕЛИКОМ и сопоставлялась в
+    # памяти — так было сделано ради страховки от лимита Postgres в 32767
+    # параметров запроса, который выбивал вкладку с InterfaceError, когда
+    # в IN(...) уходили все 45 тысяч имён.
+    # Теперь наружу уходит страница в сотни строк, и имена спокойно
+    # помещаются в запрос: фильтруем на стороне базы. Разница ощутимая —
+    # одни только channel_capabilities это 30 тысяч ORM-объектов на каждый
+    # запрос, из-за них даже страница в десять каналов собиралась три
+    # секунды. Полное чтение оставлено запасным путём: без limit имён
+    # слишком много для IN(...).
     usernames = [c.username for c in channels if c.username]
+    _want = set(usernames)
+    # Ниже порога подставляем имена в запрос, выше — читаем таблицу целиком.
+    _by_page = 0 < len(usernames) <= 5000
     stats_map = {}
     if usernames:
-        stats_r = await db.execute(
-            select(ChannelBanStats).where(
-                ChannelBanStats.user_id == current_user.id,
-                ChannelBanStats.channel_username.in_(usernames),
-            )
+        _sq = select(ChannelBanStats).where(
+            ChannelBanStats.user_id == current_user.id,
         )
+        if _by_page:
+            _sq = _sq.where(ChannelBanStats.channel_username.in_(usernames))
+        stats_r = await db.execute(_sq)
         for s in stats_r.scalars().all():
+            if s.channel_username not in _want:
+                continue
+            _sk = s.skipped_count or 0
+            _bn = s.banned_count or 0
             pass_rate = 100.0 if s.total_attempts == 0 else round(
-                (s.total_attempts - s.banned_count) / s.total_attempts * 100, 1
+                max(0, s.total_attempts - _bn - _sk) / s.total_attempts * 100, 1
             )
             stats_map[s.channel_username] = {
                 "pass_rate": pass_rate,
                 "total_attempts": s.total_attempts,
-                "banned_count": s.banned_count,
+                "banned_count": _bn,
+                "skipped_count": _sk,
+                "last_skip_reason": s.last_skip_reason or "",
             }
+
+    # ── Живучесть комментов по каналу (2026-08-27) ───────────────
+    # Раньше здесь было видно только «дошёл ли коммент до отправки»
+    # (pass_rate). Но отправить — половина дела: часть каналов молча
+    # удаляет комменты модерацией через минуты. Это знание уже копилось
+    # в comment_logs.verify_status (его проставляет действие
+    # verify_my_comments), просто никем не сводилось по каналам и в UI
+    # не попадало. Сводим здесь — таблица маленькая (тысячи строк),
+    # группировка дешевле, чем тащить её целиком в память.
+    #   ok      — коммент на месте при повторной проверке
+    #   deleted — исчез, канал его снял
+    #   unknown — не смогли долистать до него, вердикта нет
+    verify_map = {}
+    try:
+        from models.campaign import CommentLog, Campaign
+        _vr = await db.execute(
+            select(
+                CommentLog.channel_username,
+                func.count().label("written"),
+                func.count().filter(CommentLog.verify_status == "ok").label("alive"),
+                func.count().filter(CommentLog.verify_status == "deleted").label("dead"),
+            )
+            .join(Campaign, Campaign.id == CommentLog.campaign_id)
+            .where(
+                Campaign.user_id == current_user.id,
+                *([CommentLog.channel_username.in_(usernames)] if _by_page else []),
+            )
+            .group_by(CommentLog.channel_username)
+        )
+        for uname, written, alive, dead in _vr.all():
+            if uname not in _want:
+                continue
+            judged = (alive or 0) + (dead or 0)
+            verify_map[uname] = {
+                "comments_written": written or 0,
+                "comments_alive": alive or 0,
+                "comments_deleted": dead or 0,
+                # None, пока ни один коммент этого канала не проверен —
+                # ноль здесь читался бы как «всё удаляют», а это не так.
+                "survival_rate": (round((alive or 0) / judged * 100, 1)
+                                  if judged else None),
+            }
+    except Exception:
+        verify_map = {}
+
+    # ── Статус проверки канала (2026-08-24) ──────────────────────
+    # has_comments — булево, и «проверен, комментов нет» в нём неотличимо
+    # от «ещё не проверяли». Из-за этого в UI фильтр «только непроверенные»
+    # показывал не то. Берём реальный статус из channel_capabilities:
+    #   checked=False           → канал вообще не проверяли
+    #   checked=True, cap_ok    → можно комментировать
+    #   checked=True, !cap_ok   → нельзя, причина в cap_reason
+    caps_map = {}
+    if usernames:
+        try:
+            from models.channel_capability import ChannelCapability
+            _cq = select(ChannelCapability)
+            if _by_page:
+                _cq = _cq.where(ChannelCapability.channel_username.in_(usernames))
+            caps_r = await db.execute(_cq)
+            for cc in caps_r.scalars().all():
+                if cc.channel_username not in _want:
+                    continue
+                caps_map[cc.channel_username] = {
+                    "reason": cc.reason or "",
+                    "commentable": cc.commentable,
+                    "needs_approval": cc.needs_approval,
+                    "join_to_send": cc.join_to_send,
+                    "checked_at": cc.checked_at.isoformat() if cc.checked_at else None,
+                }
+        except Exception:
+            caps_map = {}
+
+    if response is not None:
+        response.headers["X-Total-Count"] = str(total)
+        response.headers["Access-Control-Expose-Headers"] = "X-Total-Count"
 
     return [{
         "id": c.id,
@@ -155,7 +301,69 @@ async def list_parsed_channels(
         "pass_rate": stats_map.get(c.username, {}).get("pass_rate"),  # None если нет статы
         "total_attempts": stats_map.get(c.username, {}).get("total_attempts", 0),
         "banned_count": stats_map.get(c.username, {}).get("banned_count", 0),
+        "skipped_count": stats_map.get(c.username, {}).get("skipped_count", 0),
+        "last_skip_reason": stats_map.get(c.username, {}).get("last_skip_reason", ""),
+        # Живучесть (из CommentLog.verify_status)
+        "comments_written": verify_map.get(c.username, {}).get("comments_written", 0),
+        "comments_alive":   verify_map.get(c.username, {}).get("comments_alive", 0),
+        "comments_deleted": verify_map.get(c.username, {}).get("comments_deleted", 0),
+        "survival_rate":    verify_map.get(c.username, {}).get("survival_rate"),
+        # Статус проверки на комментарии
+        "checked": c.username in caps_map,
+        "cap_commentable": caps_map.get(c.username, {}).get("commentable"),
+        "cap_reason": caps_map.get(c.username, {}).get("reason", ""),
+        "cap_needs_approval": caps_map.get(c.username, {}).get("needs_approval"),
+        "cap_join_to_send": caps_map.get(c.username, {}).get("join_to_send"),
+        "cap_checked_at": caps_map.get(c.username, {}).get("checked_at"),
     } for c in channels]
+
+@router.get("/channels/stats")
+async def parsed_channels_stats(
+    folder: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Сводка по всей базе каналов: сколько всего, с комментариями,
+    непроверенных и средний размер.
+
+    Нужна потому, что список теперь приезжает страницами. Карточки наверху
+    считались по загруженному массиву и после перехода на подгрузку стали
+    показывать «300 каналов» вместо тридцати пяти тысяч. Счёт по всей
+    выборке умеет только база — четыре агрегата дешевле, чем выгрузка
+    всех строк ради их подсчёта в браузере.
+    """
+    from models.channel_capability import ChannelCapability as _CC
+
+    base = select(ParsedChannel).where(ParsedChannel.user_id == current_user.id)
+    if folder is not None:
+        base = base.where(ParsedChannel.folder == folder)
+
+    async def _count(q):
+        return (await db.execute(
+            select(func.count()).select_from(q.subquery()))).scalar() or 0
+
+    _bad = select(_CC.channel_username).where(
+        _CC.commentable == False)  # noqa: E712
+    with_comments = base.where(
+        ParsedChannel.has_comments == True,  # noqa: E712
+        ParsedChannel.username.notin_(_bad),
+    )
+    unchecked = base.where(
+        ParsedChannel.username.notin_(select(_CC.channel_username)))
+
+    # Считаем по колонке самого подзапроса: ParsedChannel.subscribers
+    # снаружи не связан с алиасом и дал бы декартово произведение.
+    _sub = base.subquery()
+    avg_subs = (await db.execute(
+        select(func.avg(_sub.c.subscribers)))).scalar()
+
+    return {
+        "total": await _count(base),
+        "with_comments": await _count(with_comments),
+        "unchecked": await _count(unchecked),
+        "avg_subscribers": int(avg_subs or 0),
+    }
+
 
 @router.post("/search")
 async def search_channels(
@@ -225,25 +433,217 @@ async def clear_all_parsed(
 
 @router.get("/export")
 async def export_channels_csv(
+    folder: Optional[str] = None,               # "" = только каналы без папки, None = все
+    only_with_comments: bool = False,
+    min_subscribers: int = 0,
+    max_subscribers: Optional[int] = None,
+    format: str = "csv",                        # csv | txt | txt_links
+    source: str = "parsed",                     # parsed | tgstat_checked
+    # ── Фильтры по проходимости (из ChannelBanStats) ──
+    min_pass_rate: float = 0.0,                 # 0..100. Только каналы где ok/total >= X%
+    no_skips: bool = False,                     # только каналы где skipped_count = 0
+    min_attempts: int = 0,                      # минимум попыток (иначе 1 успешный = 100%)
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        select(ParsedChannel).where(ParsedChannel.user_id == current_user.id).order_by(ParsedChannel.subscribers.desc())
-    )
-    channels = result.scalars().all()
+    """Экспорт каналов с фильтрами.
+
+    Query params:
+      source:
+        parsed         — ParsedChannel (только сохранённые каналы юзера)
+        tgstat_checked — TgstatCheckedChannel (ВСЁ проверенное web-скрейпером
+                         на TGStat: тут 1000+ каналов даже с комментами,
+                         которые не попали в ParsedChannel из-за UPSERT).
+      folder                — имя папки (только для source=parsed).
+                              None = все, пустая строка = только без папки.
+      only_with_comments    — оставить только has_comments=True
+      min_subscribers       — оставить только subs >= N
+      max_subscribers       — оставить только subs <= N
+      format:
+        csv        — полный CSV с колонками
+        txt        — по одному @username на строку (для copy-paste)
+        txt_links  — по одной t.me/xxx-ссылке на строку
+
+    Content-Disposition имя файла собирается из фильтров: чтобы юзер сразу
+    видел что скачал: channels_folder-crypto_with-comments.csv
+    """
+    import urllib.parse as _up
+
+    # ── Собираем rows (username, title, subs, has_comments, folder, last_post, query) ──
+    rows = []
+    if source == "tgstat_checked":
+        from models.tgstat_checked_channel import TgstatCheckedChannel
+        q = select(TgstatCheckedChannel).where(TgstatCheckedChannel.user_id == current_user.id)
+        if only_with_comments:
+            q = q.where(TgstatCheckedChannel.has_comments == True)
+        if min_subscribers:
+            q = q.where(TgstatCheckedChannel.subscribers >= min_subscribers)
+        if max_subscribers:
+            q = q.where(TgstatCheckedChannel.subscribers <= max_subscribers)
+        q = q.order_by(TgstatCheckedChannel.subscribers.desc().nullslast())
+        for c in (await db.execute(q)).scalars().all():
+            rows.append({
+                "username": c.username or "",
+                "title": c.title or "",
+                "subscribers": c.subscribers or 0,
+                "has_comments": bool(c.has_comments),
+                "folder": "",
+                "last_post": c.checked_at.isoformat() if c.checked_at else "",
+                "query": f"tgstat_web:{c.last_job_id or ''}",
+            })
+    else:
+        # source=parsed (default) — из ParsedChannel
+        q = select(ParsedChannel).where(ParsedChannel.user_id == current_user.id)
+        if folder is not None:
+            q = q.where(ParsedChannel.folder == folder)
+        if only_with_comments:
+            q = q.where(ParsedChannel.has_comments == True)
+        if min_subscribers:
+            q = q.where(ParsedChannel.subscribers >= min_subscribers)
+        if max_subscribers:
+            q = q.where(ParsedChannel.subscribers <= max_subscribers)
+        q = q.order_by(ParsedChannel.subscribers.desc())
+        for c in (await db.execute(q)).scalars().all():
+            rows.append({
+                "username": c.username or "",
+                "title": c.title or "",
+                "subscribers": c.subscribers or 0,
+                "has_comments": bool(c.has_comments),
+                "folder": c.folder or "",
+                "last_post": c.last_post_date.isoformat() if c.last_post_date else "",
+                "query": c.search_query or "",
+            })
+
+    # ── Фильтр по проходимости (ChannelBanStats) ──
+    if min_pass_rate > 0 or no_skips or min_attempts > 0:
+        from models.channel_ban_stats import ChannelBanStats
+        _usernames = [r["username"] for r in rows if r["username"]]
+        _stats_q = await db.execute(select(ChannelBanStats).where(
+            ChannelBanStats.user_id == current_user.id,
+            ChannelBanStats.channel_username.in_(_usernames),
+        ))
+        _stats_by_username = {s.channel_username: s for s in _stats_q.scalars().all()}
+        _filtered = []
+        for r in rows:
+            st = _stats_by_username.get(r["username"])
+            if not st:
+                # Нет статистики → не знаем прошёл или нет. Если запросили фильтр
+                # min_attempts>0 или min_pass_rate>0 — считаем что не подходит.
+                if min_attempts > 0 or min_pass_rate > 0:
+                    continue
+                # no_skips без min_attempts — пропускаем каналы без стат (безопасно)
+                _filtered.append(r)
+                continue
+            if min_attempts > 0 and (st.total_attempts or 0) < min_attempts:
+                continue
+            if no_skips and (st.skipped_count or 0) > 0:
+                continue
+            if min_pass_rate > 0 and st.pass_rate < min_pass_rate:
+                continue
+            # добавляем метрики в row (пригодится для CSV)
+            r["ban_stats_total"] = st.total_attempts or 0
+            r["ban_stats_banned"] = st.banned_count or 0
+            r["ban_stats_skipped"] = st.skipped_count or 0
+            r["ban_stats_pass_rate"] = st.pass_rate
+            _filtered.append(r)
+        rows = _filtered
+
+    # ── Имя файла с фильтрами ──
+    fname_parts = ["channels"]
+    if source == "tgstat_checked":
+        fname_parts.append("tgstat")
+    if folder is not None and source == "parsed":
+        fname_parts.append("folder-" + (folder or "none"))
+    if only_with_comments:
+        fname_parts.append("with-comments")
+    if min_subscribers:
+        fname_parts.append(f"min{min_subscribers}")
+    if min_pass_rate > 0:
+        fname_parts.append(f"pass{int(min_pass_rate)}pct")
+    if no_skips:
+        fname_parts.append("no-skips")
+    ext = {"csv": "csv", "txt": "txt", "txt_links": "txt"}.get(format, "csv")
+    filename = "_".join(fname_parts) + f".{ext}"
+    ascii_name = filename.encode("ascii", "ignore").decode() or "channels.csv"
+    utf8_encoded = _up.quote(filename, safe="")
 
     output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["username", "title", "subscribers", "has_comments", "folder", "last_post", "query"])
-    for c in channels:
-        writer.writerow([f"@{c.username}", c.title, c.subscribers, c.has_comments,
-                         c.folder or "", c.last_post_date.isoformat() if c.last_post_date else "",
-                         c.search_query])
+    if format == "txt":
+        # @username по одному на строку — готово к вставке в commenting кампанию.
+        # Санитайзим на всякий случай — оставляем только [a-zA-Z0-9_] в username.
+        import re as _re_uname
+        for r in rows:
+            u = (r["username"] or "").strip().lstrip("@")
+            u = _re_uname.sub(r"[^a-zA-Z0-9_]", "", u)
+            if u:
+                output.write("@" + u + "\n")
+        media = "text/plain; charset=utf-8"
+    elif format == "txt_links":
+        for r in rows:
+            if r["username"]:
+                output.write(f"https://t.me/{r['username']}\n")
+        media = "text/plain; charset=utf-8"
+    else:
+        writer = csv.writer(output)
+        writer.writerow(["username", "title", "subscribers", "has_comments", "folder", "last_post", "query"])
+        for r in rows:
+            writer.writerow([
+                f"@{r['username']}", r["title"], r["subscribers"], r["has_comments"],
+                r["folder"], r["last_post"], r["query"],
+            ])
+        media = "text/csv; charset=utf-8"
 
     output.seek(0)
-    return StreamingResponse(iter([output.getvalue()]), media_type="text/csv",
-                             headers={"Content-Disposition": "attachment; filename=channels.csv"})
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type=media,
+        headers={
+            "Content-Disposition": f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{utf8_encoded}",
+            "X-Records-Count": str(len(rows)),
+        },
+    )
+
+
+@router.get("/export/counts")
+async def export_counts(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Счётчики для UI-модалки экспорта: сколько каналов в каждом источнике,
+    сколько из них с комментами. Чтобы юзер сразу видел «Parsed: 555 / 1234,
+    TGStat checked: 1277 / 5000» и понимал что качает."""
+    from models.tgstat_checked_channel import TgstatCheckedChannel
+
+    # ParsedChannel
+    parsed_total_q = await db.execute(
+        select(func.count(ParsedChannel.id))
+        .where(ParsedChannel.user_id == current_user.id)
+    )
+    parsed_wc_q = await db.execute(
+        select(func.count(ParsedChannel.id))
+        .where(ParsedChannel.user_id == current_user.id,
+               ParsedChannel.has_comments == True)
+    )
+    # TgstatChecked
+    tg_total_q = await db.execute(
+        select(func.count(TgstatCheckedChannel.id))
+        .where(TgstatCheckedChannel.user_id == current_user.id)
+    )
+    tg_wc_q = await db.execute(
+        select(func.count(TgstatCheckedChannel.id))
+        .where(TgstatCheckedChannel.user_id == current_user.id,
+               TgstatCheckedChannel.has_comments == True)
+    )
+    return {
+        "parsed": {
+            "total": parsed_total_q.scalar() or 0,
+            "with_comments": parsed_wc_q.scalar() or 0,
+        },
+        "tgstat_checked": {
+            "total": tg_total_q.scalar() or 0,
+            "with_comments": tg_wc_q.scalar() or 0,
+        },
+    }
 
 
 @router.post("/import")
@@ -326,8 +726,10 @@ async def get_folder_channels(
             )
         )
         for s in stats_r.scalars().all():
+            _sk = s.skipped_count or 0
+            _bn = s.banned_count or 0
             pass_rate = 100.0 if s.total_attempts == 0 else round(
-                (s.total_attempts - s.banned_count) / s.total_attempts * 100, 1
+                max(0, s.total_attempts - _bn - _sk) / s.total_attempts * 100, 1
             )
             stats_map[s.channel_username] = pass_rate
 
@@ -420,6 +822,324 @@ async def stop_search(
             pass
         r.delete(f"parser:task_id:{current_user.id}")
     return {"status": "stop requested"}
+
+
+# ══════════════════════════════════════════════════════════
+# Multi-account поиск
+# ══════════════════════════════════════════════════════════
+
+class SearchMultiRequest(BaseModel):
+    account_ids: list[int]                                  # какие акки использовать
+    keywords: str
+    min_subscribers: int = 0
+    max_subscribers: int = 10_000_000
+    only_with_comments: bool = True                         # precise_check ВСЕГДА, флаг только "фильтровать?"
+    active_hours: int = 0
+    name_endings: Optional[str] = None
+    name_contains: Optional[str] = None
+    limit_per_keyword: int = 50
+    max_channels_per_acc: int = 500
+    # Диапазон случайной параллельности: сколько прокси одновременно
+    # (реальное значение = random.randint(min, min(max, N_proxies))).
+    min_concurrency: int = 2
+    max_concurrency: int = 7
+    pause_between_keywords_min: float = 3.0
+    pause_between_keywords_max: float = 6.0
+    pause_between_channels_min: float = 0.8
+    pause_between_channels_max: float = 1.5
+
+
+def _multi_check_no_duplicate(r, user_id: int):
+    """Guard: если у юзера уже идёт multi-парсер (progress running, heartbeat
+    свежий) — 409. Иначе получим два параллельных таска, они пишут в разные
+    ключи, но грузят одни и те же акки. Юзер должен либо дождаться, либо
+    остановить."""
+    import json as _json, time as _t
+    # Сканим все multi-progress ключи юзера
+    for key in r.scan_iter(match=f"parser:multi:progress:{user_id}:*"):
+        raw = r.get(key)
+        if not raw:
+            continue
+        try:
+            d = _json.loads(raw)
+        except Exception:
+            continue
+        if d.get("status") != "running":
+            continue
+        ts = int(d.get("ts") or 0)
+        if _t.time() - ts > 120:
+            continue    # stale, considered dead
+        active_job = d.get("job_id") or ""
+        found_total = d.get("found_total", 0)
+        acc_total = d.get("total_accounts", 0)
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Уже идёт multi-парсер (job={active_job[:12]}): найдено {found_total}, "
+                f"акков {acc_total}. Дождись окончания или нажми Стоп."
+            ),
+        )
+
+
+@router.post("/search/multi")
+async def search_multi(
+    body: SearchMultiRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Мульти-акк парсер каналов.
+
+    Отличия от /search:
+      * accepts N account_ids
+      * группирует по прокси, N воркеров параллельно (random 2..7)
+      * FloodWait → аккаунт уходит на cooldown ≥ 1час, без retry
+      * precise has_comments вшит (не нужно потом отдельно верифить)
+    """
+    import redis as redis_lib
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    _multi_check_no_duplicate(r, current_user.id)
+
+    keywords = [k.strip() for k in body.keywords.split(",") if k.strip()]
+    if not keywords:
+        raise HTTPException(status_code=400, detail="Укажите хотя бы одно ключевое слово")
+    if not body.account_ids:
+        raise HTTPException(status_code=400, detail="Не выбран ни один аккаунт")
+
+    # проверка — что акки принадлежат юзеру
+    acc_r = await db.execute(
+        select(TelegramAccount.id).where(
+            TelegramAccount.id.in_(body.account_ids),
+            TelegramAccount.user_id == current_user.id,
+        )
+    )
+    owned = {r[0] for r in acc_r.all()}
+    missing = [x for x in body.account_ids if x not in owned]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Не твои акки: {missing[:5]}{'...' if len(missing)>5 else ''}",
+        )
+
+    import uuid as _uuid, time as _t
+    job_id = f"multi_{int(_t.time())}_{_uuid.uuid4().hex[:6]}"
+
+    from celery_app import celery_app
+    params = body.model_dump()
+    params["job_id"] = job_id
+    task = celery_app.send_task(
+        "tasks.parser_multi_tasks.run_parser_multi_search",
+        args=[current_user.id, list(owned), params],
+        queue="parsers",
+    )
+    return {
+        "task_id": task.id,
+        "job_id": job_id,
+        "status": "started",
+        "accounts_scheduled": len(owned),
+        "keywords": len(keywords),
+        "message": f"Multi-парсинг: {len(owned)} акк, {len(keywords)} ключей",
+    }
+
+
+@router.get("/search/multi/progress")
+async def get_search_multi_progress(
+    job_id: str = Query(...),
+    current_user: User = Depends(get_current_user),
+):
+    """Snapshot per-account прогресса multi-парсинга.
+    Формат в docstring tasks.parser_multi_tasks.
+
+    Auto-stale: если status=running но heartbeat старше 120с — считаем
+    воркер мёртвым, отдаём status=error чтобы UI мгновенно показал.
+    """
+    import redis as redis_lib
+    import json as _json, time as _t
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    prog_key = f"parser:multi:progress:{current_user.id}:{job_id}"
+    raw = r.get(prog_key)
+    if not raw:
+        return {"status": "idle"}
+    try:
+        d = _json.loads(raw)
+    except Exception:
+        return {"status": "idle"}
+    # Stale detection
+    if d.get("status") == "running":
+        ts = int(d.get("ts") or 0)
+        age = int(_t.time()) - ts
+        if age > 120:
+            d["status"] = "error"
+            d["stale"] = True
+            d["error"] = (
+                f"Воркер не отвечает {age}с — вероятно упал (рестарт celery, "
+                f"crash или OOM). Найдено {d.get('found_total',0)} каналов. "
+                f"Запусти заново — акки на cooldown будут пропущены."
+            )
+            try:
+                r.setex(prog_key, 3600, _json.dumps(d, ensure_ascii=False))
+            except Exception:
+                pass
+    return d
+
+
+@router.get("/search/multi/active")
+async def get_active_multi(
+    current_user: User = Depends(get_current_user),
+):
+    """Список активных multi-парсер задач юзера. UI подхватывает на mount
+    чтобы бейдж «Multi-парсер идёт» показывался даже после F5.
+    Возвращает только те где status=running + heartbeat < 120с."""
+    import redis as redis_lib
+    import json as _json, time as _t
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    out = []
+    now_ts = int(_t.time())
+    for key in r.scan_iter(match=f"parser:multi:progress:{current_user.id}:*"):
+        raw = r.get(key)
+        if not raw:
+            continue
+        try:
+            d = _json.loads(raw)
+        except Exception:
+            continue
+        ts = int(d.get("ts") or 0)
+        age = now_ts - ts
+        status = d.get("status")
+        # Показываем running (свежие) И recently-done/cancelled (< 5 мин)
+        # чтобы юзер после F5 увидел итоги последнего run'а.
+        if status == "running" and age > 120:
+            continue    # stale, будет marked как error при следующем /progress
+        if status in ("done", "cancelled", "error") and age > 300:
+            continue    # старые — не тянем
+        out.append({
+            "job_id": d.get("job_id"),
+            "status": status,
+            "found_total": d.get("found_total", 0),
+            "saved_total": d.get("saved_total", 0),
+            "total_accounts": d.get("total_accounts", 0),
+            "concurrency": d.get("concurrency", 0),
+            "started_at": d.get("started_at"),
+            "age_sec": age,
+        })
+    # Самые свежие сверху
+    out.sort(key=lambda x: x.get("started_at") or 0, reverse=True)
+    return {"jobs": out}
+
+
+@router.post("/search/multi/stop")
+async def stop_search_multi(
+    job_id: str = Query(...),
+    current_user: User = Depends(get_current_user),
+):
+    """Ставит cancel-флаг. Воркеры увидят на ближайшем check и выйдут
+    (мягкая остановка — акки текущей итерации доделываются)."""
+    import redis as redis_lib
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    r.setex(f"parser:multi:stop:{current_user.id}:{job_id}", 3600, "1")
+    return {"status": "stopping", "job_id": job_id}
+
+
+@router.post("/search/multi/reset")
+async def reset_search_multi(
+    job_id: str = Query(...),
+    current_user: User = Depends(get_current_user),
+):
+    """Force-reset зависшего multi-парсера.
+
+    Что делает:
+      1. celery_app.control.revoke(task_id, terminate=True, signal=SIGTERM)
+         → пришибает celery-воркер даже если он застрял в blocking Telethon.
+      2. Ставит cancel-флаг (на случай если revoke не сработает).
+      3. Помечает snapshot в Redis как status=error чтобы UI перестал крутить.
+      4. Удаляет task_id-ключ.
+    """
+    import redis as redis_lib
+    import json as _json, time as _t
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    revoked = False
+    tk_key = f"parser:multi:task_id:{current_user.id}:{job_id}"
+    task_id = r.get(tk_key)
+    if task_id:
+        try:
+            from celery_app import celery_app
+            tid = task_id.decode() if isinstance(task_id, bytes) else str(task_id)
+            celery_app.control.revoke(tid, terminate=True, signal="SIGTERM")
+            revoked = True
+        except Exception as e:
+            logger.warning(f"[multi_reset] revoke failed: {e}")
+    # Cancel-флаг — как второй пояс безопасности
+    r.setex(f"parser:multi:stop:{current_user.id}:{job_id}", 3600, "1")
+    # Помечаем snapshot как error
+    prog_key = f"parser:multi:progress:{current_user.id}:{job_id}"
+    raw = r.get(prog_key)
+    if raw:
+        try:
+            d = _json.loads(raw)
+            d["status"] = "error"
+            d["stale"] = True
+            d["error"] = f"Force-reset юзером{' (revoked)' if revoked else ''}"
+            d["ts"] = int(_t.time())
+            r.setex(prog_key, 3600, _json.dumps(d, ensure_ascii=False))
+        except Exception:
+            pass
+    # Убираем task_id — новый запуск сгенерит свой
+    r.delete(tk_key)
+    return {"status": "reset", "job_id": job_id, "revoked": revoked}
+
+
+@router.get("/search/multi/cooldowns")
+async def get_acc_cooldowns(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Список аккаунтов юзера с активным parser:acc_cooldown флагом.
+    UI показывает: «эти акки на перекуре, будут пропущены»."""
+    import redis as redis_lib
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    accs_r = await db.execute(
+        select(TelegramAccount.id, TelegramAccount.phone, TelegramAccount.first_name)
+        .where(TelegramAccount.user_id == current_user.id)
+    )
+    out = []
+    now_ts = int(__import__("time").time())
+    for acc_id, phone, first_name in accs_r.all():
+        cd = r.get(f"parser:acc_cooldown:{acc_id}")
+        if not cd:
+            continue
+        try:
+            expires = int(cd)
+        except Exception:
+            expires = now_ts
+        out.append({
+            "account_id": acc_id,
+            "phone": phone,
+            "first_name": first_name,
+            "expires_at": expires,
+            "seconds_left": max(0, expires - now_ts),
+        })
+    return out
+
+
+@router.post("/search/multi/cooldowns/clear")
+async def clear_acc_cooldown(
+    account_id: int = Query(...),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Ручной сброс cooldown для одного аккаунта (юзер знает лучше).
+    Проверка что акк принадлежит юзеру."""
+    r_ = await db.execute(
+        select(TelegramAccount.id).where(
+            TelegramAccount.id == account_id,
+            TelegramAccount.user_id == current_user.id,
+        )
+    )
+    if not r_.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Аккаунт не найден")
+    import redis as redis_lib
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    r.delete(f"parser:acc_cooldown:{account_id}")
+    return {"status": "cleared", "account_id": account_id}
 @router.get("/whitelist")
 async def get_whitelist(
     min_rate: float = 0,  # фильтр по минимальной проходимости
@@ -438,8 +1158,10 @@ async def get_whitelist(
 
     out = []
     for s in stats:
+        _sk = s.skipped_count or 0
+        _bn = s.banned_count or 0
         pass_rate = 100.0 if s.total_attempts == 0 else round(
-            (s.total_attempts - s.banned_count) / s.total_attempts * 100, 1
+            max(0, s.total_attempts - _bn - _sk) / s.total_attempts * 100, 1
         )
         if pass_rate < min_rate:
             continue
@@ -447,9 +1169,11 @@ async def get_whitelist(
             "id": s.id,
             "channel_username": s.channel_username,
             "total_attempts": s.total_attempts,
-            "banned_count": s.banned_count,
+            "banned_count": _bn,
+            "skipped_count": _sk,
             "pass_rate": pass_rate,
             "last_ban_reason": s.last_ban_reason,
+            "last_skip_reason": s.last_skip_reason or "",
             "last_updated": s.last_updated.isoformat() + "Z",
         })
 
@@ -482,6 +1206,25 @@ async def delete_whitelist_entry(
     if s:
         await db.delete(s)
         await db.flush()
+
+
+@router.delete("/whitelist")
+async def wipe_whitelist(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Полностью очистить всю проходимость юзера — все ChannelBanStats
+    удаляются. Юзкейс: изначальные записи созданы во время неполного
+    цикла (без верификации удаления), pass_rate там нерелевантный.
+    После очистки — начинаем считать с нуля через новый verify-механизм.
+    """
+    from models.channel_ban_stats import ChannelBanStats
+    from sqlalchemy import delete as sa_delete
+    result = await db.execute(
+        sa_delete(ChannelBanStats).where(ChannelBanStats.user_id == current_user.id)
+    )
+    await db.flush()
+    return {"deleted": result.rowcount or 0}
 
 # ══════════════════════════════════════════════════════════
 # Similar channels crawler (обход графа похожих каналов)
@@ -651,6 +1394,229 @@ async def get_similar_progress(
         }
     except Exception:
         return {"status": "idle"}
+
+
+# ══════════════════════════════════════════════════════════
+# Multi-account паутинка (crawler)
+# ══════════════════════════════════════════════════════════
+
+class SimilarMultiRequest(BaseModel):
+    account_ids: list[int]
+    seeds: list[str]
+    max_depth: int = 2
+    max_channels: int = 1000
+    folder: str = ""
+    pause_min: float = 8.0
+    pause_max: float = 15.0
+    min_concurrency: int = 2
+    max_concurrency: int = 7
+    # Оставлять только каналы с открытыми комментариями (linked discussion).
+    # Precise-check вшит: GetFullChannel во время crawl'а. +1 запрос TG
+    # per candidate, но сохраняем сразу правильный флаг → не нужно потом
+    # отдельно верифить.
+    only_with_comments: bool = True
+
+
+def _similar_multi_check_no_duplicate(r, user_id: int):
+    """Guard: если уже идёт multi-паутинка — 409."""
+    import json as _json, time as _t
+    for key in r.scan_iter(match=f"parser:similar_multi:progress:{user_id}:*"):
+        raw = r.get(key)
+        if not raw:
+            continue
+        try: d = _json.loads(raw)
+        except Exception: continue
+        if d.get("status") != "running":
+            continue
+        ts = int(d.get("ts") or 0)
+        if _t.time() - ts > 120:
+            continue
+        active_job = d.get("job_id") or ""
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Уже идёт multi-паутинка (job={active_job[:12]}): найдено "
+                f"{d.get('found_total',0)}. Дождись или нажми Стоп."
+            ),
+        )
+
+
+@router.post("/similar/multi")
+async def start_similar_multi(
+    body: SimilarMultiRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Мульти-акк паутинка. Отличия от /similar/start:
+      * accepts N account_ids
+      * random concurrency 2..7 по прокси
+      * FloodWait → cooldown ≥1час, без retry
+      * cooperative yield с warmup/commenting/refix через account_lock
+      * split seeds round-robin среди активных акков, общий Redis SET
+        для кросс-акк дедупа
+    """
+    import redis as redis_lib
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    _similar_multi_check_no_duplicate(r, current_user.id)
+
+    if not body.seeds:
+        raise HTTPException(status_code=400, detail="Укажи хотя бы один seed-канал")
+    if not body.account_ids:
+        raise HTTPException(status_code=400, detail="Не выбран ни один аккаунт")
+
+    acc_r = await db.execute(
+        select(TelegramAccount.id).where(
+            TelegramAccount.id.in_(body.account_ids),
+            TelegramAccount.user_id == current_user.id,
+        )
+    )
+    owned = {r_[0] for r_ in acc_r.all()}
+    missing = [x for x in body.account_ids if x not in owned]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Не твои акки: {missing[:5]}{'...' if len(missing)>5 else ''}",
+        )
+
+    import uuid as _uuid, time as _t
+    job_id = f"similar_multi_{int(_t.time())}_{_uuid.uuid4().hex[:6]}"
+
+    from celery_app import celery_app
+    params = body.model_dump()
+    params["job_id"] = job_id
+    task = celery_app.send_task(
+        "tasks.parser_similar_multi_tasks.run_similar_multi_crawler",
+        args=[current_user.id, list(owned), params],
+        queue="parsers",
+    )
+    return {
+        "task_id": task.id,
+        "job_id": job_id,
+        "status": "started",
+        "accounts_scheduled": len(owned),
+        "seeds": len(body.seeds),
+        "message": f"Multi-паутинка: {len(owned)} акк, {len(body.seeds)} seeds",
+    }
+
+
+@router.get("/similar/multi/progress")
+async def get_similar_multi_progress(
+    job_id: str = Query(...),
+    current_user: User = Depends(get_current_user),
+):
+    """Snapshot per-acc прогресса паутинки. Auto-stale если heartbeat >120с."""
+    import redis as redis_lib
+    import json as _json, time as _t
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    prog_key = f"parser:similar_multi:progress:{current_user.id}:{job_id}"
+    raw = r.get(prog_key)
+    if not raw:
+        return {"status": "idle"}
+    try:
+        d = _json.loads(raw)
+    except Exception:
+        return {"status": "idle"}
+    if d.get("status") == "running":
+        ts = int(d.get("ts") or 0)
+        age = int(_t.time()) - ts
+        if age > 120:
+            d["status"] = "error"
+            d["stale"] = True
+            d["error"] = (
+                f"Воркер не отвечает {age}с — вероятно упал. "
+                f"Найдено {d.get('found_total',0)} каналов. Запусти заново."
+            )
+            try:
+                r.setex(prog_key, 3600, _json.dumps(d, ensure_ascii=False))
+            except Exception:
+                pass
+    return d
+
+
+@router.get("/similar/multi/active")
+async def get_active_similar_multi(
+    current_user: User = Depends(get_current_user),
+):
+    """Список активных multi-паутинок юзера (для persistence после F5)."""
+    import redis as redis_lib
+    import json as _json, time as _t
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    out = []
+    now_ts = int(_t.time())
+    for key in r.scan_iter(match=f"parser:similar_multi:progress:{current_user.id}:*"):
+        raw = r.get(key)
+        if not raw:
+            continue
+        try: d = _json.loads(raw)
+        except Exception: continue
+        ts = int(d.get("ts") or 0)
+        age = now_ts - ts
+        status = d.get("status")
+        if status == "running" and age > 120:
+            continue
+        if status in ("done", "cancelled", "error") and age > 300:
+            continue
+        out.append({
+            "job_id": d.get("job_id"),
+            "status": status,
+            "found_total": d.get("found_total", 0),
+            "saved_total": d.get("saved_total", 0),
+            "total_accounts": d.get("total_accounts", 0),
+            "concurrency": d.get("concurrency", 0),
+            "started_at": d.get("started_at"),
+            "age_sec": age,
+        })
+    out.sort(key=lambda x: x.get("started_at") or 0, reverse=True)
+    return {"jobs": out}
+
+
+@router.post("/similar/multi/stop")
+async def stop_similar_multi(
+    job_id: str = Query(...),
+    current_user: User = Depends(get_current_user),
+):
+    """Мягкий стоп: cancel-флаг → воркеры доделывают текущий канал и выходят."""
+    import redis as redis_lib
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    r.setex(f"parser:similar_multi:stop:{current_user.id}:{job_id}", 3600, "1")
+    return {"status": "stopping", "job_id": job_id}
+
+
+@router.post("/similar/multi/reset")
+async def reset_similar_multi(
+    job_id: str = Query(...),
+    current_user: User = Depends(get_current_user),
+):
+    """Force-reset: revoke celery + cancel + mark error."""
+    import redis as redis_lib
+    import json as _json, time as _t
+    r = redis_lib.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    revoked = False
+    tk_key = f"parser:similar_multi:task_id:{current_user.id}:{job_id}"
+    task_id = r.get(tk_key)
+    if task_id:
+        try:
+            from celery_app import celery_app
+            tid = task_id.decode() if isinstance(task_id, bytes) else str(task_id)
+            celery_app.control.revoke(tid, terminate=True, signal="SIGTERM")
+            revoked = True
+        except Exception as e:
+            logger.warning(f"[similar_multi_reset] revoke fail: {e}")
+    r.setex(f"parser:similar_multi:stop:{current_user.id}:{job_id}", 3600, "1")
+    prog_key = f"parser:similar_multi:progress:{current_user.id}:{job_id}"
+    raw = r.get(prog_key)
+    if raw:
+        try:
+            d = _json.loads(raw)
+            d["status"] = "error"
+            d["stale"] = True
+            d["error"] = f"Force-reset юзером{' (revoked)' if revoked else ''}"
+            d["ts"] = int(_t.time())
+            r.setex(prog_key, 3600, _json.dumps(d, ensure_ascii=False))
+        except Exception:
+            pass
+    r.delete(tk_key)
+    return {"status": "reset", "job_id": job_id, "revoked": revoked}
 
 
 # ══════════════════════════════════════════════════════════
@@ -1286,10 +2252,10 @@ class WebScrapeStartRequest(BaseModel):
     page_locale: Optional[str] = "en-US"
     humanize: Optional[bool] = True
     headless: Optional[bool] = True
-    # camoufox = patched Firefox с fresh context per URL (быстрее старт, легковеснее)
     # cloak    = CloakBrowser с persistent-профилем на каждый прокси
-    #            (fingerprint и cookies копятся → меньше CF-челленджей)
-    engine: Optional[str] = "camoufox"
+    #            (fingerprint и cookies копятся → меньше CF-челленджей). Дефолт.
+    # camoufox = patched Firefox с fresh context per URL (fallback, легковеснее)
+    engine: Optional[str] = "cloak"
 
 
 @router.post("/web/scrape/start")
@@ -1338,7 +2304,7 @@ async def web_scrape_start(
         "node_rotation_min_sec": float(body.node_rotation_min_sec or 15.0),
         "node_rotation_max_sec": float(body.node_rotation_max_sec or 35.0),
         "page_locale": body.page_locale or "en-US",
-        "engine": (body.engine or "camoufox").lower(),
+        "engine": (body.engine or "cloak").lower(),
         "camoufox": {
             "humanize": bool(body.humanize),
             "headless": bool(body.headless),
@@ -1616,6 +2582,13 @@ class WebScrapeTgstatRequest(BaseModel):
     only_with_comments: bool = True
     pages_per_geo: int = 1              # сколько страниц с каждого среза
     include_global: bool = False        # добавлять глобальный URL (без country)
+    # Источник кандидатов:
+    #   "rating"  — топ-100 из /ratings/channels{/category}?sort=members. Дефолт.
+    #                Ограничено ~100 на URL, но качественные каналы.
+    #   "sitemap" — TGStat sitemap.xml (~10k global + ~10k на каждый geo).
+    #                Огромный охват, но качество каналов смешанное — Stage 2
+    #                отфильтрует по linked_chat.
+    source: str = "rating"
     # Сколько кандидатов проверить во 2-м проходе (детальные страницы).
     # 0 = без лимита. Влияет на ВРЕМЯ: каждый кандидат это 1 HTTP запрос
     # к /channel/@xxx с 60-120 сек cooldown между прокси.
@@ -1634,7 +2607,7 @@ class WebScrapeTgstatRequest(BaseModel):
     page_locale: Optional[str] = "en-US"
     humanize: Optional[bool] = True
     headless: Optional[bool] = True
-    engine: Optional[str] = "camoufox"
+    engine: Optional[str] = "cloak"
 
 
 @router.post("/web/scrape/tgstat/start")
@@ -1644,7 +2617,7 @@ async def web_scrape_tgstat_start(
     db: AsyncSession = Depends(get_db),
 ):
     """Запуск Camoufox-скрейпинга TGStat по выбранным гео/таргету."""
-    from utils.web_scraper import build_urls
+    from utils.web_scraper import build_urls, sitemap_urls_for
     from models.proxy import Proxy
 
     # ── Сборка прокси-пула ─────────────────────────────────────
@@ -1686,14 +2659,33 @@ async def web_scrape_tgstat_start(
     if target not in ("channels", "chats"):
         target = "chats"
 
-    urls = build_urls(
-        countries=countries,
-        categories=body.categories,
-        only_with_comments=body.only_with_comments,
-        pages_per_geo=max(1, min(body.pages_per_geo, 10)),
-        include_global=body.include_global or not countries,
-        target=target,
-    )
+    source = (body.source or "rating").lower()
+    if source not in ("rating", "sitemap"):
+        source = "rating"
+
+    if source == "sitemap":
+        # Country codes для sitemap иначе называются:
+        # ISO-2 из countries маппим в ISO-2/3 кода-ключи SITEMAP_COUNTRIES.
+        # У нас в GEO_COUNTRIES codes RU/UA/BY/KZ/UZ/KG/IR/CN/IN/ET, а в
+        # SITEMAP_COUNTRIES ключи: ru/ua/by/kz/uz/kg/ir/cn/in/et — то же
+        # самое в lowercase. Мапим 1:1.
+        cc_lower = [c.lower() for c in countries]
+        urls = sitemap_urls_for(
+            countries=cc_lower,
+            include_global=body.include_global or not countries,
+        )
+        extractor_name = "tgstat_sitemap"
+    else:
+        urls = build_urls(
+            countries=countries,
+            categories=body.categories,
+            only_with_comments=body.only_with_comments,
+            pages_per_geo=max(1, min(body.pages_per_geo, 10)),
+            include_global=body.include_global or not countries,
+            target=target,
+        )
+        extractor_name = "tgstat"
+
     if not urls:
         raise HTTPException(
             status_code=400,
@@ -1702,7 +2694,7 @@ async def web_scrape_tgstat_start(
 
     job_id = _uuid.uuid4().hex
     options = {
-        "extractor": "tgstat",
+        "extractor": extractor_name,
         "max_workers": max(1, min(int(body.max_workers or 3), 6)),
         "max_retries": max(1, min(int(body.max_retries or 3), 5)),
         "page_timeout_sec": float(body.page_timeout_sec or 60.0),
@@ -1712,9 +2704,9 @@ async def web_scrape_tgstat_start(
         "node_rotation_max_sec": float(body.node_rotation_max_sec or 35.0),
         "page_locale": body.page_locale or "en-US",
         # Лимит кандидатов на проверку во 2-м проходе. 0 = весь Stage 1.
-        "stage2_limit": max(0, min(int(body.max_channels or 0), 500)),
+        "stage2_limit": max(0, min(int(body.max_channels or 0), 2000)),
         "skip_recently_checked_days": max(0, int(body.skip_recently_checked_days or 0)),
-        "engine": (body.engine or "camoufox").lower(),
+        "engine": (body.engine or "cloak").lower(),
         "camoufox": {
             "humanize": bool(body.humanize),
             "headless": bool(body.headless),
@@ -1738,7 +2730,7 @@ async def web_scrape_tgstat_start(
     # UI использует это как основной знаменатель прогресс-бара с самого
     # старта, а не Stage 1 URL count (обычно 1-8), иначе показывает "0/1"
     # что вводит в заблуждение.
-    stage2_target = max(0, min(int(body.max_channels or 0), 500))
+    stage2_target = max(0, min(int(body.max_channels or 0), 2000))
     initial = {
         "status": "queued",
         "job_id": job_id,
@@ -1792,11 +2784,16 @@ async def web_scrape_tgstat_aggregate(
     """
     stage2_path = _ws_jsonl_path(current_user.id, job_id).parent / f"{job_id}.stage2.jsonl"
 
-    channels_data = []
+    # Дедуп по username: если один канал попал в JSONL дважды (retry),
+    # берём последнюю запись — там актуальный статус.
+    by_username: dict[str, dict] = {}
+    rows_read_raw = 0
+    dead_count = 0
     if stage2_path.exists():
         try:
             with stage2_path.open("r", encoding="utf-8") as f:
                 for line in f:
+                    rows_read_raw += 1
                     try:
                         rec = _json.loads(line)
                     except Exception:
@@ -1816,9 +2813,17 @@ async def web_scrape_tgstat_aggregate(
                             u = url[idx + len(marker):].split("/")[0].split("?")[0].lstrip("@")
                     if not u:
                         continue
+                    # ── Фильтр 404-страниц TGStat ──
+                    # extractor выставляет is_dead=True когда TGStat отдал
+                    # fallback-страницу «канал не найден». В таких записях
+                    # linked_chat и subscribers могут быть из кеша, но
+                    # реальный Telegram-канал удалён — не показываем.
+                    if bool(data.get("is_dead")):
+                        dead_count += 1
+                        continue
                     has_c = bool(data.get("has_open_comments"))
                     subs = int(data.get("subscribers") or 0)
-                    channels_data.append({
+                    by_username[u.lower()] = {
                         "username": u,
                         "title": (data.get("title") or "")[:250] or None,
                         "subscribers": subs,
@@ -1826,11 +2831,12 @@ async def web_scrape_tgstat_aggregate(
                         "category": data.get("category"),
                         "verified": bool(data.get("verified")),
                         "discussion_chat": (data.get("linked_chat_username") or "").lstrip("@") or None,
-                    })
+                    }
         except Exception as e:
             logging.getLogger(__name__).warning(
                 f"[aggregate] Stage 2 JSONL read error for {job_id}: {e}"
             )
+    channels_data = list(by_username.values())
 
     # Language подтягиваем из БД одним запросом по usernames
     lang_by_user: dict[str, str | None] = {}
@@ -1886,9 +2892,22 @@ async def web_scrape_tgstat_aggregate(
             "source_url": f"https://tgstat.com/channel/@{u}",
         })
     out.sort(key=lambda x: x.get("subscribers") or 0, reverse=True)
+    # Метрики:
+    #   rows_read      — сколько уникальных живых каналов прочитали из JSONL
+    #                    (после дедупа по username + фильтра is_dead)
+    #   channels_count — сколько ПОПАЛО в out после only_with_comments/min_subs фильтров
+    #   with_comments  — сколько всего живых с комментами (независимо от фильтра)
+    #   dead_count     — сколько 404/dead записей отфильтровали
+    #   rows_read_raw  — сырые строки в JSONL (до дедупа)
+    with_c = sum(1 for c in channels_data if c["has_comments"])
+    without_c = sum(1 for c in channels_data if not c["has_comments"])
     return {
         "job_id": job_id,
-        "rows_read": len(channels_data),
+        "rows_read": len(channels_data),        # уникальные живые
+        "rows_read_raw": rows_read_raw,          # все строки JSONL
+        "dead_count": dead_count,
+        "with_comments_count": with_c,
+        "without_comments_count": without_c,
         "channels_count": len(out),
         "channels": out,
         "source": "stage2_jsonl" if stage2_path.exists() else "db_fallback",

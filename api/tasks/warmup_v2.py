@@ -907,12 +907,19 @@ async def _run_session(task_row, account, proxy, session_cfg, db):
                             channels_today.append(pending_comment.channel)
                             behavior.channels_commented_today = channels_today
 
-                            # Обновляем campaign comments_sent
+                            # Обновляем campaign comments_sent (атомарный SQL —
+                            # см. plan_executor 2026-07-14 fix, обычный += теряет
+                            # инкременты при параллельных сессиях)
                             from models.campaign import Campaign, CommentLog
+                            from sqlalchemy import update as _sa_update
                             camp_r = await db.execute(select(Campaign).where(Campaign.id == pending_comment.campaign_id))
                             camp = camp_r.scalar_one_or_none()
                             if camp:
-                                camp.comments_sent += 1
+                                await db.execute(
+                                    _sa_update(Campaign)
+                                    .where(Campaign.id == camp.id)
+                                    .values(comments_sent=Campaign.comments_sent + 1)
+                                )
                                 db.add(CommentLog(
                                     campaign_id=camp.id, account_id=account.id,
                                     account_phone=phone, channel_username=pending_comment.channel,

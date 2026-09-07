@@ -15,12 +15,20 @@ class ChannelBanStats(Base):
     channel_username:   Mapped[str]              = mapped_column(String(128), nullable=False, index=True)
     total_attempts:     Mapped[int]              = mapped_column(Integer, default=0)
     banned_count:       Mapped[int]              = mapped_column(Integer, default=0)
+    # Комменты которые НЕ дошли до отправки (canWrite=false, no discussion,
+    # MsgIdInvalid и т.д.). Если растёт — системная проблема с каналом.
+    skipped_count:      Mapped[int]              = mapped_column(Integer, default=0)
     last_ban_reason:    Mapped[Optional[str]]    = mapped_column(Text, nullable=True)
+    last_skip_reason:   Mapped[Optional[str]]    = mapped_column(Text, nullable=True)
     last_updated:       Mapped[datetime]         = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     created_at:         Mapped[datetime]         = mapped_column(DateTime, default=datetime.utcnow)
 
     @property
     def pass_rate(self) -> float:
+        """Процент реально ДОШЕДШИХ комментов от всех попыток.
+        skipped_count тоже вычитаем — это неотправленные (не ошибка,
+        но и не успех)."""
         if self.total_attempts == 0:
             return 100.0
-        return round((self.total_attempts - self.banned_count) / self.total_attempts * 100, 1)
+        _ok = self.total_attempts - (self.banned_count or 0) - (self.skipped_count or 0)
+        return round(max(0, _ok) / self.total_attempts * 100, 1)

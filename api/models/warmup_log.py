@@ -27,6 +27,9 @@ class WarmupLog(Base):
     created_at:  Mapped[datetime]         = mapped_column(DateTime, default=datetime.utcnow, index=True)
     source:      Mapped[str]              = mapped_column(String(32), default="warmup", index=True)  # warmup | commenting
     campaign_id: Mapped[Optional[int]]    = mapped_column(Integer, nullable=True, index=True)
+    # Кто сказал ошибку (миграция 034): 'telegram' | 'internal'.
+    # Только 'telegram' влияет на здоровье аккаунта — см. utils/error_origin.
+    error_origin: Mapped[Optional[str]]   = mapped_column(String(16), nullable=True)
 
     def __repr__(self):
         return f"<WarmupLog task={self.task_id} action={self.action} ok={self.success}>"

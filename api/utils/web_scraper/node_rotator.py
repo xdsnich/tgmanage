@@ -41,6 +41,13 @@ class ProxyNode:
     last_rotation_at: float = 0.0     # последняя смена контекста на этом IP
     successes: int = 0
     failures: int = 0
+    # Кол-во ПОДРЯД идущих неудач без единого успеха между ними. Используется
+    # для эскалирующего cooldown: 1-й 403 = x1, 2-й = x3, 3-й = x8 + burn.
+    # Обнуляется на любом success.
+    consecutive_failures: int = 0
+    # Полностью выключен на эту сессию (сожжён): 3+ подряд 403. Не выдаём
+    # даже если cooldown_until истёк — фингерпринт уже палёный.
+    burned: bool = False
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     @property
@@ -54,6 +61,11 @@ class ProxyNode:
     @property
     def is_busy(self) -> bool:
         return self._lock.locked()
+
+    @property
+    def is_available(self) -> bool:
+        """Узел готов принять запрос: не занят, не в cooldown, не сожжён."""
+        return not self.burned and not self.is_cooldown and not self.is_busy
 
 
 class NodeRotator:
@@ -115,7 +127,7 @@ class NodeRotator:
             if cancel_check is not None and cancel_check():
                 raise asyncio.TimeoutError("cancelled during node wait")
             async with self._global_lock:
-                available = [n for n in self.nodes if not n.is_cooldown and not n.is_busy]
+                available = [n for n in self.nodes if n.is_available]
                 if available:
                     # Случайный выбор из доступных вместо round-robin.
                     # Раньше _rr_index давал фиксированный порядок → TGStat
@@ -148,18 +160,62 @@ class NodeRotator:
         """
         Помечает узел как зафейленный: ставит cooldown и освобождает lock.
         Вызывать на 403/429/timeout/connection error.
+
+        Эскалирующий cooldown:
+          - 1-й фейл подряд → base cooldown
+          - 2-й фейл подряд → ×3 (Cloudflare помнит IP несколько минут после
+            challenge — 60-120с точно не хватит, нужно 5-15 мин)
+          - 3-й фейл подряд → ×8 + burn узел (фингерпринт спалён на эту
+            сессию, дальше пробовать = ловить перманентный ban)
+
+        Плюс мультипликатор по типу проблемы:
+          - "HTTP 403" / "HTTP 429" — WAF-challenge, ×2 (CF помнит долго)
+          - "HTTP 5xx" — сервер, ×1
+          - "timeout" / "connection" — сетевые, ×1
         """
-        cd = random.randint(self.cooldown_min_sec, self.cooldown_max_sec)
-        node.cooldown_until = time.time() + cd
+        node.consecutive_failures += 1
         node.failures += 1
-        logger.warning(
-            f"[rotator] Узел {self._mask(node.url)} → cooldown {cd}с (reason: {reason})"
-        )
+        streak = node.consecutive_failures
+
+        # Escalation по количеству подряд
+        if streak == 1:
+            streak_mult = 1.0
+        elif streak == 2:
+            streak_mult = 3.0
+        else:  # 3+
+            streak_mult = 8.0
+
+        # Escalation по типу
+        reason_low = (reason or "").lower()
+        is_waf = "403" in reason_low or "429" in reason_low or "cloudflare" in reason_low
+        reason_mult = 2.0 if is_waf else 1.0
+
+        base = random.randint(self.cooldown_min_sec, self.cooldown_max_sec)
+        cd = int(base * streak_mult * reason_mult)
+        # Верхний предел — час, ниже нет смысла держать в cooldown
+        cd = min(cd, 3600)
+        node.cooldown_until = time.time() + cd
+
+        # На 3-м подряд WAF-фейле — burn: фингерпринт этого IP+профиля
+        # уже засветился, дальнейшие визиты в эту сессию только ухудшат
+        # trust score. Проще выключить узел до следующего job'а.
+        if streak >= 3 and is_waf:
+            node.burned = True
+            logger.warning(
+                f"[rotator] Узел {self._mask(node.url)} СОЖЖЁН на эту сессию "
+                f"(3 подряд WAF-фейла). Выключен до следующего job."
+            )
+        else:
+            logger.warning(
+                f"[rotator] Узел {self._mask(node.url)} → cooldown {cd}с "
+                f"(reason: {reason}, streak: {streak}, mult: {streak_mult}×{reason_mult})"
+            )
         self.release(node)
 
     async def mark_success(self, node: ProxyNode) -> None:
-        """Помечает узел как успешный и освобождает lock."""
+        """Помечает узел как успешный и освобождает lock. Сбрасывает streak."""
         node.successes += 1
+        node.consecutive_failures = 0
         self.release(node)
 
     def mark_rotation(self, node: ProxyNode) -> None:
@@ -184,18 +240,21 @@ class NodeRotator:
         """Снимок состояния пула — для прогресс-UI и мониторинга."""
         return {
             "total": len(self.nodes),
-            "available": sum(1 for n in self.nodes if not n.is_cooldown and not n.is_busy),
-            "in_cooldown": sum(1 for n in self.nodes if n.is_cooldown),
+            "available": sum(1 for n in self.nodes if n.is_available),
+            "in_cooldown": sum(1 for n in self.nodes if n.is_cooldown and not n.burned),
             "busy": sum(1 for n in self.nodes if n.is_busy),
+            "burned": sum(1 for n in self.nodes if n.burned),
             "total_successes": sum(n.successes for n in self.nodes),
             "total_failures": sum(n.failures for n in self.nodes),
             "nodes": [
                 {
                     "url": self._mask(n.url),
-                    "available": not n.is_cooldown,
+                    "available": n.is_available,
                     "cooldown_remaining": n.cooldown_remaining,
                     "successes": n.successes,
                     "failures": n.failures,
+                    "consecutive_failures": n.consecutive_failures,
+                    "burned": n.burned,
                     "busy": n.is_busy,
                 }
                 for n in self.nodes

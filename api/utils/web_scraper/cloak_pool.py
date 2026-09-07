@@ -77,6 +77,7 @@ class CloakProfilePool:
         page_locale: str = "en-US",
         idle_shutdown_sec: float = 300.0,
         browser_version: str | None = None,
+        disable_seeder: bool = False,
     ):
         self.profiles_dir = Path(profiles_dir)
         self.rotation_min = float(node_rotation_min_sec)
@@ -86,6 +87,7 @@ class CloakProfilePool:
         self.cloak_kwargs = dict(cloak_kwargs or {})
         self.page_locale = page_locale
         self.idle_shutdown_sec = float(idle_shutdown_sec)
+        self.disable_seeder = bool(disable_seeder)
         # Дефолт cloakbrowser сейчас — 146.0.7680.177.5, свободная ветка
         # (Pro-ключ не нужен). Оставляем None → библиотека сама подставит.
         # Если юзер явно передал версию через cloak_kwargs["browser_version"]
@@ -335,6 +337,31 @@ class CloakProfilePool:
                 "last_use": time.time(),
                 "profile_dir": profile_dir,
             }
+
+            # ── Профиль-seeder ────────────────────────────────
+            # Свежий/недо-oбросший профиль перед первым визитом на TGStat
+            # обходит 1-3 «нейтральных» сайта (Wikipedia, Google, VK,
+            # YouTube и т.д.), накапливая cookies разных доменов. Cloudflare
+            # оценивает профиль как «настоящий браузер обычного юзера»,
+            # а не как «фингерпринт для одного только TGStat».
+            #
+            # Затухание: MAX_SEEDS_PER_PROFILE=5, интервал 6ч между seed'ами
+            # (см. profile_seeder.py). После 5 сессий профиль считается
+            # «оброс», seed больше не запускается — только tgstat warmup.
+            if not self.disable_seeder:
+                try:
+                    from .profile_seeder import should_seed, seed_profile
+                    if should_seed(profile_dir):
+                        try:
+                            await seed_profile(ctx, profile_dir)
+                        except Exception as _se:
+                            # Seeding не должен ломать основной поток
+                            logger.debug(
+                                f"[cloak_pool] seed_profile failed for "
+                                f"{_profile_hash(proxy_url)}: {type(_se).__name__}: {_se}"
+                            )
+                except Exception as _im:
+                    logger.debug(f"[cloak_pool] seeder import failed: {_im}")
             return ctx
 
     async def _close_one(self, proxy_url: str) -> None:

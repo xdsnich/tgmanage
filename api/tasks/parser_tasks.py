@@ -113,23 +113,29 @@ async def _save_channel(user_id, channel_data):
 
 async def _check_has_comments(client, chat) -> tuple[bool, int]:
     """
-    Точная проверка: канал имеет linked discussion group?
-    Возвращает (has_comments, flood_wait_seconds).
-    """
-    from telethon.tl.functions.channels import GetFullChannelRequest
-    from telethon.errors import FloodWaitError, ChannelPrivateError
+    Точная проверка пригодности канала для комментирования.
+    Возвращает (commentable, flood_wait_seconds).
 
-    try:
-        full = await client(GetFullChannelRequest(channel=chat))
-        linked_id = getattr(full.full_chat, 'linked_chat_id', 0) or 0
-        return (linked_id > 0, 0)
-    except FloodWaitError as e:
-        return (False, e.seconds)
-    except ChannelPrivateError:
-        return (False, 0)
-    except Exception as e:
-        logger.warning(f"[parser] GetFullChannel @{getattr(chat, 'username', '?')}: {str(e)[:100]}")
-        return (False, 0)
+    ── 2026-08-22 ───────────────────────────────────────────────
+    Раньше проверялось только наличие linked discussion group. Но
+    «обсуждения есть» ≠ «туда можно писать»: замер на 25 каналах показал,
+    что из них 9 непригодны — 6 без обсуждений и 3 со вступлением ТОЛЬКО
+    ПО ЗАЯВКЕ. Такие каналы попадали в базу как годные, и потом в них по
+    очереди упирался каждый аккаунт, собирая отказы от Telegram.
+
+    Тот же самый GetFullChannelRequest отдаёт и join_request, и
+    default_banned_rights — отсеиваем сразу, БЕЗ дополнительных запросов.
+    Заодно результат пишется в channel_capabilities и становится общим
+    знанием для всех аккаунтов.
+    """
+    from utils.channel_caps import check_and_record, entity_username
+    # entity_username учитывает мульти-юзернеймы: у части каналов
+    # поле username пустое, а имя лежит в списке usernames.
+    uname = entity_username(chat)
+    ok, fw, caps = await check_and_record(client, chat, uname, source="parser_search")
+    if not ok and caps.get("reason") and caps.get("reason") != "no_discussion":
+        logger.info(f"[parser] @{uname}: отсеян — {caps['reason']}")
+    return (ok, fw)
 
 
 async def _get_last_post_date(client, chat):
@@ -311,7 +317,11 @@ async def _run_parser(user_id: int, account_id: int, params: dict):
                             pass
 
                     # Фильтры по результату
-                    if params.get("only_with_comments") and not has_comments:
+                    # Умолчание True: если вызывающий не передал флаг, сохраняем
+                    # ТОЛЬКО пригодные каналы. Раньше отсутствие параметра
+                    # означало «сохранять всё», и в базу текли каналы без
+                    # обсуждений и с обязательной заявкой.
+                    if params.get("only_with_comments", True) and not has_comments:
                         continue
                     if params.get("active_hours", 0) > 0 and last_post:
                         cutoff = datetime.utcnow() - timedelta(hours=params["active_hours"])

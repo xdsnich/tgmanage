@@ -647,7 +647,11 @@ export default function AccountDetailPage() {
               ['Фото', a.has_photo ? '✅ Есть' : '❌ Нет'],
               ['2FA', a.has_2fa ? '✅ Включена' : '❌ Отключена'],
               ['Активных сессий', a.active_sessions],
-              ['Прокси', a.proxy_id ? `🟢 #${a.proxy_id}` : '❌ Не назначен'],
+              ['Прокси', a.proxy_id
+                ? (a.proxy_host
+                    ? `🟢 ${a.proxy_host}${a.proxy_country_code ? ` (${a.proxy_country_code})` : ''} · #${a.proxy_id}`
+                    : `🟢 #${a.proxy_id}`)
+                : '❌ Не назначен'],
               ['Добавлен', a.added_at ? new Date(a.added_at).toLocaleDateString('ru') : '—'],
               ['Последняя проверка', a.last_checked ? new Date(a.last_checked).toLocaleString('ru') : '— не проверялся'],
             ].map(([label, val]) => (

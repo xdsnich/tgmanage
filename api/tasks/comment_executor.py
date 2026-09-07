@@ -121,9 +121,77 @@ async def _do_smart_comment(client, account, channel_username, post_id, comment_
         steps.append({"action": "abort", "detail": "Начал писать, передумал"})
         return "aborted", "Начал писать, передумал", steps
 
-    # 6. Отправляем комментарий
-    await client.send_message(entity=entity, message=comment_text, comment_to=post_id)
-    steps.append({"action": "comment_sent", "detail": f"Отправил: {comment_text[:80]}"})
+    # 6. Отправляем комментарий и сразу вытаскиваем adress-tuple для verify:
+    # discussion_peer_id + discussion_msg_id. Telethon возвращает объект
+    # Message откуда можно получить peer_id и id — оба они нам нужны для
+    # последующего get_messages(peer, ids=[msg_id]) в verify-фазе.
+    #
+    # Auto-join: если TG говорит ChatGuestSendForbidden — гостям писать
+    # нельзя, надо сначала вступить в linked discussion group. Пробуем
+    # один раз JoinChannelRequest и повторяем send.
+    from telethon.errors import ChatGuestSendForbiddenError
+    from telethon.tl.functions.channels import (
+        GetFullChannelRequest, JoinChannelRequest,
+    )
+    from telethon.errors import UserAlreadyParticipantError
+    sent_msg = None
+    for _try in range(2):
+        try:
+            sent_msg = await client.send_message(entity=entity, message=comment_text, comment_to=post_id)
+            break
+        except ChatGuestSendForbiddenError:
+            if _try > 0:
+                raise
+            # Резолвим linked discussion и вступаем
+            try:
+                full = await client(GetFullChannelRequest(entity))
+                linked_id = getattr(full.full_chat, "linked_chat_id", 0) or 0
+                if not linked_id:
+                    raise    # нечего join'ить
+                disc = await client.get_entity(linked_id)
+                try:
+                    await client(JoinChannelRequest(disc))
+                except UserAlreadyParticipantError:
+                    pass
+                steps.append({"action": "join_discussion", "detail": f"вступил в discussion @{channel_username}"})
+                await asyncio.sleep(random.uniform(2, 5))
+                # retry send через continue for-loop
+            except Exception:
+                raise    # оригинальный ChatGuestSendForbidden поднимаем наверх
+    # Peer discussion-группы, куда попал коммент
+    discussion_peer_id = None
+    discussion_msg_id = None
+    try:
+        if sent_msg is not None:
+            discussion_msg_id = int(getattr(sent_msg, "id", 0) or 0)
+            # peer_id → PeerChannel/PeerChat/PeerUser
+            peer = getattr(sent_msg, "peer_id", None)
+            if peer is not None:
+                # PeerChannel(channel_id=...) / PeerChat(chat_id=...) / PeerUser
+                discussion_peer_id = (
+                    getattr(peer, "channel_id", None)
+                    or getattr(peer, "chat_id", None)
+                    or getattr(peer, "user_id", None)
+                )
+                if discussion_peer_id is not None:
+                    discussion_peer_id = int(discussion_peer_id)
+    except Exception:
+        pass
+    steps.append({
+        "action": "comment_sent",
+        "detail": f"Отправил: {comment_text[:80]}",
+        "discussion_peer_id": discussion_peer_id,
+        "discussion_msg_id": discussion_msg_id,
+    })
+
+    # 6.5. Реакции на комменты в discussion — 2-12 штук, с большим весом
+    # на первые (топовые) комментарии. Реакции берутся из channel.
+    # available_reactions если задано, иначе fallback standard set.
+    try:
+        rc_result = await _react_on_comments(client, entity, post_id)
+        steps.append({"action": "react_comments", "detail": rc_result[1]})
+    except Exception as e:
+        steps.append({"action": "react_comments", "detail": f"skip ({type(e).__name__})"})
 
     # 7. После комментария — прочитать ещё 1-3 поста (не уходим сразу)
     await asyncio.sleep(random.randint(5, 20))
@@ -134,6 +202,133 @@ async def _do_smart_comment(client, account, channel_username, post_id, comment_
     steps.append({"action": "post_read", "detail": f"Дочитал {len(more_posts)} постов после коммента"})
 
     return "ok", f"Комментарий отправлен в @{channel_username}", steps
+
+
+# ═══════════════════════════════════════════════════════════
+# Reactions on comments — weighted toward top comments
+# ═══════════════════════════════════════════════════════════
+
+_DEFAULT_REACTIONS = ["👍", "🔥", "❤️", "🤔", "👏", "😁", "🥰", "🤩", "😱", "🤯", "💯", "🙏"]
+
+
+async def _get_available_reactions(client, entity) -> list:
+    """Возвращает список emoji-строк доступных в этом канале.
+    Читает full_chat.available_reactions:
+      * ChatReactionsAll → все стандартные emoji-реакции (наш _DEFAULT_REACTIONS)
+      * ChatReactionsSome(reactions=[...]) → конкретный список ReactionEmoji
+      * ChatReactionsNone / чтение упало → пустой список (реакции отключены)
+    """
+    try:
+        from telethon.tl.functions.channels import GetFullChannelRequest
+        from telethon.tl.types import (
+            ChatReactionsAll, ChatReactionsSome, ChatReactionsNone,
+            ReactionEmoji,
+        )
+        full = await client(GetFullChannelRequest(entity))
+        r = getattr(full.full_chat, "available_reactions", None)
+        if isinstance(r, ChatReactionsAll):
+            return list(_DEFAULT_REACTIONS)
+        if isinstance(r, ChatReactionsSome):
+            out = []
+            for x in (r.reactions or []):
+                if isinstance(x, ReactionEmoji):
+                    out.append(x.emoticon)
+            return out or list(_DEFAULT_REACTIONS)
+        if isinstance(r, ChatReactionsNone):
+            return []
+    except Exception:
+        pass
+    # Fallback: default set (для лички / не-канала / ошибок parse)
+    return list(_DEFAULT_REACTIONS)
+
+
+async def _react_on_comments(client, channel_entity, post_id: int) -> tuple[str, str]:
+    """Ставит 2-12 реакций на комменты под постом с большим весом на
+    первые (топовые). Возвращает (status, detail).
+
+    Weighted pick: каждый следующий коммент в порядке от старого к
+    новому получает вес w = max(1.0, 4.0 - i * 0.4). Т.е. первые ~10
+    комментов сильно доминируют.
+    """
+    from telethon.tl.functions.channels import GetFullChannelRequest
+    from telethon.tl.functions.messages import SendReactionRequest
+    from telethon.tl.types import ReactionEmoji
+
+    # 1. Достаём linked discussion group
+    try:
+        full = await client(GetFullChannelRequest(channel_entity))
+        linked_id = getattr(full.full_chat, "linked_chat_id", 0) or 0
+        if not linked_id:
+            return "skip", "нет discussion-группы"
+        discussion = await client.get_entity(linked_id)
+    except Exception as e:
+        return "skip", f"нет discussion ({type(e).__name__})"
+
+    # 2. Собираем комменты (последние ~40, потом reverse чтобы старые сверху)
+    comments = []
+    try:
+        async for msg in client.iter_messages(discussion, reply_to=post_id, limit=40):
+            if msg and msg.id:
+                comments.append(msg)
+    except Exception as e:
+        return "skip", f"iter_messages fail ({type(e).__name__})"
+    if not comments:
+        return "skip", "0 комментов"
+
+    # iter_messages отдаёт новые → старые. Reverse чтобы первые (топовые) были comments[0].
+    comments.reverse()
+
+    # 3. Доступные emoji этого канала
+    reactions_pool = await _get_available_reactions(client, channel_entity)
+    if not reactions_pool:
+        return "skip", "реакции отключены в канале"
+
+    # 4. Сколько реакций поставить: 2-12
+    target_count = random.randint(2, min(12, len(comments)))
+
+    # 5. Weighted pick без повторов — топы получают ×3-4 вес
+    def _weight(i: int) -> float:
+        return max(1.0, 4.0 - i * 0.4)
+
+    # Собираем вероятность выбора без замены через weighted shuffle
+    indices = list(range(len(comments)))
+    picked = []
+    remaining_weights = [_weight(i) for i in indices]
+    while len(picked) < target_count and indices:
+        total = sum(remaining_weights)
+        if total <= 0:
+            break
+        r = random.uniform(0, total)
+        cumulative = 0.0
+        for idx, w in enumerate(remaining_weights):
+            cumulative += w
+            if r <= cumulative:
+                picked.append(indices[idx])
+                # remove
+                indices.pop(idx)
+                remaining_weights.pop(idx)
+                break
+
+    # 6. Собственно реакции + мини-паузы 1-4с между
+    ok_count = 0
+    fail_count = 0
+    for idx in picked:
+        msg = comments[idx]
+        emoji = random.choice(reactions_pool)
+        try:
+            await client(SendReactionRequest(
+                peer=discussion, msg_id=msg.id,
+                reaction=[ReactionEmoji(emoticon=emoji)],
+            ))
+            ok_count += 1
+        except Exception:
+            fail_count += 1
+        await asyncio.sleep(random.uniform(1, 4))
+
+    return "ok", (
+        f"Реакции на комменты: {ok_count} ok, {fail_count} fail, "
+        f"target={target_count}, пул={len(reactions_pool)} emoji"
+    )
 
 
 async def _execute_queue_item(item, db):
@@ -271,8 +466,15 @@ async def _execute_queue_item(item, db):
         if status == "ok":
             item.status = "done"
 
-            # Обновляем счётчики кампании
-            campaign.comments_sent += 1
+            # АТОМАРНЫЙ инкремент через SQL (см. plan_executor 2026-07-14 fix):
+            # обычный += даёт race при параллельных сессиях, теряет инкременты.
+            from sqlalchemy import update as _sa_update
+            from models.campaign import Campaign as _Camp
+            await db.execute(
+                _sa_update(_Camp)
+                .where(_Camp.id == campaign.id)
+                .values(comments_sent=_Camp.comments_sent + 1)
+            )
 
             # Обновляем behavior
             behavior.comments_today += 1
@@ -281,7 +483,14 @@ async def _execute_queue_item(item, db):
             channels.append(item.channel)
             behavior.channels_commented_today = channels
 
-            # Лог
+            # Лог — сохраняем discussion peer/msg id для последующего verify.
+            # Достаём из шага 'comment_sent' в steps (см. _do_smart_comment).
+            disc_peer = disc_msg = None
+            for _st in steps:
+                if _st.get("action") == "comment_sent":
+                    disc_peer = _st.get("discussion_peer_id")
+                    disc_msg  = _st.get("discussion_msg_id")
+                    break
             db.add(CommentLog(
                 campaign_id=campaign.id,
                 account_id=account.id,
@@ -292,6 +501,8 @@ async def _execute_queue_item(item, db):
                 post_text=item.post_text[:500],
                 comment_text=comment_text,
                 llm_provider=_val(campaign.llm_provider),
+                discussion_peer_id=disc_peer,
+                discussion_msg_id=disc_msg,
             ))
 
             logger.info(f"[executor] {account.phone} -> @{item.channel} #{item.post_id}: {comment_text[:50]}...")

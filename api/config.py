@@ -33,7 +33,7 @@ SESSIONS_DIR = BASE_DIR.parent / "sessions"
 SESSIONS_DIR.mkdir(exist_ok=True)
 
 # ── Приложение ───────────────────────────────────────────────
-APP_NAME    = "GramGPT API"
+APP_NAME    = "ufo.gram API"
 APP_VERSION = "0.6.0"
 DEBUG       = os.getenv("DEBUG", "true").lower() == "true"
 

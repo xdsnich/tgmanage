@@ -44,6 +44,7 @@ from routers import tg_auth, analytics, security, channels, actions, inbox, tdat
 from routers import health
 from routers import web_session
 from routers import diagnostics
+from routers import leomatch
 
 # Регистрируем модели чтобы create_all создал таблицы (модели,
 # которые ещё не подцепились через router-импорты).
@@ -107,6 +108,7 @@ app.include_router(account_media.router, prefix=PREFIX)  # Фото для ст�
 app.include_router(account_media.bulk_router, prefix=PREFIX)  # Bulk-операции с медиа (несколько акков)
 app.include_router(web_session.router, prefix="/api/v1")
 app.include_router(diagnostics.router, prefix=PREFIX)  # Диагностика подписок и аккаунтов
+app.include_router(leomatch.router, prefix=PREFIX)     # Массовый онбординг в @leomatchbot
 # ── Healthcheck ──────────────────────────────────────────────
 @app.get("/health")
 async def health():

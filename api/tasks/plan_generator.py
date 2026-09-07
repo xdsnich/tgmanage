@@ -13,6 +13,10 @@ GramGPT — tasks/plan_generator.py
 """
 
 import random
+import os
+
+# Вес «нулевой» сессии при раскладке комментов (см. ниже). Было жёстко 25.
+SESSION_ZERO_WEIGHT = int(os.getenv("SESSION_ZERO_WEIGHT", "10"))
 from datetime import datetime
 
 
@@ -20,13 +24,49 @@ from datetime import datetime
 # РАСПРЕДЕЛЕНИЕ КОММЕНТАРИЕВ
 # ═══════════════════════════════════════════════════════════
 
-def distribute_comments_by_days(total_comments, total_days):
+def distribute_comments_by_days(total_comments, total_days, even=False):
     """
-    Распределяет комменты по дням кампании. НЕ равномерно.
-    Первые дни меньше (прогрев), потом нарастает, к концу снижается.
+    Распределяет комменты по дням кампании.
+
+    Два режима:
+      even=False (default, для regular): "прогревная" волна — 0-25% в дн 1-2,
+                                          затем 40-150%, к концу снижается.
+                                          Имитирует органическую активность.
+      even=True (для check_only и любых screening/уже-прогретых кампаний):
+                                          РАВНОМЕРНО ± небольшой jitter (±10%).
+                                          Юзеру важно чтобы каждый день делалось
+                                          примерно одинаково много.
     """
     if total_days <= 0:
         return []
+
+    if even:
+        # Равномерно с ощутимым разбросом: каждому дню — случайный
+        # коэффициент 0.65-1.35 (примерно ±30% от среднего), потом
+        # нормализуем чтобы сумма = total_comments.
+        # Пример: для total=1948, days=4 → 400, 600, 350, 550-ish.
+        factors = [random.uniform(0.65, 1.35) for _ in range(total_days)]
+        fsum = sum(factors)
+        daily = [max(0, round(total_comments * f / fsum)) for f in factors]
+        # Rounding может дать погрешность — правим чтобы сумма точно
+        # совпадала с total_comments.
+        diff = total_comments - sum(daily)
+        while diff != 0:
+            idx = random.randint(0, total_days - 1)
+            if diff > 0:
+                daily[idx] += 1
+                diff -= 1
+            elif daily[idx] > 1:
+                daily[idx]  -= 1
+                diff += 1
+        # 2026-07-24 — если последний день "маленький" (< 40% от среднего),
+        # переносим его в предпоследний. Не оставляем "хвост" из 77 комментов
+        # когда в предпоследнем 300 — нет смысла тянуть день ради 15% плана.
+        _avg = total_comments / max(1, total_days)
+        while len(daily) >= 2 and daily[-1] < 0.4 * _avg:
+            daily[-2] += daily[-1]
+            daily.pop()
+        return daily
 
     avg = max(1, total_comments / total_days)
     daily = []
@@ -57,11 +97,42 @@ def distribute_comments_by_days(total_comments, total_days):
     return daily
 
 
-def distribute_day_comments(comments_today, accounts_with_personalities):
+def distribute_day_comments(comments_today, accounts_with_personalities, target_by_acc=None):
     """
     Распределяет дневную квоту по аккаунтам.
     Возвращает {account_id: количество_комментов}
+
+    Если target_by_acc={acc_id: n_channels_this_acc} передан — используем
+    ПРОПОРЦИОНАЛЬНОЕ распределение (для check_only где нужно ровно
+    n_channels/total_days комментов на акка, без урезания по personality).
     """
+    # ── EVEN MODE (для check_only): пропорционально assigned каналам ──
+    if target_by_acc is not None and any(v > 0 for v in target_by_acc.values()):
+        total_target = sum(target_by_acc.values()) or 1
+        distribution = {}
+        remaining = comments_today
+        # Первый проход: пропорционально
+        for acc_id, _p in accounts_with_personalities:
+            t = target_by_acc.get(acc_id, 0)
+            if t <= 0:
+                distribution[acc_id] = 0
+                continue
+            # Доля этого акка от общего пула
+            share = comments_today * t / total_target
+            # Округляем вниз, остаток разбрасываем
+            distribution[acc_id] = min(t, int(share))
+            remaining -= distribution[acc_id]
+        # Разбрасываем остаток (округления) — приоритет акам где ещё не хватает
+        while remaining > 0:
+            cand = [a for a, c in distribution.items() if c < target_by_acc.get(a, 0)]
+            if not cand:
+                break
+            a = random.choice(cand)
+            distribution[a] += 1
+            remaining -= 1
+        return distribution
+
+    # ── Классический режим (regular): по personality ──
     distribution = {}
     remaining = comments_today
 
@@ -141,7 +212,12 @@ def generate_daily_plan(
     timing=None, style=None,
     channels_to_join=None,            # каналы для вступления СЕГОДНЯ (1–2)
     commentable_from_prev_days=None,  # каналы, в которых уже можно комментировать
+    commented_from_prev_days=None,    # каналы где уже был коммент в предыдущих днях (для check_only 1 per channel)
     decoy_per_day=1,                  # макс. decoy-подписок в день (популярные каналы, БЕЗ комментов)
+    add_tail_verify_session=False,    # +1 verify-only сессия через ~40 мин после последней
+    max_comments_per_channel_per_day=1,  # 1 = 1 коммент на канал/день (check_only), 2-3 = regular с multiply
+    session_times=None,               # готовые времена [(hour, minute), ...] от ip_scheduler
+    first_session_comments=False,     # разрешить комменты в 1-й сессии дня (прогретые акки)
 ):
     """
     Генерирует УНИКАЛЬНЫЙ план дня для одного аккаунта.
@@ -192,6 +268,11 @@ def generate_daily_plan(
                 "day_number":     day_number,
                 "total_comments": 0,
                 "total_sessions": 1,
+                # День отдыха: единственная сессия помечена skipped, до
+                # подключения дело не дойдёт. Флаг ставим для консистентности,
+                # чтобы dispatch не считал такой план «старым» (иначе он
+                # попадал бы в ветку с большим stagger'ом).
+                "ip_scheduled":   True,
                 "sessions": [{
                     "connect_at_hour":   (now.hour + 3) % 24,
                     "connect_at_minute": now.minute,
@@ -229,49 +310,107 @@ def generate_daily_plan(
     min_start_hour   = current_hour   if day_number == 1 else 8
     min_start_minute = (current_minute + 10) if day_number == 1 else 0
 
-    session_times = []
-    if p_name == "night_owl":
-        for _ in range(num_sessions):
-            lo = max(min_start_hour, 17) if random.random() < 0.7 else max(min_start_hour, 10)
-            hi = 23 if lo >= 17 else 16
-            if lo > hi:
-                lo, hi = min_start_hour, 23
-            session_times.append((random.randint(lo, hi), random.randint(0, 59)))
-    elif p_name == "lurker":
-        for _ in range(num_sessions):
-            lo = max(min_start_hour, 19) if random.random() < 0.5 else max(min_start_hour, 8)
-            hi = 23 if lo >= 19 else 18
-            if lo > hi:
-                lo, hi = min_start_hour, 23
-            session_times.append((random.randint(lo, hi), random.randint(0, 59)))
-    else:
-        for _ in range(num_sessions):
-            r = random.random()
-            if r < 0.4:
-                lo, hi = max(min_start_hour, 8), 13
-            elif r < 0.7:
-                lo, hi = max(min_start_hour, 13), 18
+    # ── Времена пришли снаружи (utils/ip_scheduler) ──────────
+    # 2026-08-22: время сессий больше не выбирается генератором в одиночку.
+    # Раньше каждый аккаунт рандомил себе часы независимо, ничего не зная
+    # о соседях по IP — отсюда 37.5% пар подключений на одном IP в пределах
+    # 15 минут, которые потом разгребал ip_throttle откладыванием (и терял
+    # сессии: 126 smart_comment из 285 за 14 июля).
+    #
+    # Теперь ip_scheduler раскладывает сессии ВСЕХ аккаунтов одного IP на
+    # общей оси с гарантированным зазором. Времена при этом остаются
+    # случайными — они разные каждый день, просто больше не пересекаются.
+    # ВАЖНО: отличаем None («планировщик не звали») от [] («звали, но мест
+    # в остатке суток не осталось»). Раньше тут стояло bool(session_times),
+    # и пустой список молча включал локальную генерацию — аккаунт получал
+    # несогласованные времена и садился в чужой зазор. Стресс-тест на 25
+    # кампаний поймал 5 таких случаев, все с ip_scheduled=False.
+    _external_times = session_times is not None
+    if _external_times:
+        session_times = sorted((int(h), int(m)) for h, m in session_times)
+        num_sessions = len(session_times)
+
+    # 2026-07-23 — правило «2 гарантированные ночные сессии каждому» ОТМЕНЕНО
+    # (2026-08-22, по запросу юзера). Именно оно делало 00-05 самыми
+    # загруженными часами суток (37% всей активности) и создавало затор
+    # в самом узком окне. Ночная активность теперь берётся из хронотипа
+    # аккаунта в ip_scheduler: ночью работают только «совы».
+    # Ветка ниже — fallback для вызовов БЕЗ ip_scheduler (старые пути).
+    NIGHT_HOURS = [0, 1, 2, 3, 4, 5]
+    N_NIGHT_SESSIONS = 2
+
+    if not _external_times:
+        # ── Локальная генерация времён (fallback) ──────────
+        # Работает когда ip_scheduler не задействован: старые вызовы,
+        # ручной прогрев, тесты. Соседей по IP не учитывает.
+        num_sessions = max(num_sessions, N_NIGHT_SESSIONS + 3)
+
+        session_times = []
+        _night_slots = random.sample(NIGHT_HOURS, min(N_NIGHT_SESSIONS, len(NIGHT_HOURS)))
+        for h in _night_slots:
+            session_times.append((h, random.randint(0, 59)))
+
+        # Оставшиеся дневные — по personality
+        _day_sessions_needed = num_sessions - len(session_times)
+        if p_name == "night_owl":
+            for _ in range(_day_sessions_needed):
+                if random.random() < 0.7:
+                    session_times.append((random.randint(18, 23), random.randint(0, 59)))
+                else:
+                    session_times.append((random.randint(10, 16), random.randint(0, 59)))
+        elif p_name == "lurker":
+            for _ in range(_day_sessions_needed):
+                if random.random() < 0.55:
+                    session_times.append((random.randint(19, 23), random.randint(0, 59)))
+                else:
+                    session_times.append((random.randint(8, 18), random.randint(0, 59)))
+        else:
+            for _ in range(_day_sessions_needed):
+                r = random.random()
+                if r < 0.35:
+                    session_times.append((random.randint(8, 13), random.randint(0, 59)))
+                elif r < 0.65:
+                    session_times.append((random.randint(13, 18), random.randint(0, 59)))
+                else:
+                    session_times.append((random.randint(18, 23), random.randint(0, 59)))
+
+        # Хронологическая сортировка (00 → 05 → 08 → 23).
+        session_times.sort()
+
+        min_gap = random.randint(20, 90)
+        for i in range(1, len(session_times)):
+            prev_min = session_times[i-1][0] * 60 + session_times[i-1][1]
+            curr_min = session_times[i][0] * 60 + session_times[i][1]
+            if curr_min - prev_min < min_gap:
+                new_min = prev_min + min_gap + random.randint(0, 30)
+                new_h = new_min // 60
+                new_m = new_min % 60
+                if new_h > 23:
+                    new_h = 23
+                    new_m = 50
+                session_times[i] = (new_h, new_m)
+
+    # Для внешних времён отсев прошедших слотов уже сделан в ip_scheduler
+    # (параметр not_before_min), причём с учётом соседей по IP. Повторять
+    # его здесь нельзя: локальный fallback «сейчас + 15 мин» выдавал ОДНО
+    # И ТО ЖЕ время всем аккаунтам одного IP и создавал ровно то совпадение,
+    # от которого мы уходим (поймано E2E-тестом 2026-08-22: acc#209 и
+    # acc#210 оба получили 18:06).
+    if day_number == 1 and not _external_times:
+        # Разрешаем только БУДУЩИЕ сессии по календарю сегодня.
+        # Ночные (h<6) разрешены ТОЛЬКО если сейчас тоже ночь (current_hour<6),
+        # иначе они "уже прошли утром" и dispatch их пропустит как просроченные.
+        # Пример: сейчас 23:12 → сессия 03:00 уже прошла (23-3=20ч > 4ч лимит).
+        def _is_future(h, m):
+            if 6 <= current_hour <= 23:
+                # Дневное сейчас — только час больше текущего
+                return h > current_hour or (h == current_hour and m >= min_start_minute)
             else:
-                lo, hi = max(min_start_hour, 18), 23
-            if lo > hi:
-                lo, hi = min_start_hour, 23
-            session_times.append((random.randint(lo, hi), random.randint(0, 59)))
-
-    session_times.sort()
-
-    min_gap = random.randint(20, 90)
-    for i in range(1, len(session_times)):
-        prev_min = session_times[i-1][0] * 60 + session_times[i-1][1]
-        curr_min = session_times[i][0] * 60 + session_times[i][1]
-        if curr_min - prev_min < min_gap:
-            new_min = prev_min + min_gap + random.randint(0, 30)
-            new_h = min(23, new_min // 60)
-            new_m = new_min % 60
-            session_times[i] = (new_h, new_m)
-
-    if day_number == 1:
-        session_times = [(h, m) for h, m in session_times
-                         if h > current_hour or (h == current_hour and m >= min_start_minute)]
+                # Ночь сейчас (0-5) — ночные больше текущего или дневные
+                if h < 6:
+                    return h > current_hour or (h == current_hour and m >= min_start_minute)
+                return True   # любое дневное = будущее (уже сегодня после 06:00)
+        session_times = [(h, m) for h, m in session_times if _is_future(h, m)]
         if not session_times:
             next_h = current_hour
             next_m = current_minute + 15
@@ -281,6 +420,33 @@ def generate_daily_plan(
             if next_h <= 23:
                 session_times = [(next_h, next_m)]
 
+    # ── Tail-verify: одна verify-only сессия через 35-45 мин после последней
+    # рабочей. Только на последнем дне кампании (add_tail_verify_session=True).
+    # Индекс этой сессии сохраняем в tail_sess_idx — цикл ниже отдельно
+    # обработает: без join, без комментов, только verify + пара read_feed.
+    tail_sess_idx = -1
+    if add_tail_verify_session and session_times:
+        if _external_times:
+            # ── 2026-08-22 ─────────────────────────────────────────
+            # Придумывать новое время нельзя: оно не согласовано с
+            # соседями по IP и почти наверняка попадёт в чужой зазор.
+            # E2E-тест поймал именно это: tail-сессия acc#208 встала в
+            # 23:53, а у acc#209 уже было 23:46 — интервал 7 минут.
+            # Вместо этого caller запрашивает на последний день на одну
+            # сессию больше, и последняя из выданных становится
+            # verify-only. Она и так позже всех рабочих.
+            if len(session_times) >= 2:
+                tail_sess_idx = len(session_times) - 1
+        else:
+            last_h, last_m = session_times[-1]
+            delay = random.randint(35, 45)
+            total_min = last_h * 60 + last_m + delay
+            new_h = total_min // 60
+            new_m = total_min % 60
+            if new_h <= 23:                     # если не переползли за полночь
+                session_times.append((new_h, new_m))
+                tail_sess_idx = len(session_times) - 1
+
     # ═══════════════════════════════════════════════════
     # ЦИКЛ СЕССИЙ — органическая воронка подписок
     # ═══════════════════════════════════════════════════
@@ -288,6 +454,21 @@ def generate_daily_plan(
     joined_today   = []         # каналы, вступление в которые произошло СЕГОДНЯ
     remaining_comments = comments_today
     sessions = []
+    # Каналы для которых уже запланирован join_discussion_of в предыдущих
+    # или текущей сессии. Перед КАЖДЫМ smart_comment @X проверяем: если X
+    # тут ещё не был — вставляем join_discussion_of @X ПЕРЕД smart_comment
+    # (executor всё равно skip'нет коммент если Redis-флаг disc_joined не
+    # установлен). Этот tracker гарантирует что план это учитывает.
+    _disc_scheduled: set = set()
+    # Каналы куда УЖЕ запланирован smart_comment в этом плане ИЛИ в
+    # предыдущих днях. Правило: 1 коммент на канал в день (органично +
+    # для check_only это ЖЁСТКОЕ требование "1 коммент на канал ВООБЩЕ",
+    # поэтому caller передаёт `commented_from_prev_days` для кросс-day дедупа).
+    # Counter вместо set — считаем сколько раз канал уже комментировался
+    # (позволяет несколько комментов в один канал за день если max_per_ch > 1)
+    from collections import Counter as _Counter
+    _commented_channels: _Counter = _Counter(commented_from_prev_days or [])
+    _max_per_ch = max(1, int(max_comments_per_channel_per_day))
 
     for sess_i, (hour, minute) in enumerate(session_times):
 
@@ -295,36 +476,77 @@ def generate_daily_plan(
         sess_commentable = commentable_start + joined_today
 
         # Вступаем ли в канал в этой сессии?
-        join_this_sess = channels_to_join[sess_i] if sess_i < len(channels_to_join) else None
+        # На tail-verify сессии — НЕ вступаем (это по определению verify-only).
+        _is_tail_verify_sess = (sess_i == tail_sess_idx)
+        if _is_tail_verify_sess:
+            join_this_sess = None
+        else:
+            join_this_sess = channels_to_join[sess_i] if sess_i < len(channels_to_join) else None
         if join_this_sess:
             joined_today.append(join_this_sess)
 
         # ── Сколько комментов в этой сессии ─────────────
+        # На tail-verify — 0 комментов, 0 реакций.
         sessions_left = len(session_times) - sess_i
         sess_c_count = 0
-        # Нельзя комментировать в первой сессии (правило: предыдущая сессия)
-        # И только если есть commentable каналы
-        if remaining_comments > 0 and sess_commentable and sess_i >= 1:
-            avg = max(1, remaining_comments / sessions_left)
-            sess_c_count = random.choices(
-                [0, max(1, round(avg)), max(1, round(avg)) + 1],
-                weights=[25, 50, 25], k=1
-            )[0]
-            sess_c_count = min(sess_c_count, 3, remaining_comments)
+        # check_only: агрессивно распределяем ВСЕ comments_today (иначе
+        # personality-random режет до 25% зeroed sessions + `sess_i>=1`
+        # блокирует 1-ю сессию → в итоге ~50% плана не помещается).
+        _force_all_comments = personality.get("_force_verify_every_session", False)
+        # Первая сессия дня обычно комментов не пишет — аккаунт «зашёл,
+        # осмотрелся». Для ПРОГРЕТЫХ аккаунтов (уже подписаны на свои каналы)
+        # это лишняя трата: замер 25.08 — при 3.6 сессии в день блокировка
+        # первой съедала около четверти дневных слотов, а новых подключений
+        # разрешение не добавляет, аккаунт и так уже в сети.
+        _can_comment_this_sess = (
+            sess_i >= 1 or _force_all_comments or first_session_comments
+        )
+        if not _is_tail_verify_sess and remaining_comments > 0 and sess_commentable and _can_comment_this_sess:
+            # sessions_left исключая tail_verify (там 0 комментов)
+            _work_sessions_left = sessions_left - (1 if tail_sess_idx >= 0 and sess_i < tail_sess_idx else 0)
+            _work_sessions_left = max(1, _work_sessions_left)
+            if _force_all_comments:
+                # check_only: math.ceil чтобы гарантированно распределить ВСЁ.
+                import math as _m
+                sess_c_count = _m.ceil(remaining_comments / _work_sessions_left)
+            else:
+                avg = max(1, remaining_comments / _work_sessions_left)
+                # Доля «пустых» сессий. Держит поведение неровным, но 25%
+                # при трёх-четырёх сессиях в день выбрасывали слишком много
+                # слотов. Вынесено в env, чтобы крутить без правки кода.
+                sess_c_count = random.choices(
+                    [0, max(1, round(avg)), max(1, round(avg)) + 1],
+                    weights=[SESSION_ZERO_WEIGHT, 50, 25], k=1
+                )[0]
+            # для check_only — лимит 8 в сессию (было 3),
+            # чтобы вместить пиковые дни при много каналов/акка
+            # regular: 6 комментов/сессию (было 3) — чтобы multiply 2-3 коммента
+            # в один канал влезал. check_only остаётся 8 как раньше.
+            _max_per_sess = 8 if _force_all_comments else 6
+            sess_c_count = min(sess_c_count, _max_per_sess, remaining_comments)
 
         remaining_comments = max(0, remaining_comments - sess_c_count)
 
-        # ── Цели комментариев: ТОЛЬКО commentable ────────
+        # ── Цели комментариев: ТОЛЬКО commentable И ещё не прокомментированные ──
+        # 1 коммент на канал в день (для check_only это гарантирует
+        # "1 коммент на канал ВООБЩЕ" — caller исключает already-commented
+        # каналы из campaign_channels при генерации следующих дней).
         sess_c_targets = []
-        if sess_c_count > 0 and sess_commentable:
-            sess_c_targets = random.sample(
-                sess_commentable,
-                min(sess_c_count, len(sess_commentable)),
-            )
+        if not _is_tail_verify_sess and sess_c_count > 0 and sess_commentable:
+            _uncommented = [ch for ch in sess_commentable if _commented_channels[ch] < _max_per_ch]
+            if _uncommented:
+                sess_c_targets = random.sample(
+                    _uncommented,
+                    min(sess_c_count, len(_uncommented)),
+                )
+            # Если все каналы уже прокомментированы — возвращаем quota обратно
+            else:
+                remaining_comments += sess_c_count
+                sess_c_count = 0
 
         # ── Реакции: тоже только в commentable ──────────
         sess_r_targets = []
-        if sess_commentable and random.random() < 0.5:
+        if not _is_tail_verify_sess and sess_commentable and random.random() < 0.5:
             n_r = random.randint(1, min(3, len(sess_commentable)))
             sess_r_targets = random.sample(sess_commentable, n_r)
 
@@ -374,6 +596,25 @@ def generate_daily_plan(
         # ── Строим список действий ───────────────────────
         actions = []
 
+        # 0. VERIFY: ОДИН точный ping в СЛЕДУЮЩЕЙ сессии после отправки.
+        # Действие verify_my_comments проверяет только комменты старше
+        # min_age_sec (1800 сек = 30 мин) — значит комменты этой же сессии
+        # НЕ верифицируются (они слишком свежие), а верифятся комменты
+        # предыдущих сессий (в т.ч. с ПРЕДЫДУЩЕГО ДНЯ — window_hours=24
+        # покрывает и они уже старше 30 мин).
+        #
+        # Cadence: КАЖДАЯ сессия (включая первую сессию дня — там могут
+        # быть неверифицированные комменты с последней сессии прошлого дня).
+        # Executor сам early-exit'ит если нечего проверять ("непроверенных
+        # нет") — cost = 1 SQL SELECT, безопасно.
+        actions.append({
+            "type": "verify_my_comments",
+            "window_hours": 24,             # смотрим комменты за последние 24ч
+            "min_age_sec": 1800,            # НО не свежее 30 мин
+            "max_checks": 20 if not personality.get("_force_verify_every_session") else 40,
+            "pause_after": random.randint(15, 45),
+        })
+
         # 1. Вступление в канал — ПЕРВЫМ действием сессии
         if join_this_sess:
             actions.append({
@@ -418,6 +659,16 @@ def generate_daily_plan(
                         "count": random.randint(2, 10),
                         "pause_after": random.randint(10, 180),
                     })
+                    # ── ГАРАНТ: перед smart_comment @X должен быть
+                    # join_discussion_of @X в этом или предыдущем сессионе.
+                    # Иначе executor тупо skip'нет smart_comment.
+                    if target not in _disc_scheduled:
+                        actions.append({
+                            "type": "join_discussion_of",
+                            "channel": target,
+                            "pause_after": random.randint(4, 15),
+                        })
+                        _disc_scheduled.add(target)
                     if random.random() < random.uniform(0.10, 0.55):
                         actions.append({
                             "type": "set_reaction",
@@ -430,22 +681,40 @@ def generate_daily_plan(
                         "channel": target,
                         "pause_before": random.randint(2, 30),
                     })
-                    # С некоторой вероятностью — ставим реакцию(-и) на комменты в обсуждении
-                    _react_roll = random.random()
-                    if _react_roll < 0.15:
+                    _commented_channels[target] += 1
+                    # ── Реакции на ЧУЖИЕ комменты ───────────────────────
+                    # Это отдельный канал трафика: автор коммента получает
+                    # уведомление и заходит смотреть, кто отреагировал. В
+                    # отличие от set_reaction, которая ставится на пост канала
+                    # и никому уведомления не шлёт.
+                    #
+                    # Было: 15% на две реакции и 25% на одну, всегда в тот же
+                    # канал, куда написали. Стало: половина случаев, от одной
+                    # до трёх, и иногда веером по нескольким каналам.
+                    if random.random() < 0.50:
                         actions.append({
                             "type": "react_to_comment",
                             "channel": target,
-                            "count": 2,
+                            "count": random.randint(1, 3),
                             "pause_after": random.randint(3, 12),
                         })
-                    elif _react_roll < 0.40:
-                        actions.append({
-                            "type": "react_to_comment",
-                            "channel": target,
-                            "count": 1,
-                            "pause_after": random.randint(3, 12),
-                        })
+                        # ── Веер по соседним каналам ────────────────────
+                        # Берём ТОЛЬКО те, где аккаунт уже вступил в
+                        # обсуждение в этом плане: такой канал лежит в кэше
+                        # сессии, и обращение к нему не тратит резолв. А
+                        # именно резолвы приводят к флуду — незнакомое имя
+                        # стоит запроса ResolveUsername, и на них выгорали
+                        # аккаунты при обходе каналов.
+                        _extra_pool = [ch for ch in _disc_scheduled if ch != target]
+                        if _extra_pool and random.random() < 0.35:
+                            _n_extra = min(random.randint(1, 2), len(_extra_pool))
+                            for _ch in random.sample(_extra_pool, _n_extra):
+                                actions.append({
+                                    "type": "react_to_comment",
+                                    "channel": _ch,
+                                    "count": random.randint(1, 2),
+                                    "pause_after": random.randint(8, 30),
+                                })
                     actions.append({
                         "type": "read_feed",
                         "channel": None,
@@ -513,6 +782,29 @@ def generate_daily_plan(
 
             action_i += 1
 
+        # ── DISCUSSION-JOIN SPRINKLE ────────────────────────
+        # С шансом ~40% в эту сессию — вставляем join_discussion_of
+        # для случайного канала из commentable (тот в который уже
+        # вступил ранее, но возможно ещё не в его discussion).
+        # Executor молча съедает UserAlreadyParticipant, так что
+        # повторение не вредит. За 3-4 дня legacy 900 доподпишутся
+        # равномерно через нормальный flow. ── А в сессиях где сейчас
+        # уже был join_target_channel — НЕ ставим (иначе бандлинг).
+        # Sprinkle: НЕ те что уже в _disc_scheduled, приоритет "ещё не запланировано"
+        _disc_pool_all = list(commentable_start + joined_today[:-1] if join_this_sess else commentable_start + joined_today)
+        _disc_pool = [ch for ch in _disc_pool_all if ch not in _disc_scheduled]
+        if _disc_pool and not _is_tail_verify_sess and random.random() < 0.45:
+            _dch = random.choice(_disc_pool)
+            # Вставляем в СЛУЧАЙНОЕ место среди actions (не первым и не
+            # последним — иначе выглядит как «зашёл и сразу подписался»).
+            _insert_at = random.randint(1, max(1, len(actions) - 1)) if len(actions) >= 3 else len(actions)
+            actions.insert(_insert_at, {
+                "type": "join_discussion_of",
+                "channel": _dch,
+                "pause_after": random.randint(3, 12),
+            })
+            _disc_scheduled.add(_dch)
+
         # 8% шанс пропустить сессию (только без целевых действий)
         if random.random() < 0.08 and not has_targeted:
             sessions.append({
@@ -524,9 +816,23 @@ def generate_daily_plan(
             })
             continue
 
-        jitter = random.randint(-15, 20)
-        adjusted_min = hour * 60 + minute + jitter
-        adjusted_min = max(8 * 60, min(23 * 60 + 50, adjusted_min))
+        if _external_times:
+            # Время пришло от ip_scheduler и уже согласовано с соседями по
+            # IP. Любой jitter здесь съел бы гарантированный зазор: сдвиг
+            # ±20 мин легко превращает 22-минутный интервал в 2-минутный.
+            # Разброс уже заложен внутри планировщика.
+            adjusted_min = hour * 60 + minute
+        else:
+            jitter = random.randint(-15, 20)
+            adjusted_min = hour * 60 + minute + jitter
+            # 2026-07-23 — старый код клампил всё в 8:00-23:50, уничтожая
+            # ночные сессии (0-5). Теперь: для ночных (h<6) не трогаем,
+            # для дневных клампим 8:00-23:50 как раньше.
+            if hour < 6:
+                # Ночная — jitter в узком диапазоне ±10 мин, не переходя за 05:59
+                adjusted_min = max(0, min(5 * 60 + 59, adjusted_min))
+            else:
+                adjusted_min = max(8 * 60, min(23 * 60 + 50, adjusted_min))
 
         sessions.append({
             "connect_at_hour":   adjusted_min // 60,
@@ -572,5 +878,8 @@ def generate_daily_plan(
         "day_number":    day_number,
         "total_comments": actual_comments,
         "total_sessions": len(sessions),
+        # Времена согласованы по IP (utils/ip_scheduler) — dispatch_plans
+        # обязан стартовать такие планы почти точно, без большого stagger'а.
+        "ip_scheduled":  _external_times,
         "sessions":      sessions,
     }

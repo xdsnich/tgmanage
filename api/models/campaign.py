@@ -110,6 +110,24 @@ class Campaign(Base):
     # сразу после окончания прогрева» без ручного нажатия "Старт".
     scheduled_start_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
 
+    # ── Тип кампании (миграция 030) ────────────────────────
+    # 'regular'    — обычный комментинг, verify-действие добавляется автоматом
+    #                в каждую 2-3 сессию (вариант B).
+    # 'check_only' — screening-кампания: 1 коммент/канал, без time-limit
+    #                на max_hours (∞), main цель — проверить не удалят ли.
+    #                Логика ниже:
+    #                  - в execute каждого acc берётся ~10 каналов из
+    #                    campaign target_channels, ещё не помеченных как
+    #                    "checked" в CampaignChannelAssignment
+    #                  - на каждый пишется РОВНО 1 коммент
+    #                  - через 30-90 мин следующая сессия делает verify
+    #                  - результат отправляется в ChannelBanStats
+    campaign_type:     Mapped[str]              = mapped_column(String(32), default="regular", index=True)
+    # Опциональный чат/канал куда акки пишут "❌ +380... коммент удалили
+    # в @xxx через 4 мин 12 сек". Формат: @username или числовой chat_id
+    # (у юзера или у одного из акков должен быть доступ туда).
+    notification_chat: Mapped[Optional[str]]    = mapped_column(String(128), nullable=True)
+
     # ── Relationships ────────────────────────────────────
     target_channels: Mapped[list[TargetChannel]] = relationship("TargetChannel", back_populates="campaign", cascade="all, delete-orphan")
 
@@ -148,7 +166,7 @@ class CommentLog(Base):
 
     id:             Mapped[int]              = mapped_column(Integer, primary_key=True)
     campaign_id:    Mapped[int]              = mapped_column(ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True)
-    account_id:     Mapped[int]              = mapped_column(Integer, nullable=False)
+    account_id:     Mapped[int]              = mapped_column(Integer, nullable=False, index=True)
     account_phone:  Mapped[str]              = mapped_column(String(32), default="")
     channel_username: Mapped[str]            = mapped_column(String(128), default="")
     channel_title:  Mapped[str]              = mapped_column(String(256), default="")
@@ -157,6 +175,16 @@ class CommentLog(Base):
     comment_text:   Mapped[str]              = mapped_column(Text, default="")
     llm_provider:   Mapped[str]              = mapped_column(String(32), default="")
     created_at:     Mapped[datetime]         = mapped_column(DateTime, default=datetime.utcnow)
+
+    # ── Verification fields (миграция 030) ─────────────────────
+    # discussion_peer_id/msg_id — точный адрес нашего коммента для
+    # последующего get_messages(peer, ids=[msg_id]).
+    discussion_peer_id: Mapped[Optional[int]]     = mapped_column(BigInteger, nullable=True)
+    discussion_msg_id:  Mapped[Optional[int]]     = mapped_column(BigInteger, nullable=True)
+    verified_at:        Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    was_deleted:        Mapped[Optional[bool]]    = mapped_column(Boolean, nullable=True)
+    # 'ok' | 'deleted' | 'flood' | 'not_found' | 'unknown' | ''
+    verify_status:      Mapped[str]               = mapped_column(String(32), default="")
 
     def __repr__(self):
         return f"<CommentLog campaign={self.campaign_id} @{self.channel_username}>"

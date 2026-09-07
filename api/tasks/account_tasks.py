@@ -74,11 +74,16 @@ async def _check_account_with_proxy(account_dict: dict, check_spam: bool = False
                 authorized = await client.is_user_authorized()
 
                 if not authorized:
+                    # ⚠ Раньше здесь ставили frozen — но !authorized может быть
+                    # временной сетевой глитч (прокси частично отвечает).
+                    # Реальное разрушение сессии придёт как AuthKeyUnregistered
+                    # ниже в except. Ставим "unauthorized" — юзер сам решит
+                    # что делать.
                     await client.disconnect()
-                    account.status = "frozen"
+                    account.status = "unauthorized"
                     account.last_checked = datetime.utcnow()
                     await db.commit()
-                    return {**account_dict, "status": "frozen",
+                    return {**account_dict, "status": "unauthorized",
                             "last_checked": datetime.utcnow().isoformat()}
 
                 # Получаем инфу
