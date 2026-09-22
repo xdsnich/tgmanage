@@ -234,6 +234,27 @@ GROQ_MODELS = [
 # Модели, снятые с обслуживания в этом процессе (404) — не долбим повторно
 _groq_dead_models: set[str] = set()
 
+# ── Сколько модель думает вслух ──────────────────────────────
+# gpt-oss — рассуждающие модели: сначала пишут размышления, потом ответ,
+# и то и другое считается в один max_tokens. Наш системный промпт длинный
+# (правила языка, запреты, тон), и на него модель тратила 186-298 токенов
+# размышлений при потолке в 300 — на сам комментарий не оставалось ничего.
+# Замер 09.09 на реальных постах кампании: два из пяти вернулись пустыми
+# (finish_reason=length), остальные прошли впритык, с 23-28 символами
+# ответа. В логах это выглядело как «Groq вернул пустой content».
+#
+# reasoning_effort=low срезает размышления до 7-10 токенов. Ответ при этом
+# не портится — он и должен быть в одну-две фразы.
+#
+# Параметр понимают не все: groq/compound-mini отвечает на него 400.
+# Поэтому при таком отказе просто запоминаем модель и повторяем без него.
+GROQ_REASONING_EFFORT = os.getenv("GROQ_REASONING_EFFORT", "low")
+_groq_no_reasoning_param: set[str] = set()
+
+# Потолок ответа. Держим с запасом: размышления теперь короткие, но если
+# модель почему-то задумается, комментарий всё равно должен поместиться.
+GROQ_MAX_TOKENS = int(os.getenv("GROQ_MAX_TOKENS", "500"))
+
 
 def _call_groq(system_prompt: str, post_text: str,
                api_keys: list[str] | None = None) -> tuple[str, str]:
@@ -265,19 +286,40 @@ def _call_groq(system_prompt: str, post_text: str,
                 break   # все в cooldown или уже пробованы
             tried.add(k)
             try:
+                body = {
+                    "model": model,
+                    "max_tokens": GROQ_MAX_TOKENS,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": post_text},
+                    ],
+                }
+                if GROQ_REASONING_EFFORT and model not in _groq_no_reasoning_param:
+                    body["reasoning_effort"] = GROQ_REASONING_EFFORT
+
                 with httpx.Client(timeout=30) as client:
                     resp = client.post(
                         "https://api.groq.com/openai/v1/chat/completions",
                         headers={"Authorization": f"Bearer {k}", "Content-Type": "application/json"},
-                        json={
-                            "model": model,
-                            "max_tokens": 300,
-                            "messages": [
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": post_text},
-                            ],
-                        },
+                        json=body,
                     )
+                    # Модель не понимает reasoning_effort — запоминаем и
+                    # повторяем без него, не тратя на это попытку ключа.
+                    if (resp.status_code == 400
+                            and "reasoning_effort" in resp.text
+                            and "reasoning_effort" in body):
+                        logger.info(
+                            f"Groq: {model} не принимает reasoning_effort — "
+                            f"повторяю без него"
+                        )
+                        _groq_no_reasoning_param.add(model)
+                        body.pop("reasoning_effort")
+                        resp = client.post(
+                            "https://api.groq.com/openai/v1/chat/completions",
+                            headers={"Authorization": f"Bearer {k}",
+                                     "Content-Type": "application/json"},
+                            json=body,
+                        )
                     if resp.status_code == 429:
                         ra = resp.headers.get("retry-after", "60")
                         try:
@@ -325,9 +367,19 @@ def _call_groq(system_prompt: str, post_text: str,
                 logger.error(f"Groq ...{k[-6:]} ({model}): {e}")
                 last_err = str(e)[:80]
                 continue
-        if not model_dead:
-            # Модель жива, но все ключи провалили — следующая модель не поможет
-            break
+        if model_dead:
+            continue
+        if last_err == "empty":
+            # Пустой ответ — беда МОДЕЛИ, а не ключей: так ведёт себя
+            # рассуждающая модель, упёршаяся в потолок токенов. Раньше
+            # тут стоял общий break, и при одном ключе в пуле мы уходили
+            # в отказ, ни разу не попробовав остальные модели из списка,
+            # хотя в логе честно перечисляли все три.
+            logger.info(f"Groq: {model} вернула пусто — пробую следующую модель")
+            continue
+        # Ключи кончились по 429/401 — следующая модель не поможет,
+        # она пойдёт по тем же ключам.
+        break
 
     logger.error(f"Groq: не удалось сгенерировать (модели={models}, ключей={len(pool)}, last_err={last_err})")
     # Переводим внутренний last_err в стабильный код причины

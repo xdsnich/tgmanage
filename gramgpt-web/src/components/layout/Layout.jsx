@@ -98,7 +98,7 @@ export default function Layout({ children }) {
                 ufo<span style={{ color: '#4de8ff' }}>.</span>gram
               </div>
               <div style={{ fontSize: 10, color: 'var(--text-3)', letterSpacing: '0.06em' }}>
-                v1.0
+                v2.0
               </div>
             </div>
           </div>

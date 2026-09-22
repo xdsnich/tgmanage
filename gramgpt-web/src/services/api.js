@@ -610,6 +610,11 @@ export const commentingAPI = {
   // withSessions=false — только счётчики по дням, без поминутного
   // расписания: оно занимает почти весь объём ответа, а нужно лишь для
   // раскрытого дня, который догружается отдельно с day=N.
+  // Что кампания написала. Для realtime-кампаний заменяет «Планы»:
+  // планов у них нет, они пишут по факту выхода поста.
+  written: (id, limit = 200) =>
+    api.get(`/commenting/campaigns/${id}/written`, { params: { limit } }),
+
   plans: (id, day = null, withSessions = true) =>
     api.get(`/commenting/campaigns/${id}/plans`, {
       params: {

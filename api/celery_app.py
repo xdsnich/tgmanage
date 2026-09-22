@@ -28,6 +28,7 @@ if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
         pass
 
 from celery import Celery
+from celery.schedules import crontab
 from celery.signals import worker_process_init, beat_init
 import os
 from dotenv import load_dotenv
@@ -42,6 +43,7 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 def _setup_worker_logging(**_):
     from utils.logging_setup import setup_logging
     setup_logging("celery")
+
 
 
 @beat_init.connect
@@ -60,6 +62,10 @@ celery_app = Celery(
         "tasks.ai_tasks",
         "tasks.commenting_tasks",
         "tasks.comment_executor",
+        "tasks.realtime_comments",   # ← Комменты по факту выхода поста
+        "tasks.promote_checked",     # ← Проверенные каналы → в гео-папки
+        "tasks.rt_restore",          # ← Возврат ограниченных, когда срок вышел
+        "tasks.funnel_snapshot",     # ← Полуночный снимок воронки (приток за сутки)
         "tasks.warmup_tasks",
         "tasks.warmup_v2",
         "tasks.subscribe_tasks",
@@ -120,6 +126,8 @@ celery_app.conf.update(
         "tasks.ai_tasks.*":              {"queue": "ai_dialogs"},
         "tasks.commenting_tasks.*":      {"queue": "ai_dialogs"},
         "tasks.comment_executor.*":      {"queue": "ai_dialogs"},
+        "tasks.realtime_comments.*":     {"queue": "ai_dialogs"},
+        "tasks.promote_checked.*":       {"queue": "parsers"},
 
         # Массовый онбординг в @leomatchbot — batch может идти 20-40 мин
         "tasks.leomatch_onboarding.*":   {"queue": "bulk_actions"},
@@ -158,12 +166,31 @@ celery_app.conf.update(
     # Запуск: celery -A celery_app beat --loglevel=info
     # Beat НЕ выполняет таски сам — он только посылает их в очередь воркеру
     # по расписанию. Так что Beat и Worker — это два РАЗНЫХ процесса.
+    #
+    # ── Срок годности у задач расписания (expires) ───────────────
+    # Все задачи ниже — повторяющиеся и одинаковые: пропущенный тик не
+    # надо навёрстывать, через минуту придёт следующий и сделает ровно
+    # то же самое, только по свежим данным.
+    #
+    # Без срока годности пропущенные тики копятся в Redis и при запуске
+    # воркера уходят залпом. Так было 09.09: Windows поставил обновления
+    # и перезагрузил машину, воркер умер с полусотней разобранных, но не
+    # подтверждённых задач; Redis вернул их в очередь, и на старте
+    # диспетчер планов отработал 76 раз за две минуты вместо одного раза
+    # в минуту. Каждый проход двигал указатель сессии вперёд по правилу
+    # «просрочено больше 4 часов — пропускаем», и 37 сессий кампании
+    # сгорели, ни разу не выполнившись. Наблюдатель realtime в тот же
+    # момент набил очередь восемнадцатью заданиями при потолке в пять.
+    # Тот же сценарий описан в шапке start_all.ps1 — инцидент 2026-06-12.
+    #
+    # expires чуть больше периода: тик, не начатый за это время, уже
+    # неактуален и Celery выбросит его сам, не отдавая воркеру.
     beat_schedule={
         "dispatch-plans": {
             # Исполняет И commenting, И warmup планы (единый движок).
             "task": "tasks.plan_executor.dispatch_plans",
             "schedule": 60.0,                  # каждые 60 секунд
-            "options": {"queue": "plans"},
+            "options": {"queue": "plans", "expires": 90},
         },
         # ── ОТКЛЮЧЕНО 2026-08-24 ─────────────────────────────────
         # dispatch-channel-probe бил по 40 каналов на аккаунт каждые 30 мин,
@@ -180,6 +207,58 @@ celery_app.conf.update(
         #     "schedule": 1800.0,
         #     "options": {"queue": "parsers"},
         # },
+        # ── Комменты по факту выхода поста ───────────────────────
+        # Наблюдатель обходит каналы realtime-кампаний через публичную
+        # веб-версию t.me/s/ — аккаунтов и их лимитов это не касается.
+        # Замер 08.09: 4800 запросов подряд по 20 в секунду через один
+        # прокси, ни одного 429. Так что минута между обходами — с
+        # огромным запасом.
+        #
+        # Если realtime-кампаний нет, обе задачи выходят сразу и почти
+        # ничего не стоят.
+        "watch-realtime-channels": {
+            "task": "tasks.realtime_comments.watch_channels",
+            "schedule": 60.0,
+            "options": {"queue": "ai_dialogs", "expires": 55},
+        },
+        # Ограничения за жалобы почти всегда временные — бот называет
+        # дату снятия. Задача сама проверяет созревших через @SpamBot и
+        # возвращает чистых в кампанию; раз в двадцать минут достаточно,
+        # сроки измеряются сутками.
+        # Полуночный снимок воронки. Список заявок читается постранично и
+        # целиком не отдаётся, а счётчики канала — отдаются. Разница
+        # между снимком и текущим значением и есть суточный приток.
+        "funnel-midnight-snapshot": {
+            "task": "tasks.funnel_snapshot.snapshot_funnel",
+            # Расписание celery живёт в UTC, а нам нужна полночь по Киеву
+            # (UTC+3) — это 21:02 предыдущих суток по UTC. Ставить 00:02
+            # было бы промахом на три часа.
+            "schedule": crontab(hour=21, minute=2),
+            "options": {"queue": "ai_dialogs", "expires": 1800},
+        },
+
+        "restore-limited-accounts": {
+            "task": "tasks.rt_restore.restore_limited",
+            # Раз в десять минут, а не в двадцать: адреса заняты почти
+            # всегда, и чем чаще заходим, тем выше шанс поймать окно.
+            "schedule": 600.0,
+            "options": {"queue": "ai_dialogs", "expires": 550},
+        },
+
+        "dispatch-realtime-comments": {
+            "task": "tasks.realtime_comments.dispatch_realtime",
+            "schedule": 30.0,
+            "options": {"queue": "ai_dialogs", "expires": 28},
+        },
+        # Проверка каналов идёт пачками круглосуточно, и её результат
+        # надо разбирать так же — иначе проверенное копится в отстойнике
+        # и в работу не попадает. Было ровно так: 9303 канала проверены,
+        # 3159 пригодны, а счётчик в интерфейсе стоял неделю.
+        "promote-checked-channels": {
+            "task": "tasks.promote_checked.promote_checked",
+            "schedule": 300.0,
+            "options": {"queue": "parsers"},
+        },
         "dispatch-prep-plan-sessions": {
             # Диспетчер prep-plan (⚙ Подготовка → 🗓 План).
             # Пере-выкидывает scheduled сессии с прошедшим connect_ts.
@@ -203,3 +282,41 @@ celery_app.conf.update(
         # },
     },
 )
+
+
+# ── Карта моделей собирается здесь, до первой задачи ─────────────
+# Воркер запущен в 40 потоков (-P threads), и раньше карта складывалась
+# сама собой — тем импортом, который случился первым. Пока один поток
+# исполнял models/__init__, другой видел пакет наполовину собранным,
+# брал из него нужную модель и получал мапперы без соседей:
+#   expression 'ApiApp' failed to locate a name
+#   expression 'Proxy' failed to locate a name
+# Валилось всё, что трогает аккаунты, причём плавающе — в зависимости от
+# того, какая задача успела первой.
+#
+# Делать это в worker_process_init нельзя: тот сигнал приходит только у
+# процессного пула, а у потокового не приходит вовсе — проверено 09.09,
+# хук молчал, а мапперы падали дальше. На импорте модуля выполнится
+# гарантированно и ровно один раз, до приёма задач.
+try:
+    import models  # noqa: F401  — регистрирует ВСЕ модели разом
+    from sqlalchemy.orm import configure_mappers as _configure_mappers
+    _configure_mappers()
+except Exception:  # pragma: no cover
+    import logging as _logging
+    _logging.getLogger(__name__).exception(
+        "[celery] не удалось собрать карту моделей на старте")
+
+# Движок базы — здесь же, по той же причине. Сам по себе он импортируется
+# лениво, из первой задачи, а задача уже крутится в своём цикле событий:
+# первое подключение берёт внутренний замок asyncio, и соседняя задача из
+# другого цикла падает на нём с «Lock is bound to a different event loop».
+# При каждом перезапуске так гибли две первые задачи. Импорт отсюда —
+# из главного потока, где никакого цикла ещё нет, — даёт прогреву
+# сработать и снимает гонку.
+try:
+    import utils.db_pool  # noqa: F401
+except Exception:  # pragma: no cover
+    import logging as _logging
+    _logging.getLogger(__name__).exception(
+        "[celery] движок базы не прогрелся на старте")

@@ -35,6 +35,61 @@ def run_async(coro):
         loop.close()
 
 
+# Сколько раз задача готова вернуться за аккаунтами, чей адрес был занят.
+# Четырёх подходов хватает: остывание десятиминутное, а на адресе сидят
+# два-три аккаунта, то есть очередь рассасывается за полчаса.
+_МАКС_ПОПЫТОК = int(os.getenv("SUBSCRIBE_MAX_ATTEMPTS", "4"))
+# Кампания, к которой относим вступление, если готовой строки назначения
+# нет. По ней же realtime потом ищет участников.
+_ASSIGN_CAMPAIGN = int(os.getenv("SUBSCRIBE_ASSIGN_CAMPAIGN", "139"))
+
+
+async def _отметить_вступление(db, acc_id: int, channel: str):
+    """Записать факт вступления в назначения кампании.
+
+    Без этого ночная работа остаётся невидимой: realtime определяет,
+    кто состоит в канале, именно по строкам 'joined' в этой таблице, а
+    задача подписки раньше писала результат только в свой отчёт. Отсюда
+    два следствия — realtime не пускал писать туда, куда мы подписались,
+    а повторный запуск выбирал те же каналы заново, потому что 'pending'
+    так и не убывал.
+
+    Строки может не быть вовсе (список пришёл не из плана кампании) —
+    тогда заводим её сами.
+    """
+    from sqlalchemy import text as sa_text
+
+    ch = (channel or "").lstrip("@")
+    if not ch:
+        return
+    try:
+        res = await db.execute(sa_text("""
+            UPDATE campaign_channel_assignments
+            SET status = 'joined', joined_at = now()
+            WHERE account_id = :a AND lower(channel_username) = lower(:ch)
+              AND status <> 'joined'"""),
+            {"a": acc_id, "ch": ch})
+        if not res.rowcount:
+            есть = (await db.execute(sa_text("""
+                SELECT 1 FROM campaign_channel_assignments
+                WHERE account_id = :a AND lower(channel_username) = lower(:ch)
+                LIMIT 1"""), {"a": acc_id, "ch": ch})).scalar()
+            if not есть:
+                await db.execute(sa_text("""
+                    INSERT INTO campaign_channel_assignments
+                        (campaign_id, account_id, channel_username, status,
+                         assigned_at, joined_at)
+                    VALUES (:c, :a, :ch, 'joined', now(), now())"""),
+                    {"c": _ASSIGN_CAMPAIGN, "a": acc_id, "ch": ch})
+        await db.commit()
+    except Exception:
+        logger.debug("[subscribe] не удалось отметить вступление", exc_info=True)
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+
+
 def _normalize_channel(link: str) -> str:
     link = link.strip()
     if link.startswith("@"):
@@ -89,10 +144,21 @@ async def _run_subscribe_task(task_data: dict):
 
     logger.info(f"[subscribe] ═══ Старт: {num_accounts} акков × {len(channels)} каналов = {total_subs} подписок за ~{total_minutes} мин")
 
-    subscribed = 0
-    failed = 0
-    skipped = 0
-    results = []
+    # Перенос с прошлой попытки: задача, упёршаяся в занятые адреса,
+    # перезапускает себя с оставшимися аккаунтами, и итог должен быть
+    # общим, а не отдельным за каждый подход.
+    перенос = task_data.get("_carry") or {}
+    попытка = int(task_data.get("_attempt") or 1)
+
+    subscribed = int(перенос.get("subscribed") or 0)
+    failed = int(перенос.get("failed") or 0)
+    skipped = int(перенос.get("skipped") or 0)
+    results = list(перенос.get("results") or [])
+
+    # Аккаунты, чей адрес был занят. Их списки не выбрасываем — заберём
+    # следующим подходом, когда адрес освободится.
+    отложенные: list[int] = []
+    ждать_сек = 0
 
     async with Session() as db:
         try:
@@ -138,8 +204,24 @@ async def _run_subscribe_task(task_data: dict):
                 # warmup'ом/комментингом/AI-диалогом — ждём пока IP отдохнёт.
                 # Subscribe не критичен по времени, можно подождать.
                 from utils.ip_throttle import acquire_ip_lock, get_ip_cooldown_remaining
-                if not acquire_ip_lock(proxy):
+                # owner=acc_id — представляемся замку. Адрес закрепляется
+                # за аккаунтом на десять минут, и без имени подписка не
+                # прошла бы даже на СВОЙ адрес: замок считает безымянного
+                # чужим и держит его полный срок.
+                if not acquire_ip_lock(proxy, owner=acc_id):
                     remaining = get_ip_cooldown_remaining(proxy)
+                    # Адрес закреплён за соседом по прокси — на одном
+                    # адресе живут два-три аккаунта, и пачка будит их
+                    # одновременно. Раньше здесь терялся весь список
+                    # каналов; теперь аккаунт ждёт своей очереди.
+                    if попытка < _МАКС_ПОПЫТОК:
+                        отложенные.append(acc_id)
+                        ждать_сек = max(ждать_сек, remaining)
+                        logger.info(
+                            f"[subscribe] {acc.phone} IP {proxy.host}:{proxy.port} "
+                            f"занят ({remaining}с) — вернусь к нему позже"
+                        )
+                        continue
                     logger.info(
                         f"[subscribe] {acc.phone} IP {proxy.host}:{proxy.port} "
                         f"в cooldown ({remaining}с) — пропуск"
@@ -181,6 +263,7 @@ async def _run_subscribe_task(task_data: dict):
                             await client(JoinChannelRequest(entity))
 
                             results.append({"account_id": acc_id, "channel": channel, "phone": acc.phone, "ok": True, "detail": "Подписан"})
+                            await _отметить_вступление(db, acc_id, channel)
                             subscribed += 1
                             logger.info(f"[subscribe]   ✅ {acc.phone} → @{channel} ({ch_i + 1}/{len(channels)})")
 
@@ -188,6 +271,9 @@ async def _run_subscribe_task(task_data: dict):
                             err = str(e)[:150]
                             if "already" in err.lower() or "USER_ALREADY_PARTICIPANT" in err:
                                 results.append({"account_id": acc_id, "channel": channel, "phone": acc.phone, "ok": True, "detail": "Уже подписан"})
+                                # «Уже участник» — такой же факт членства,
+                                # как и свежее вступление.
+                                await _отметить_вступление(db, acc_id, channel)
                                 skipped += 1
                                 logger.info(f"[subscribe]   ✓ {acc.phone} уже в @{channel}")
                             elif "CHANNELS_TOO_MUCH" in err:
@@ -271,6 +357,38 @@ async def _run_subscribe_task(task_data: dict):
 
                     logger.info(f"[subscribe] ── Пауза между аккаунтами: {between_delay}с (~{between_delay // 60} мин) ──")
                     await asyncio.sleep(between_delay)
+
+            # ── Отложенные: вернуться за ними ────────────
+            # Ждать внутри задачи нельзя — жёсткий предел десять минут,
+            # ровно столько же длится остывание адреса. Поэтому задача
+            # перезапускает себя с оставшимися аккаунтами и уходит.
+            if отложенные:
+                пауза = max(60, min(int(ждать_сек) + random.randint(20, 90), 900))
+                logger.info(
+                    f"[subscribe] ⏭ {len(отложенные)} акк. ждут свой адрес — "
+                    f"вернусь через {пауза}с (подход {попытка + 1}/{_МАКС_ПОПЫТОК})"
+                )
+                if subscribe_task_id:
+                    st_r = await db.execute(select(SubscribeTask).where(SubscribeTask.id == subscribe_task_id))
+                    task_row = st_r.scalar_one_or_none()
+                    if task_row:
+                        task_row.subscribed = subscribed
+                        task_row.failed = failed
+                        task_row.skipped = skipped
+                        доля = len(отложенные) / max(1, len(account_ids))
+                        task_row.progress = int(100 * (1 - доля))
+                        await db.commit()
+                run_subscribe.apply_async(
+                    args=[dict(task_data,
+                               account_ids=list(отложенные),
+                               _attempt=попытка + 1,
+                               _carry={"subscribed": subscribed, "failed": failed,
+                                       "skipped": skipped, "results": results})],
+                    countdown=пауза,
+                )
+                return {"subscribed": subscribed, "failed": failed,
+                        "skipped": skipped, "total": total_subs,
+                        "deferred": len(отложенные)}
 
             # ── Финал ────────────────────────────────────
             if subscribe_task_id:

@@ -40,6 +40,12 @@ def _proxy_key(host: str, port: Any) -> str:
     return f"gramgpt:ip_lock:{host}:{port}"
 
 
+def _owner_key(host: str, port: int) -> str:
+    """Чей адрес в текущем окне. Живёт полные IP_COOLDOWN_SEC и держит
+    чужие аккаунты снаружи, даже когда сам замок уже снят."""
+    return f"gramgpt:ip_owner:{host}:{port}"
+
+
 def _extract_host_port(proxy_obj: Any) -> Optional[tuple[str, int]]:
     """Достаёт host:port из Proxy-модели или dict'а. None если не получилось."""
     if not proxy_obj:
@@ -58,9 +64,32 @@ def _extract_host_port(proxy_obj: Any) -> Optional[tuple[str, int]]:
         return None
 
 
-def acquire_ip_lock(proxy_obj: Any, ttl: Optional[int] = None) -> bool:
+def acquire_ip_lock(proxy_obj: Any, ttl: Optional[int] = None,
+                    owner: Optional[int] = None) -> bool:
     """
     Захватывает per-IP cooldown lock.
+
+    ttl — на сколько адрес считается занятым. Короткий ttl имеет смысл
+    только вместе с owner (см. ниже); без owner он ослабил бы ровно ту
+    защиту, ради которой замок и заводился.
+
+    owner — id аккаунта, который подключается. Разделяет два очень разных
+    риска, которые до этого лежали под одним замком:
+
+      • разные аккаунты с одного адреса подряд — то, из-за чего замок и
+        появился (2026-06-12: 166 акков на 33 IP за две секунды). Здесь
+        по-прежнему держим полные IP_COOLDOWN_SEC;
+
+      • тот же аккаунт переподключается с того же адреса — обычная жизнь
+        телефона, и растягивать её на десять минут незачем.
+
+    Поэтому владение адресом отмечается отдельным ключом на полные
+    IP_COOLDOWN_SEC, а сам замок можно ставить коротким: пока адрес
+    «принадлежит» аккаунту, он возвращается к нему быстро, а чужие
+    подождут столько же, сколько ждали раньше.
+
+    Ключ владения ставится только если его ещё нет и НЕ продлевается —
+    иначе аккаунт, работающий часто, забрал бы адрес себе навсегда.
 
     Returns:
         True  — IP свободен, можно подключаться
@@ -73,20 +102,83 @@ def acquire_ip_lock(proxy_obj: Any, ttl: Optional[int] = None) -> bool:
         return True  # без прокси — не блокируем
     host, port = hp
 
-    actual_ttl = (ttl if ttl is not None else IP_COOLDOWN_SEC) + \
-                 random.randint(0, IP_COOLDOWN_JITTER_SEC)
+    # Джиттер соразмерен самому остыванию. Фиксированные ±120с поверх
+    # десяти минут — это разброс в пятую часть, а поверх двух минут он
+    # удвоил бы срок и съел весь смысл короткого окна. Верхний предел
+    # прежний, так что для дефолтных десяти минут ничего не меняется.
+    base = ttl if ttl is not None else IP_COOLDOWN_SEC
+    jitter = min(IP_COOLDOWN_JITTER_SEC, max(5, base // 4))
+    actual_ttl = base + random.randint(0, jitter)
 
     try:
         r = _get_redis()
-        acquired = r.set(_proxy_key(host, port), "1", nx=True, ex=actual_ttl)
-        if acquired:
-            logger.debug(f"[ip_throttle] ✅ {host}:{port} захвачен на {actual_ttl}с")
-        else:
+
+        # Кому адрес принадлежит в текущем окне.
+        prev = r.get(_owner_key(host, port))
+        if prev is not None:
+            prev = prev.decode() if isinstance(prev, bytes) else str(prev)
+            if owner is None or str(owner) != prev:
+                logger.info(
+                    f"[ip_throttle] ⏳ {host}:{port} занят аккаунтом {prev}")
+                return False
+
+        acquired = r.set(_proxy_key(host, port), str(owner or "?"),
+                         nx=True, ex=actual_ttl)
+        if not acquired:
             logger.info(f"[ip_throttle] ⏳ {host}:{port} в cooldown")
-        return bool(acquired)
+            return False
+
+        if owner is not None:
+            r.set(_owner_key(host, port), str(owner),
+                  nx=True, ex=IP_COOLDOWN_SEC)
+        logger.debug(f"[ip_throttle] ✅ {host}:{port} захвачен на {actual_ttl}с")
+        return True
     except Exception as e:
         logger.warning(f"[ip_throttle] redis error ({host}:{port}): {e}")
         return True  # fail-open — не блокируем работу при упавшем Redis
+
+
+def is_ip_busy(host: str, port: Any = None, owner: Optional[int] = None) -> bool:
+    """Занят ли адрес — БЕЗ захвата.
+
+    Нужна там, где надо только выбрать подходящего кандидата и не отнимать
+    адрес у того, кто его вот-вот займёт: отбор аккаунта под комментарий,
+    диспетчер очереди. Захват делает уже сам исполнитель, когда доходит
+    до подключения.
+
+    Порт может быть неизвестен (в отборе аккаунтов у нас на руках только
+    host) — тогда считаем адрес занятым, если занят любой его порт.
+    """
+    if IP_THROTTLE_DISABLED:
+        return False
+    if not host:
+        return False
+    try:
+        r = _get_redis()
+        if port is not None:
+            if r.exists(_proxy_key(str(host), int(port))):
+                return True
+            keys = [_owner_key(str(host), int(port))]
+        else:
+            if r.keys(f"gramgpt:ip_lock:{host}:*"):
+                return True
+            keys = r.keys(f"gramgpt:ip_owner:{host}:*")
+
+        # Замок снят, но адрес мог остаться закреплён за другим аккаунтом:
+        # для него он свободен, для нас — нет. Спрашивающий без owner
+        # узнаёт только про сам замок, как и раньше.
+        if owner is None:
+            return False
+        for k in keys:
+            v = r.get(k)
+            if v is None:
+                continue
+            v = v.decode() if isinstance(v, bytes) else str(v)
+            if v != str(owner):
+                return True
+        return False
+    except Exception:
+        return False   # redis упал — не мешаем работать
 
 
 def refresh_ip_lock(proxy_obj: Any, ttl: Optional[int] = None) -> bool:

@@ -25,6 +25,7 @@ import logging
 from datetime import datetime
 
 from celery_app import celery_app
+from tasks.realtime_comments import RT_IP_COOLDOWN_SEC
 
 logger = logging.getLogger(__name__)
 API_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -39,6 +40,54 @@ def run_async(coro):
 
 def _val(x):
     return x.value if hasattr(x, 'value') else x
+
+
+async def _drop_channel(db, item, reason: str, только_если_никого=False):
+    """Убрать канал из realtime-кампании: писать туда мы не можем.
+
+    Только для realtime. У плановой кампании канал закреплён за многими
+    аккаунтами, и отказ одному ещё не значит отказ всем — там свой разбор.
+    Здесь наоборот: пишет строго участник обсуждения, и если Telegram
+    ответил «нет доступа» или «комментарии отключены», то ходить туда
+    нечем и незачем. Наблюдатель опрашивает канал раз в минуту, а каждая
+    неудачная попытка вдобавок занимает адрес — за час так набегает
+    десяток отказов на ровном месте.
+
+    Не удаляем, а гасим флаг: канал остаётся в кампании и виден, вердикт
+    можно пересмотреть, а сеялка каналов не притащит его снова как новый.
+    """
+    from sqlalchemy import text as sa_text
+
+    ch = (item.channel or "").lstrip("@")
+    if not ch:
+        return
+
+    # «Нет доступа» — приговор паре аккаунт-канал, а не каналу. У 7%
+    # каналов участников двое и больше, и отказ одному ещё не значит,
+    # что писать туда некем: остальные заходят спокойно. Поэтому для
+    # таких отказов сначала смотрим, остался ли хоть кто-то.
+    if только_если_никого:
+        остались = (await db.execute(sa_text("""
+            SELECT count(*) FROM campaign_channel_assignments ca
+            JOIN accounts a ON a.id = ca.account_id
+            WHERE ca.status = 'joined' AND a.status = 'active'
+              AND lower(ca.channel_username) = lower(:ch)"""),
+            {"ch": ch})).scalar() or 0
+        if остались:
+            logger.info("[executor] @%s оставлен: участников ещё %d",
+                        ch, остались)
+            return
+
+    res = await db.execute(sa_text("""
+        UPDATE target_channels t SET is_active = false
+        FROM campaigns c
+        WHERE c.id = t.campaign_id AND t.campaign_id = :camp
+          AND c.campaign_type = 'realtime'
+          AND lower(t.username) = lower(:ch) AND t.is_active"""),
+        {"camp": item.campaign_id, "ch": ch})
+    if res.rowcount:
+        logger.warning("[executor] @%s убран из кампании %s: %s",
+                       ch, item.campaign_id, reason)
 
 
 async def _do_smart_comment(client, account, channel_username, post_id, comment_text, personality):
@@ -70,18 +119,45 @@ async def _do_smart_comment(client, account, channel_username, post_id, comment_
     reaction_chance = random.uniform(0.05, 0.55)  # От 15% до 55% каждый раз разный
     if random.random() < reaction_chance:
 
+        # Раньше здесь брался случайный эмодзи из пяти зашитых и слался
+        # вслепую. В канале, где разрешены только 👍 и ❤️, такая реакция
+        # отвергалась, и мы её просто теряли; там, где реакции выключены
+        # совсем, каждая сессия дарила Telegram гарантированный отказ.
+        # Живой человек видит доступные реакции и жмёт из них — берём ту
+        # же логику, что давно работает на реакциях под комментариями.
         try:
             from telethon.tl.functions.messages import SendReactionRequest
             from telethon.tl.types import ReactionEmoji
-            emoji = random.choice(["👍", "🔥", "❤️", "🤔", "👏"])
-            await client(SendReactionRequest(
-                peer=entity, msg_id=post_id,
-                reaction=[ReactionEmoji(emoticon=emoji)]
-            ))
-            steps.append({"action": "reaction", "detail": f"Поставил {emoji} на пост #{post_id}"})
-            await asyncio.sleep(random.randint(5, 30))
-        except Exception:
-            steps.append({"action": "reaction", "detail": "Реакция не удалась (возможно отключены)"})
+            from telethon.errors import ReactionInvalidError
+
+            разрешены = await _get_available_reactions(client, entity)
+            if not разрешены:
+                steps.append({"action": "reaction_skip",
+                              "detail": "В канале реакции отключены"})
+            else:
+                # Несколько попыток разными эмодзи: канал мог отвергнуть
+                # конкретный, но принять соседний.
+                поставлен = None
+                for emoji in random.sample(разрешены, min(3, len(разрешены))):
+                    try:
+                        await client(SendReactionRequest(
+                            peer=entity, msg_id=post_id,
+                            reaction=[ReactionEmoji(emoticon=emoji)]
+                        ))
+                        поставлен = emoji
+                        break
+                    except ReactionInvalidError:
+                        continue
+                if поставлен:
+                    steps.append({"action": "reaction",
+                                  "detail": f"Поставил {поставлен} на пост #{post_id}"})
+                    await asyncio.sleep(random.randint(5, 30))
+                else:
+                    steps.append({"action": "reaction_skip",
+                                  "detail": "Канал отверг все выбранные эмодзи"})
+        except Exception as e:
+            steps.append({"action": "reaction",
+                          "detail": f"Реакция не вышла: {type(e).__name__}"})
     else:
         steps.append({"action": "reaction_skip", "detail": "Реакцию не ставил (рандом)"})
 
@@ -184,14 +260,23 @@ async def _do_smart_comment(client, account, channel_username, post_id, comment_
         "discussion_msg_id": discussion_msg_id,
     })
 
-    # 6.5. Реакции на комменты в discussion — 2-12 штук, с большим весом
-    # на первые (топовые) комментарии. Реакции берутся из channel.
-    # available_reactions если задано, иначе fallback standard set.
+    # 6.5. Реакции на первые комменты под этим постом — одна-две.
+    # Остальной объём набирается обходом соседних каналов ниже.
     try:
         rc_result = await _react_on_comments(client, entity, post_id)
         steps.append({"action": "react_comments", "detail": rc_result[1]})
     except Exception as e:
         steps.append({"action": "react_comments", "detail": f"skip ({type(e).__name__})"})
+
+    # 6.7. Обход соседних каналов реакциями. Аккаунт уже подключён и
+    # держит адрес десять минут — за это же подключение он отмечается
+    # ещё в паре-тройке каналов, вместо того чтобы сваливать весь след
+    # под один пост.
+    try:
+        tour = await _reaction_tour(client, account.id, channel_username)
+        steps.append({"action": "reaction_tour", "detail": tour})
+    except Exception as e:
+        steps.append({"action": "reaction_tour", "detail": "skip (%s)" % type(e).__name__})
 
     # 7. После комментария — прочитать ещё 1-3 поста (не уходим сразу)
     await asyncio.sleep(random.randint(5, 20))
@@ -240,6 +325,129 @@ async def _get_available_reactions(client, entity) -> list:
         pass
     # Fallback: default set (для лички / не-канала / ошибок parse)
     return list(_DEFAULT_REACTIONS)
+
+
+# Сколько соседних каналов обойти реакциями за одну сессию и сколько
+# реакций оставить в каждом. Смысл в том, чтобы набрать объём вширь, а не
+# вглубь: аккаунт уже подключён и держит адрес десять минут, а тратит его
+# на один комментарий. За то же подключение он отмечается ещё в паре-тройке
+# каналов — охват втрое шире, след втрое тоньше, и за реакции не банят
+# (проверено дважды: два прогона по десять пар, ноль ограничений).
+TOUR_CHANNELS = int(os.getenv("RT_TOUR_CHANNELS", "3"))
+TOUR_PER_CHANNEL = int(os.getenv("RT_TOUR_PER_CHANNEL", "2"))
+# Суточный потолок реакций на аккаунт. У Telegram он есть — мы поймали
+# ReactionsTooMany на acc#81, — поэтому считаем и свой.
+TOUR_DAY_LIMIT = int(os.getenv("RT_TOUR_DAY_LIMIT", "40"))
+TOUR_KEY = "gramgpt:rt:reacts:{acc}:{day}"
+
+
+def _reacts_left(acc_id: int) -> int:
+    """Сколько реакций аккаунту ещё можно сегодня."""
+    try:
+        from datetime import date
+        from utils.redis_pool import get_redis
+        k = TOUR_KEY.format(acc=acc_id, day=date.today().isoformat())
+        return max(0, TOUR_DAY_LIMIT - int(get_redis().get(k) or 0))
+    except Exception:
+        return TOUR_DAY_LIMIT
+
+
+def _reacts_use(acc_id: int, n: int = 1):
+    try:
+        from datetime import date
+        from utils.redis_pool import get_redis
+        r = get_redis()
+        k = TOUR_KEY.format(acc=acc_id, day=date.today().isoformat())
+        r.incrby(k, n)
+        r.expire(k, 172800)
+    except Exception:
+        pass
+
+
+async def _reaction_tour(client, account_id: int, кроме: str) -> str:
+    """Пройтись реакциями по соседним каналам, не выходя из сессии.
+
+    Берём только те каналы, где аккаунт УЖЕ состоит: вступать на лету —
+    лишний след, да и вступление куда заметнее реакции. Из каждого берём
+    свежий пост, находим привязанный чат и отмечаем первые комментарии —
+    они выше всех, по ним и кликают.
+
+    Ошибки тут не страшны и не лечатся: канал мог закрыть чат, аккаунта
+    могли там забанить за прошлые комментарии. Просто идём дальше.
+    """
+    import random as _r
+    from sqlalchemy import text as _t
+    from telethon.tl.functions.messages import (
+        SendReactionRequest, GetDiscussionMessageRequest)
+    from telethon.tl.types import ReactionEmoji
+    from telethon.errors import ReactionInvalidError
+    from utils.db_pool import async_session as _S
+
+    осталось = _reacts_left(account_id)
+    if осталось <= 0:
+        return "суточный потолок реакций выбран"
+
+    async with _S() as db:
+        каналы = [x[0] for x in (await db.execute(_t("""
+            SELECT ca.channel_username
+            FROM campaign_channel_assignments ca
+            JOIN target_channels tc
+              ON lower(tc.username) = lower(ca.channel_username)
+             AND tc.is_active
+            WHERE ca.account_id = :a AND ca.status = 'joined'
+              AND lower(ca.channel_username) <> lower(:ex)
+            ORDER BY random() LIMIT :lim"""),
+            {"a": account_id, "ex": (кроме or "").lstrip("@"),
+             "lim": TOUR_CHANNELS * 3})).all()]
+    if not каналы:
+        return "нет соседних каналов"
+
+    посещено = поставлено = 0
+    for ch in каналы:
+        if посещено >= TOUR_CHANNELS or осталось <= 0:
+            break
+        try:
+            ent = await client.get_entity(ch)
+            посты = await client.get_messages(ent, limit=3)
+            if not посты:
+                continue
+            disc = await client(GetDiscussionMessageRequest(
+                peer=ent, msg_id=посты[0].id))
+            if not (disc and disc.messages):
+                continue
+            корень = disc.messages[0]
+            чат = await client.get_entity(корень.peer_id)
+            комменты = [c for c in await client.get_messages(
+                чат, limit=8, reply_to=корень.id) if c.id != корень.id]
+            if not комменты:
+                continue
+            разр = await _get_available_reactions(client, чат)
+            if not разр:
+                continue
+            посещено += 1
+            # Первые комментарии — самые верхние и самые кликаемые.
+            комменты.reverse()
+            сколько = min(TOUR_PER_CHANNEL, len(комменты), осталось)
+            for msg in комменты[:сколько]:
+                for emoji in _r.sample(разр, min(3, len(разр))):
+                    try:
+                        await client(SendReactionRequest(
+                            peer=чат, msg_id=msg.id,
+                            reaction=[ReactionEmoji(emoticon=emoji)]))
+                        поставлено += 1
+                        осталось -= 1
+                        _reacts_use(account_id, 1)
+                        break
+                    except ReactionInvalidError:
+                        continue
+                    except Exception:
+                        break
+                await asyncio.sleep(_r.uniform(2, 6))
+            await asyncio.sleep(_r.uniform(4, 12))
+        except Exception:
+            continue
+
+    return "обошёл %d каналов, поставил %d реакций" % (посещено, поставлено)
 
 
 async def _react_on_comments(client, channel_entity, post_id: int) -> tuple[str, str]:
@@ -343,6 +551,7 @@ async def _execute_queue_item(item, db):
     from models.comment_queue import CommentQueue
     from utils.telegram import make_telethon_client
     from utils.account_lock import acquire_account_lock, release_account_lock
+    from utils.ip_throttle import acquire_ip_lock
     from services.llm import generate_comment
     from tasks.behavior_engine import get_or_create_behavior
 
@@ -389,9 +598,33 @@ async def _execute_queue_item(item, db):
         logger.warning(f"[executor] Аккаунт {account.phone} без прокси — пропуск")
         return
 
-    # Загружаем кампанию
+    # Кампанию загружаем ДО замка адреса: от её типа зависит, насколько
+    # долго адрес держать.
     camp_r = await db.execute(select(Campaign).where(Campaign.id == item.campaign_id))
     campaign = camp_r.scalar_one_or_none()
+    _is_rt = bool(campaign) and _val(campaign.campaign_type) == "realtime"
+
+    # ── Замок адреса ────────────────────────────────────────────────
+    # Замка аккаунта мало: на одном прокси сидят четыре-пять аккаунтов, и
+    # без этого сюда мог влезть второй, пока первый работает, — а плановый
+    # движок и проверка каналов давно берут этот замок. Диспетчер лишь
+    # СМОТРИТ на занятость, захватывает адрес тот, кто реально
+    # подключается, то есть мы.
+    #
+    # Realtime держит адрес коротко. Смысл движка в том, чтобы успеть под
+    # свежий пост, а десятиминутное остывание давало адресу занятость 83%
+    # и превращало очередь в склад протухающих заданий. Ослабления защиты
+    # тут нет: полные десять минут по-прежнему отделяют РАЗНЫЕ аккаунты на
+    # одном адресе — именно это и было причиной инцидента 2026-06-12.
+    # Быстро возвращается только тот же самый аккаунт, за которым адрес
+    # уже закреплён (см. owner в utils/ip_throttle).
+    _ttl = RT_IP_COOLDOWN_SEC if _is_rt else None
+    if not acquire_ip_lock(proxy, ttl=_ttl, owner=account.id):
+        logger.info(f"[executor] адрес {proxy.host} занят — задание вернётся в очередь")
+        item.status = "scheduled"
+        release_account_lock(item.account_id)
+        return
+
     if not campaign or _val(campaign.status) != "active":
         item.status = "failed"
         item.error = "Кампания не активна"
@@ -404,7 +637,7 @@ async def _execute_queue_item(item, db):
     # Генерируем комментарий через LLM
     # Генерируем комментарий через LLM
     from services.llm import build_comment_prompt
-    from services.service_credentials import get_api_key
+    from services.service_credentials import get_api_key, get_api_keys_pool
     style_profile = item.style or {}
     personality = item.personality or {}
 
@@ -415,7 +648,15 @@ async def _execute_queue_item(item, db):
         db, campaign.user_id, provider,
         credential_id=getattr(campaign, "llm_credential_id", None),
     )
-    comment_text = generate_comment(provider, prompt, item.post_text, api_key=api_key)
+    # Весь пул ключей, а не один. У Groq потолок 8000 токенов в минуту НА
+    # КЛЮЧ, а один наш запрос весит около тысячи — то есть с одного ключа
+    # выходит восемь комментариев в минуту, дальше 429. Ключей у юзера
+    # четыре, и плановый движок давно берёт их все (api_keys=), а сюда
+    # передавался ровно один: замер 09.09 — у ключа #3 израсходовано, у
+    # остальных трёх по 999 запросов из 1000, то есть они простаивали.
+    api_keys = await get_api_keys_pool(db, campaign.user_id, provider)
+    comment_text = generate_comment(provider, prompt, item.post_text,
+                                    api_key=api_key, api_keys=api_keys)
 
     if not comment_text:
         item.status = "failed"
@@ -442,6 +683,34 @@ async def _execute_queue_item(item, db):
             item.error = "Не авторизован"
             item.executed_at = now
             return
+
+        # ── Предохранитель по режиму канала ─────────────────────────
+        # Читаем режим у самого края, перед самой отправкой. Отбор такие
+        # каналы уже не отдаёт, но задание могло лечь в очередь раньше
+        # смены режима — а один комментарий туда, где нас забанили,
+        # стоит аккаунта.
+        try:
+            from sqlalchemy import text as _sa_text
+            _режим = (await db.execute(_sa_text("""
+                SELECT mode FROM target_channels
+                WHERE campaign_id = :c AND lower(username) = lower(:ch)
+                LIMIT 1"""),
+                {"c": item.campaign_id,
+                 "ch": (item.channel or "").lstrip("@")})).scalar()
+        except Exception:
+            _режим = None
+        if _режим in ("react", "dead"):
+            logger.warning("[executor] @%s режим «%s» — писать нельзя, отменяю",
+                           item.channel, _режим)
+            item.status = "aborted"
+            item.error = "канал только для реакций"
+            try:
+                from tasks.realtime_comments import _quota_give_back
+                _quota_give_back(item.account_id, item.channel)
+            except Exception:
+                pass
+            await db.commit()
+            return {"status": "skipped", "reason": "режим %s" % _режим}
 
         status, detail, steps = await _do_smart_comment(
             client, account, item.channel, item.post_id, comment_text, personality
@@ -533,15 +802,97 @@ async def _execute_queue_item(item, db):
             item.status = "failed"
             item.error = "Account frozen"
 
+        elif "banned from sending messages" in err.lower():
+            # Глобальное ограничение: писать аккаунт не может нигде.
+            # Снимаем его с realtime и ставим отметку со сроком, который
+            # назвал Telegram — по ней задача rt_restore вернёт его сама.
+            logger.warning("[executor] acc#%s ограничен на отправку",
+                           item.account_id)
+            item.status = "failed"
+            item.error = "You're banned from sending messages in supergroups/channels"
+            try:
+                from tasks.rt_restore import mark_limited, снять_с_кампании
+                mark_limited(item.account_id, "?")
+                await снять_с_кампании(db, item.campaign_id, item.account_id)
+            except Exception:
+                logger.debug("[executor] не удалось снять ограниченного",
+                             exc_info=True)
+
         elif "CHANNEL_PRIVATE" in err or "private" in err.lower():
             logger.warning(f"[executor] @{item.channel}: нет доступа")
             item.status = "failed"
             item.error = "Channel private"
+            # Отметку о членстве снимаем. Realtime-отбор пускает писать
+            # только участника обсуждения и верит двум источникам: флагу
+            # в Redis и записи 'joined' в assignments. Раз Telegram
+            # отвечает «нет доступа» — участия давно нет, а отметка
+            # осталась. Пока она висит, тот же аккаунт будет выбираться
+            # на тот же канал снова: 22 отправки из 60 ушли именно так,
+            # и каждая заняла адрес на десять минут впустую.
+            try:
+                _ch = (item.channel or "").lstrip("@")
+                from utils.redis_pool import get_redis
+                get_redis().delete("gramgpt:disc_joined:%d:%s"
+                                   % (item.account_id, _ch))
+                from sqlalchemy import text as _sa_text
+                await db.execute(_sa_text("""
+                    UPDATE campaign_channel_assignments SET status = 'failed'
+                    WHERE account_id = :a AND channel_username = :ch
+                      AND status = 'joined'"""),
+                    {"a": item.account_id, "ch": _ch})
+                await _drop_channel(db, item, "нет доступа",
+                                    только_если_никого=True)
+            except Exception:
+                logger.debug("[executor] не удалось снять отметку о членстве",
+                             exc_info=True)
+
+        elif ("can't write in this chat" in err.lower()
+              or "ChatWriteForbidden" in type(e).__name__):
+            # «Нельзя писать в этот чат» — приговор паре аккаунт-канал:
+            # либо аккаунта там забанили, либо чат ему закрыт. Раньше эта
+            # ошибка никак не помечалась, и движок выбирал ту же пару
+            # снова и снова: за сутки acc#166 упал так 36 раз в ОДИН
+            # канал, acc#202 — 47 раз, всего 258 попыток вхолостую, и
+            # каждая занимала адрес на две минуты.
+            #
+            # Снимаем отметку о членстве у ЭТОГО аккаунта, а канал гасим
+            # только если писать в него стало реально некем: у части
+            # каналов участников двое и больше.
+            logger.warning("[executor] acc#%s не может писать в @%s",
+                           item.account_id, item.channel)
+            item.status = "failed"
+            item.error = "You can't write in this chat"
+            try:
+                _ch = (item.channel or "").lstrip("@")
+                from utils.redis_pool import get_redis
+                get_redis().delete("gramgpt:disc_joined:%d:%s"
+                                   % (item.account_id, _ch))
+                from sqlalchemy import text as _sa_text
+                await db.execute(_sa_text("""
+                    UPDATE campaign_channel_assignments SET status = 'failed'
+                    WHERE account_id = :a AND channel_username = :ch
+                      AND status = 'joined'"""),
+                    {"a": item.account_id, "ch": _ch})
+                await _drop_channel(db, item, "писать запрещено",
+                                    только_если_никого=True)
+            except Exception:
+                logger.debug("[executor] не удалось снять пару", exc_info=True)
+
+        elif "ALLOW_PAYMENT_REQUIRED" in err:
+            # Канал берёт плату за комментарий: писать может только тот,
+            # у кого оплачена подписка. Для нас он бесполезен так же, как
+            # закрытый, поэтому гасим сразу — иначе аккаунт будет ходить
+            # туда снова и снова, занимая адрес на десять минут за раз.
+            logger.warning(f"[executor] @{item.channel}: комментарии платные")
+            item.status = "failed"
+            item.error = "Комментарии платные"
+            await _drop_channel(db, item, "комментарии платные")
 
         elif "GetDiscussionMessage" in err or "MESSAGE_ID_INVALID" in err:
             logger.warning(f"[executor] @{item.channel} #{item.post_id}: комменты отключены")
             item.status = "failed"
             item.error = "Comments disabled"
+            await _drop_channel(db, item, "комментарии отключены")
 
         else:
             logger.error(f"[executor] ❌ {account.phone} → @{item.channel}: {e}")
@@ -552,6 +903,22 @@ async def _execute_queue_item(item, db):
         try: await client.disconnect()
         except: pass
         release_account_lock(item.account_id)
+        # ── Норму возвращаем, если коммента не вышло ─────────────────
+        # В realtime норма списывается заранее, при постановке в очередь,
+        # чтобы аккаунт не набрал заданий сверх суточного потолка. Но
+        # если задание провалилось или аккаунт «передумал», коммента не
+        # было — и держать за него единицу нормы нельзя.
+        try:
+            if item.status in ("failed", "aborted"):
+                from tasks.realtime_comments import _quota_give_back
+                _quota_give_back(item.account_id, item.channel)
+        except Exception:
+            pass
+        # Замок адреса НЕ отпускаем намеренно. Это не мьютекс на время
+        # сессии, а остывание: ключ живёт 10 минут после захвата, чтобы
+        # подключения с одного IP не шли впритык друг за другом. Плановый
+        # движок ведёт себя так же — берёт и не отпускает.
+        # Досрочное освобождение сводило бы остывание на нет.
 
 
 async def _process_comment_queue():

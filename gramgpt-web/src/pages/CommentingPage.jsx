@@ -208,6 +208,9 @@ export default function CommentingPage() {
   const [activity, setActivity] = useState([])
   const [activityLoading, setActivityLoading] = useState(false)
   const [detailTab, setDetailTab] = useState('info')
+  // Написанное — для realtime-кампаний вместо планов
+  const [written, setWritten] = useState(null)
+  const [writtenLoading, setWrittenLoading] = useState(false)
   const [diagnostics, setDiagnostics] = useState(null)
   const [diagLoading, setDiagLoading] = useState(false)
 
@@ -361,6 +364,18 @@ export default function CommentingPage() {
   // Сперва тянем только счётчики по дням — расписание сессий это почти
   // весь объём ответа (8 МБ на кампанию в 22 дня), а видно всегда лишь
   // один раскрытый день. Его расписание догружаем в openDay.
+  // У realtime-кампании планов нет: она пишет по факту выхода поста.
+  // Вместо расписания показываем сделанное и то, что в работе.
+  const loadWritten = async (campaignId) => {
+    if (!campaignId) return
+    setWrittenLoading(true)
+    try {
+      const { data } = await commentingAPI.written(campaignId)
+      setWritten(data)
+    } catch { setWritten(null) }
+    setWrittenLoading(false)
+  }
+
   const loadPlans = async (campaignId) => {
     if (!campaignId) return
     setPlansLoading(true)
@@ -1092,14 +1107,19 @@ export default function CommentingPage() {
             <div style={{ display: 'flex', gap: 4, background: 'var(--bg-2)', padding: 4, borderRadius: 10, border: '1px solid var(--border)' }}>
               {[
                 { key: 'info', label: '📋 Инфо' },
-                { key: 'plans', label: '📅 Планы' },
+                { key: 'plans',
+                  label: selected.campaign_type === 'realtime'
+                    ? '✍ Написано' : '📅 Планы' },
                 { key: 'activity', label: '🔍 Активность' },
                 { key: 'diagnostics', label: '🩺 Диагностика' },
               ].map(t => (
                 <button key={t.key} onClick={() => {
                   setDetailTab(t.key)
                   if (t.key === 'activity' && activity.length === 0) loadActivity(selected.id)
-                  if (t.key === 'plans' && plans.length === 0) loadPlans(selected.id)
+                  if (t.key === 'plans') {
+                    if (selected.campaign_type === 'realtime') loadWritten(selected.id)
+                    else if (plans.length === 0) loadPlans(selected.id)
+                  }
                   if (t.key === 'diagnostics') loadDiagnostics(selected.id)
                 }} style={{
                   flex: 1, padding: '7px 14px', borderRadius: 8, border: 'none', cursor: 'pointer', fontSize: 12, fontWeight: 600,
@@ -1163,8 +1183,95 @@ export default function CommentingPage() {
               </div>
             )}
 
+            {/* ── Написано: для realtime-кампаний вместо планов ──
+                 Планов у них нет по устройству — они пишут по факту
+                 выхода поста. Показываем сделанное и то, что в работе. */}
+            {detailTab === 'plans' && selected.campaign_type === 'realtime' && (
+              <div>
+                <div style={{ display: 'flex', justifyContent: 'space-between',
+                              alignItems: 'center', marginBottom: 12 }}>
+                  <span style={{ fontSize: 12, color: 'var(--text-3)' }}>
+                    написано {written?.written?.length || 0}
+                    {written?.pending?.length
+                      ? ` · в работе ${written.pending.length}` : ''}
+                  </span>
+                  <Button variant="ghost" size="sm"
+                    onClick={() => loadWritten(selected.id)}
+                    loading={writtenLoading}>🔄 Обновить</Button>
+                </div>
+
+                {writtenLoading && !written
+                  ? <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><Spinner size={24} /></div>
+                  : (
+                    <>
+                      {/* Найденные посты, по которым коммент ещё пишется */}
+                      {written?.pending?.length > 0 && (
+                        <div style={{ marginBottom: 16 }}>
+                          <div style={{ fontSize: 11, color: 'var(--text-3)', fontWeight: 700,
+                                        letterSpacing: '0.08em', textTransform: 'uppercase',
+                                        marginBottom: 6 }}>В работе</div>
+                          {written.pending.map(p => (
+                            <div key={`q${p.id}`} style={{
+                              display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
+                              padding: '8px 12px', marginBottom: 4, borderRadius: 8,
+                              background: 'rgba(227,161,63,0.10)',
+                              border: '1px solid rgba(227,161,63,0.25)', fontSize: 12,
+                            }}>
+                              <span style={{ color: 'var(--text-3)' }}>acc#{p.account_id}</span>
+                              <a href={p.link} target="_blank" rel="noreferrer"
+                                 style={{ color: 'var(--violet)', fontWeight: 600 }}>
+                                @{p.channel}/{p.post_id}
+                              </a>
+                              <span style={{ color: 'var(--text-3)', marginLeft: 'auto' }}>
+                                {p.status === 'executing' ? 'пишет…' : 'ждёт очереди'}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {!written?.written?.length ? (
+                        <Empty icon="✍" title="Пока ничего не написано"
+                          subtitle="Кампания ждёт новых постов в своих каналах" />
+                      ) : written.written.map(w => (
+                        <div key={w.id} style={{
+                          padding: '10px 14px', marginBottom: 6, borderRadius: 10,
+                          background: 'var(--bg-3)', border: '1px solid var(--border)',
+                        }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 10,
+                                        flexWrap: 'wrap', marginBottom: 6, fontSize: 12 }}>
+                            <span style={{ fontWeight: 700 }}>{w.account}</span>
+                            <span style={{ color: 'var(--text-3)' }}>→</span>
+                            <a href={w.link} target="_blank" rel="noreferrer"
+                               style={{ color: 'var(--violet)', fontWeight: 600 }}>
+                              @{w.channel}/{w.post_id}
+                            </a>
+                            {w.verify_status === 'ok' && <Badge color="green">жив</Badge>}
+                            {w.verify_status === 'deleted' && <Badge color="red">удалён</Badge>}
+                            <span style={{ color: 'var(--text-3)', marginLeft: 'auto' }}>
+                              {w.created_at ? new Date(w.created_at).toLocaleString('ru', {
+                                day: '2-digit', month: '2-digit',
+                                hour: '2-digit', minute: '2-digit' }) : ''}
+                            </span>
+                          </div>
+                          <div style={{ fontSize: 13, color: 'var(--text)', lineHeight: 1.5 }}>
+                            {w.text}
+                          </div>
+                          {w.post_text && (
+                            <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 6,
+                                          paddingTop: 6, borderTop: '1px solid var(--border)' }}>
+                              под постом: {w.post_text}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </>
+                  )}
+              </div>
+            )}
+
             {/* ── Plans Tab ── */}
-            {detailTab === 'plans' && (
+            {detailTab === 'plans' && selected.campaign_type !== 'realtime' && (
               <div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
                   <span style={{ fontSize: 12, color: 'var(--text-3)' }}>

@@ -20,7 +20,7 @@ get_input_entity берёт peer из локального кэша и в сет
 
 ENV:
   BULKCHK_PER_ACCOUNT_DAY   сколько каналов максимум на аккаунт в сутки (120)
-  BULKCHK_DELAY_MIN/MAX     пауза между каналами внутри аккаунта, сек (25/45)
+  BULKCHK_DELAY_MIN/MAX     пауза между каналами внутри аккаунта, сек (120/240)
   BULKCHK_ACCOUNT_GAP       пауза между аккаунтами одного прокси, сек (300)
   BULKCHK_MAX_PROXIES       сколько прокси обрабатывать параллельно (0 = все)
   BULKCHK_MIN_SUBS          не проверять каналы мельче (0 = проверять все)
@@ -40,8 +40,12 @@ logger = logging.getLogger(__name__)
 API_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 PER_ACCOUNT_DAY = int(os.getenv("BULKCHK_PER_ACCOUNT_DAY", "120"))
-DELAY_MIN = float(os.getenv("BULKCHK_DELAY_MIN", "25"))
-DELAY_MAX = float(os.getenv("BULKCHK_DELAY_MAX", "45"))
+# Пауза между каналами. При 25-45 секундах выходило около сотни
+# проверок в час — втрое выше измеренного безопасного коридора
+# (8-33 в час выживали, 49 в час дали FLOOD_WAIT). Ставим 120-240
+# секунд: это 15-30 в час, внутри коридора с запасом.
+DELAY_MIN = float(os.getenv("BULKCHK_DELAY_MIN", "120"))
+DELAY_MAX = float(os.getenv("BULKCHK_DELAY_MAX", "240"))
 ACCOUNT_GAP = float(os.getenv("BULKCHK_ACCOUNT_GAP", "300"))
 MAX_PROXIES = int(os.getenv("BULKCHK_MAX_PROXIES", "0"))
 # Ниже этого порога каналы не проверяем вовсе: проверка стоит
@@ -175,8 +179,15 @@ async def _check_one(client, db, uname: str, acc_id: int) -> str:
     caps = extract_caps_from_full(full, peer)
     await record_caps(db, uname, caps, account_id=acc_id, source="bulk_check")
     ok, why = verdict(caps)
-    if used_resolve:
-        _quota_use(acc_id, 1)
+    # ── Считаем КАЖДУЮ проверку, а не только сетевой резолв ──────────
+    # Раньше квота росла лишь когда peer не нашёлся в кэше. В ночь на
+    # 08.09 все 5768 проверок прошли из кэша — счётчик не сдвинулся ни
+    # разу, аккаунты пробили свои 120 без остановки и сделали по 185
+    # штук со скоростью 90 в час. Итог: 17 аккаунтов словили FLOOD_WAIT
+    # по 22 часа.
+    # Кэш экономит резолв, но GetFullChannelRequest всё равно уходит в
+    # сеть и имеет свой лимит — вот его и не учитывали.
+    _quota_use(acc_id, 1)
     return why
 
 
@@ -190,6 +201,7 @@ async def _worker_for_proxy(proxy_host: str, accounts: list, queue: asyncio.Queu
     from utils.db_pool import async_session as Session
     from utils.telegram import make_telethon_client
     from utils.account_lock import acquire_account_lock, release_account_lock
+    from utils.ip_throttle import acquire_ip_lock
     from utils.account_health import is_resting, record_error
     from telethon.errors import FloodWaitError
 
@@ -207,6 +219,7 @@ async def _worker_for_proxy(proxy_host: str, accounts: list, queue: asyncio.Queu
         if not acquire_account_lock(acc_id, ttl=3600):
             continue
 
+
         async with Session() as db:
             acc = (await db.execute(
                 select(TelegramAccount).options(joinedload(TelegramAccount.api_app))
@@ -221,6 +234,16 @@ async def _worker_for_proxy(proxy_host: str, accounts: list, queue: asyncio.Queu
                 release_account_lock(acc_id); continue
             proxy = (await db.execute(
                 select(Proxy).where(Proxy.id == acc.proxy_id))).scalar_one_or_none()
+            # ── Замок адреса ─────────────────────────────────────────
+            # Проверка идёт карантинными аккаунтами, но прокси у них общие
+            # с рабочими. Без этого замка проверка подключалась на адресе,
+            # где в тот же момент шла сессия кампании, — а плановый движок
+            # и realtime-очередь замок берут давно.
+            # Не отпускаем: ключ живёт своим TTL как остывание адреса.
+            if proxy and not acquire_ip_lock(proxy):
+                logger.info(f"[bulkchk] адрес {proxy.host} занят — acc#{acc_id} пропуск")
+                release_account_lock(acc_id)
+                continue
             client = make_telethon_client(acc, proxy)
             if not client:
                 release_account_lock(acc_id); continue

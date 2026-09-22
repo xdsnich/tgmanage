@@ -595,6 +595,16 @@ async def _dispatch_plans():
                     continue
 
                 # 3. Все планы выполнены?
+                #
+                # Только для кампаний, у которых планы вообще бывают.
+                # У realtime-кампании их нет по устройству: она пишет по
+                # факту выхода поста, а не по расписанию. Без этой
+                # оговорки она закрывалась в первую же минуту после
+                # запуска — «планов ноль, значит всё сделано».
+                if getattr(camp, "campaign_type", "regular") in ("realtime",
+                                                                 "check_only"):
+                    continue
+
                 remaining = (await db.execute(
                     select(func.count(CampaignPlan.id)).where(
                         CampaignPlan.campaign_id == camp.id,
@@ -628,6 +638,54 @@ async def _dispatch_plans():
 # ═══════════════════════════════════════════════════════════
 # EXECUTOR: выполняет одну сессию одного аккаунта
 # ═══════════════════════════════════════════════════════════
+
+RT_YIELD_MAX = int(os.getenv("PLAN_RT_YIELD_MAX", "3"))
+
+
+async def _realtime_waiting(db, account_id: int, plan_id: int, idx: int) -> bool:
+    """Ждёт ли у этого аккаунта realtime-задание, ради которого стоит
+    уступить адрес.
+
+    Зачем. Оба движка ходят через один и тот же прокси, а тот после
+    подключения остывает десять минут. Плановая сессия и realtime-задание
+    равны для замка, но не равны по цене: сессию можно провести и через
+    полчаса, ничего не потеряв, а комментарий под свежим постом через
+    полчаса не нужен вовсе — в этом и был весь смысл второго движка.
+    Поэтому при равных правах уступает плановая.
+
+    Уступаем не бесконечно. Наблюдатель держит по заданию на аккаунт
+    постоянно, переписывая его на свежие посты, так что «есть задание»
+    верно почти всегда. Без потолка плановые сессии этих аккаунтов не
+    состоялись бы уже никогда. RT_YIELD_MAX уступок на сессию — дальше
+    идём вперёд: у realtime суточная норма 10 комментов, у плана 5
+    сессий, а адрес выдаёт 144 подключения в сутки, места хватает обоим.
+    """
+    from sqlalchemy import text as sa_text
+
+    row = (await db.execute(sa_text("""
+        SELECT 1 FROM comment_queue q
+        JOIN campaigns c ON c.id = q.campaign_id
+        WHERE q.account_id = :a AND q.status = 'scheduled'
+          AND c.campaign_type = 'realtime'
+          AND q.scheduled_at <= (NOW() AT TIME ZONE 'utc')
+        LIMIT 1"""), {"a": account_id})).first()
+    if not row:
+        return False
+
+    try:
+        from utils.redis_pool import get_redis
+        r = get_redis()
+        k = "gramgpt:plan_rt_yield:%d:%d" % (plan_id, idx)
+        n = r.incr(k)
+        r.expire(k, 6 * 3600)
+        if n > RT_YIELD_MAX:
+            logger.info("[plan] plan #%d: уступал realtime %d раз — иду вперёд",
+                        plan_id, n - 1)
+            return False
+    except Exception:
+        return False
+    return True
+
 
 async def _execute_plan_session(plan_id: int):
     """Выполняет одну сессию из плана."""
@@ -801,6 +859,29 @@ async def _execute_plan_session(plan_id: int):
                     proxy = (await db.execute(
                         select(Proxy).where(Proxy.id == acc.proxy_id)
                     )).scalar_one_or_none()
+
+                # ═══ ПРИОРИТЕТ REALTIME ═══
+                # Адрес один на оба движка. Уступаем его тому, для кого
+                # время критично: комментарий под только что вышедшим
+                # постом протухнет за полчаса, плановая сессия — нет.
+                # Уступок на сессию не больше RT_YIELD_MAX, иначе планы
+                # этих аккаунтов не состоялись бы никогда.
+                if await _realtime_waiting(db, plan.account_id,
+                                           plan.id, _claim_idx):
+                    defer_sec = random.uniform(300, 600)
+                    logger.info(
+                        f"[plan] plan #{plan.id}: у acc#{plan.account_id} ждёт "
+                        f"realtime-задание, уступаю адрес на {defer_sec:.0f}с"
+                    )
+                    release_user_slot(acc.user_id)
+                    slot_user_id = None
+                    release_account_lock(plan.account_id)
+                    release_connection(plan.account_id)
+                    celery_app.send_task(
+                        "tasks.plan_executor.execute_plan_session",
+                        args=[plan.id], queue="plans", countdown=defer_sec)
+                    return {"status": "realtime_priority",
+                            "defer_sec": int(defer_sec)}
 
                 # ═══ PER-IP COOLDOWN (anti-burst) ═══
                 # Защита от инцидента 2026-06-12: на одном IP не должно
@@ -2232,6 +2313,40 @@ async def _execute_plan_session(plan_id: int):
                                             await db.flush()
                                             await db.commit()
                                             logger.info(f"[plan][{phone}] ✅ CommentLog @{target_channel} записан в БД (камп {campaign.id})")
+
+                                            # ── Насколько поздно мы пришли ──────────────
+                                            # Первые комменты видит каждый, кто открыл
+                                            # обсуждение, последние тонут внизу. Значит
+                                            # ценность коммента зависит от того, сколько
+                                            # их там уже было и как давно вышел пост.
+                                            # Оба числа у нас уже на руках: дата поста и
+                                            # счётчик ответов из GetDiscussionMessage —
+                                            # лишних запросов не делаем.
+                                            try:
+                                                from datetime import timezone as _tz
+                                                _pdate = getattr(target_post, "date", None)
+                                                _age_min = None
+                                                if _pdate:
+                                                    _age_min = int(
+                                                        (datetime.now(_tz.utc) - _pdate)
+                                                        .total_seconds() // 60)
+                                                # disc мог не создаться выше — тогда
+                                                # NameError поймает общий except ниже.
+                                                _before = None
+                                                if disc and disc.messages:
+                                                    _r = getattr(disc.messages[0], "replies", None)
+                                                    if _r is not None:
+                                                        _before = getattr(_r, "replies", None)
+                                                await _safe_log(
+                                                    db, task_id=log_task_id, account_id=acc.id,
+                                                    action="comment_position",
+                                                    detail="возраст поста %s мин, комментов до нас %s"
+                                                           % (_age_min, _before),
+                                                    channel=target_channel, success=True,
+                                                    source=plan_source,
+                                                    campaign_id=plan_campaign_id)
+                                            except Exception:
+                                                pass
                                         except Exception as log_err:
                                             logger.error(f"[plan][{phone}] ❌ Ошибка записи CommentLog: {log_err}")
                                             try: await db.rollback()

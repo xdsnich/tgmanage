@@ -247,7 +247,11 @@ async def _probe_with_account(account_id: int, limit: int = None,
         logger.info(f"[qprobe] acc#{account_id}: окно {window:.0f} мин на "
                     f"{proxy.host}, бюджет часа {budget} → берём {limit} каналов")
 
-        if not acquire_ip_lock(proxy):
+        # owner=account_id — представляемся замку. Без имени он пишет
+        # адрес на «никого» и держит его десять минут, выталкивая
+        # настоящего владельца: ровно это ломало подписки и проверки
+        # через @SpamBot, пока не добавили owner.
+        if not acquire_ip_lock(proxy, owner=account_id):
             return {"status": "ip_cooldown"}
         if not acquire_account_lock(account_id, ttl=3600):
             return {"status": "locked"}
@@ -332,9 +336,15 @@ async def _probe_with_account(account_id: int, limit: int = None,
                     # размер канала приходит тем же ответом — записываем
                     members = getattr(full.full_chat, "participants_count", None)
                     if members:
+                        # Пишем БЕЗУСЛОВНО. Раньше стояло «только если
+                        # больше» — и завышенное число уже не исправлялось
+                        # никогда: у @Walking_Dead_TV с разбора карточки
+                        # осталось 1,1 млн вместо настоящих 18 тысяч.
+                        # Значение приходит прямо из Telegram, это истина,
+                        # а не кандидат на повышение.
                         await db.execute(text("""
                             UPDATE parsed_channels SET subscribers = :m
-                            WHERE username = :u AND COALESCE(subscribers,0) < :m
+                            WHERE username = :u
                         """), {"m": int(members), "u": uname})
                     await db.commit()
                     # Держим старый флаг has_comments в согласии с вердиктом.

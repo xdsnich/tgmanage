@@ -699,13 +699,18 @@ def generate_daily_plan(
                             "pause_after": random.randint(3, 12),
                         })
                         # ── Веер по соседним каналам ────────────────────
-                        # Берём ТОЛЬКО те, где аккаунт уже вступил в
-                        # обсуждение в этом плане: такой канал лежит в кэше
-                        # сессии, и обращение к нему не тратит резолв. А
-                        # именно резолвы приводят к флуду — незнакомое имя
-                        # стоит запроса ResolveUsername, и на них выгорали
-                        # аккаунты при обходе каналов.
-                        _extra_pool = [ch for ch in _disc_scheduled if ch != target]
+                        # Берём только те, где аккаунт УЖЕ ПИСАЛ в этом же
+                        # плане. Доступ туда подтверждён делом: коммент
+                        # прошёл, значит и обсуждение открыто, и канал жив,
+                        # и peer лежит в кэше сессии — резолв не тратится.
+                        #
+                        # Раньше пул строился из _disc_scheduled, то есть из
+                        # ЗАПЛАНИРОВАННЫХ вступлений. Вступление могло не
+                        # состояться, и реакция летела в канал, куда аккаунт
+                        # не попал: за сутки 74 отказа ChannelPrivateError и
+                        # 16 ChatWriteForbidden, которых до веера не было.
+                        _extra_pool = [ch for ch in _commented_channels
+                                       if ch != target and _commented_channels[ch] > 0]
                         if _extra_pool and random.random() < 0.35:
                             _n_extra = min(random.randint(1, 2), len(_extra_pool))
                             for _ch in random.sample(_extra_pool, _n_extra):

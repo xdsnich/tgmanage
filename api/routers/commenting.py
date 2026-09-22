@@ -24,6 +24,16 @@ from models.campaign import (
 
 router = APIRouter(prefix="/commenting", tags=["commenting"])
 
+# Сколько каналов аккаунт берёт на вступление за день внутри плана.
+# Раньше здесь стояла жёсткая двойка — осторожная цифра для свежих
+# аккаунтов. Наши прогреты и работают месяцами, а при 2 в день охват
+# двух тысяч каналов растягивался на месяцы. Замер 08-11.09: аккаунты
+# делали по 7-14 вступлений в сутки без единого флуда.
+_JOINS_PER_DAY = int(os.getenv("PLAN_JOINS_PER_DAY", "12"))
+# Пересобранный план раскладывается ровно, без прогревной волны:
+# пересобирают уже работающую кампанию, и терять первые дни незачем.
+_REBUILD_EVEN = os.getenv("PLAN_REBUILD_EVEN", "1") not in ("0", "false", "no")
+
 # Доля пар (аккаунт, канал), уже покрытых существующими подписками, начиная
 # с которой аккаунты считаются прогретыми и комменты раскладываются по дням
 # РОВНО, а не прогревной волной. См. _do_start_campaign.
@@ -577,7 +587,7 @@ async def _do_start_campaign(db: AsyncSession, c: Campaign) -> dict:
                     planned_join_day=0,
                     joined_at=_dt.utcnow(),
                 ))
-            jpd = min(2, max(1, math.ceil(len(pending_chs) / max(1, total_days)))) if pending_chs else 1
+            jpd = min(_JOINS_PER_DAY, max(1, math.ceil(len(pending_chs) / max(1, total_days)))) if pending_chs else 1
             for i, ch in enumerate(pending_chs):
                 planned_day = (i // jpd) + 1
                 db.add(CampaignChannelAssignment(
@@ -869,7 +879,7 @@ async def _do_start_campaign(db: AsyncSession, c: Campaign) -> dict:
                 # на ПРЕДЫДУЩИЕ дни этого запуска
                 commentable_before_today = _pre_joined_chs + _pending_chs[:join_start]
             else:
-                jpd = min(2, max(1, math.ceil(len(_pending_chs) / max(1, total_days)))) if _pending_chs else 1
+                jpd = min(_JOINS_PER_DAY, max(1, math.ceil(len(_pending_chs) / max(1, total_days)))) if _pending_chs else 1
                 join_start = min(len(_pending_chs), (day_num - 1) * jpd)
                 join_end   = min(len(_pending_chs),  day_num      * jpd)
                 channels_to_join_today   = _pending_chs[join_start:join_end]
@@ -1061,17 +1071,29 @@ async def rebuild_campaign_plan(
     # 3. Читаем существующие channel assignments (какие уже joined)
     #    — НЕ удаляем и НЕ пересоздаём (акки уже подписались, повторно
     #    вступать бесполезно и вредно).
-    ca_result = await db.execute(
-        select(CampaignChannelAssignment).where(
-            CampaignChannelAssignment.campaign_id == c.id
-        )
-    )
+    # Порядок здесь определяет, на что аккаунт подпишется РАНЬШЕ: план
+    # берёт неподписанные каналы подряд и распределяет по дням. Раньше
+    # порядок был случайным (как легли записи), и подписки уходили на
+    # мелочь вперемешку с крупными. Сортируем по числу подписчиков —
+    # сначала миллионники: цена комментария там выше, а дни кампании
+    # конечны.
+    from sqlalchemy import text as _sa_text
+    _rows = (await db.execute(_sa_text('''
+        SELECT s.account_id, s.channel_username, s.status
+        FROM campaign_channel_assignments s
+        LEFT JOIN LATERAL (
+            SELECT subscribers FROM parsed_channels p
+            WHERE lower(p.username) = lower(s.channel_username)
+            ORDER BY subscribers DESC LIMIT 1) pc ON true
+        WHERE s.campaign_id = :c
+        ORDER BY COALESCE(pc.subscribers, 0) DESC, s.id
+    '''), {"c": c.id})).all()
     channel_dist: dict[int, list[str]] = {}
     joined_by_acc: dict[int, set[str]] = {}
-    for ca in ca_result.scalars().all():
-        channel_dist.setdefault(ca.account_id, []).append(ca.channel_username)
-        if ca.status == "joined":
-            joined_by_acc.setdefault(ca.account_id, set()).add(ca.channel_username)
+    for acc_id, ch_name, ch_status in _rows:
+        channel_dist.setdefault(acc_id, []).append(ch_name)
+        if ch_status == "joined":
+            joined_by_acc.setdefault(acc_id, set()).add(ch_name)
 
     # ── Дополняем из ГЛОБАЛЬНОГО реестра подписок AccountSubscription ──
     # Если акк уже подписан на канал через другую кампанию/warmup/decoy —
@@ -1208,8 +1230,14 @@ async def rebuild_campaign_plan(
         total_planned = 0
         _commented_by_acc = {k: set(v) for k, v in _commented_by_acc_initial.items()}
 
+        # Ровно по дням, без прогревной волны. Волна нужна свежим
+        # аккаунтам: первые дни по чуть-чуть, чтобы не выглядеть ботом
+        # с первого часа. Пересборка же идёт по парку, который работает
+        # месяцами, и разгон здесь только теряет день — в новых планах
+        # на первый день приходилось шесть комментариев на всю кампанию.
         daily_comments = distribute_comments_by_days(
-            c.max_comments, total_days, even=_rb_check_only,
+            c.max_comments, total_days,
+            even=_rb_check_only or _REBUILD_EVEN,
         )
         # distribute_comments_by_days может схлопнуть "хвост" (маленький последний
         # день) в предпоследний → total_days уменьшается автоматом.
@@ -2245,6 +2273,78 @@ async def backfill_discussion_joins_progress(
         return _json.loads(raw)
     except Exception:
         return {"status": "idle"}
+
+
+@router.get("/campaigns/{campaign_id}/written")
+async def get_campaign_written(
+    campaign_id: int,
+    limit: int = 200,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Что кампания написала: кто, куда, под какой пост и что именно.
+
+    У realtime-кампании планов нет по устройству — она пишет по факту
+    выхода поста. Вкладка «Планы» для неё пустая, и посмотреть работу
+    было негде. Здесь то же самое по смыслу: список сделанного.
+
+    Отдаём и то, что ждёт своей очереди: в realtime между обнаружением
+    поста и комментарием проходит минута-другая, и полезно видеть, что
+    сейчас в работе.
+    """
+    c = await _get_campaign(db, campaign_id, current_user.id)
+
+    from models.campaign import CommentLog
+    from models.comment_queue import CommentQueue
+
+    rows = (await db.execute(
+        select(CommentLog).where(CommentLog.campaign_id == c.id)
+        .order_by(CommentLog.created_at.desc()).limit(limit)
+    )).scalars().all()
+
+    phones = {}
+    if rows:
+        from models.account import TelegramAccount
+        accs = (await db.execute(select(TelegramAccount).where(
+            TelegramAccount.id.in_({r.account_id for r in rows if r.account_id})
+        ))).scalars().all()
+        phones = {a.id: (a.first_name or a.phone) for a in accs}
+
+    written = [{
+        "id": r.id,
+        "account_id": r.account_id,
+        "account": phones.get(r.account_id) or r.account_phone,
+        "phone": r.account_phone,
+        "channel": r.channel_username,
+        "post_id": r.post_id,
+        "post_text": (r.post_text or "")[:160],
+        "text": r.comment_text or "",
+        "created_at": r.created_at.isoformat() + "Z" if r.created_at else None,
+        "verify_status": getattr(r, "verify_status", None),
+        "link": ("https://t.me/%s/%s" % (r.channel_username, r.post_id)
+                 if r.channel_username and r.post_id else None),
+    } for r in rows]
+
+    # Очередь: что найдено и ждёт исполнения.
+    q = (await db.execute(
+        select(CommentQueue).where(
+            CommentQueue.campaign_id == c.id,
+            CommentQueue.status.in_(("scheduled", "executing")),
+        ).order_by(CommentQueue.scheduled_at.asc()).limit(50)
+    )).scalars().all()
+    pending = [{
+        "id": x.id,
+        "account_id": x.account_id,
+        "channel": x.channel,
+        "post_id": x.post_id,
+        "status": x.status,
+        "scheduled_at": x.scheduled_at.isoformat() + "Z" if x.scheduled_at else None,
+        "link": ("https://t.me/%s/%s" % (x.channel, x.post_id)
+                 if x.channel and x.post_id else None),
+    } for x in q]
+
+    return {"written": written, "pending": pending,
+            "total_written": len(written)}
 
 
 @router.get("/campaigns/{campaign_id}/plans")
