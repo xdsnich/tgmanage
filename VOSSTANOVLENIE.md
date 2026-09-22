@@ -48,10 +48,28 @@
 
 ### 1. Код
 
+Если в комплекте есть `ufogram-code.bundle` — берём его. Это весь
+репозиторий одним файлом: ветки, коммиты, история. Так надёжнее, чем
+тянуть с GitHub: там может не оказаться последних правок, если их не
+успели отправить.
+
+```
+git clone ufogram-code.bundle tg_manager1
+cd tg_manager1
+git checkout feat/ufogram-reactions-parsing
+```
+
+Если файла нет — с GitHub:
+
 ```
 git clone https://github.com/xdsnich/tgmanage.git tg_manager1
 cd tg_manager1
 git checkout feat/ufogram-reactions-parsing
+```
+
+Дальше в обоих случаях:
+
+```
 python -m venv .venv
 .\.venv\Scripts\pip install -r requirements.txt
 ```
