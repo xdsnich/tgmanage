@@ -34,7 +34,12 @@ if ($existing) {
     exit 1
 }
 
-$python = (Get-Command python).Source
+# ВАЖНО: берём python из venv проекта ЯВНО, не через Get-Command.
+# Иначе при запуске из Планировщика заданий PATH отдаёт системный python
+# (без uvicorn/celery) и процессы мгновенно падают "No module named uvicorn".
+$venvPython = Join-Path $ROOT ".venv\Scripts\python.exe"
+if (Test-Path $venvPython) { $python = $venvPython }
+else { $python = (Get-Command python).Source }
 $apiDir = Join-Path $ROOT "api"
 
 function Start-BgProcess {

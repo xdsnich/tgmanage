@@ -69,6 +69,7 @@ celery_app = Celery(
         "tasks.warmup_tasks",
         "tasks.warmup_v2",
         "tasks.subscribe_tasks",
+        "tasks.react_subscribe",     # ← Чистые аккаунты в каналы «только реакции»
         "tasks.plan_executor",
         "tasks.parser_tasks",
         "tasks.parser_similar_tasks",   # ← ДОБАВЛЕНО: crawler похожих каналов
@@ -121,6 +122,7 @@ celery_app.conf.update(
 
         # Подписки — отдельно, бывают long-running
         "tasks.subscribe_tasks.*":       {"queue": "subscribe"},
+        "tasks.react_subscribe.*":       {"queue": "subscribe"},
 
         # AI-диалоги и комментинг
         "tasks.ai_tasks.*":              {"queue": "ai_dialogs"},
@@ -235,6 +237,16 @@ celery_app.conf.update(
             # было бы промахом на три часа.
             "schedule": crontab(hour=21, minute=2),
             "options": {"queue": "ai_dialogs", "expires": 1800},
+        },
+
+        # Каналы «только реакции» живут, пока в них сидят аккаунты без
+        # бана — только они и ставят там реакции. Раз в ночь добираем
+        # недостающих, по десять вступлений на аккаунт, пачками по пять.
+        # 22:15 UTC = 01:15 по Киеву. Выключить: RT_REACT_SUBSCRIBE=0.
+        "react-channels-subscribe": {
+            "task": "tasks.react_subscribe.plan_react_subscriptions",
+            "schedule": crontab(hour=22, minute=15),
+            "options": {"queue": "subscribe", "expires": 3600},
         },
 
         "restore-limited-accounts": {

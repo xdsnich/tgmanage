@@ -130,21 +130,24 @@ async def list_parsed_channels(
         # Теперь опираемся на кэш свойств: показываем то, куда РЕАЛЬНО
         # можно писать. Непроверенные оставляем — они кандидаты, их ещё
         # предстоит проверить, и в UI они помечены отдельно.
+        # Имена сравниваем без учёта регистра: вердикт мог записаться как
+        # @nobyda, а в базе канал лежит как @NobyDa — 01.10 так терялись
+        # вердикты у 3177 каналов.
         from models.channel_capability import ChannelCapability
-        _bad = select(ChannelCapability.channel_username).where(
+        _bad = select(func.lower(ChannelCapability.channel_username)).where(
             ChannelCapability.commentable == False  # noqa: E712
         )
         q = q.where(
             ParsedChannel.has_comments == True,
-            ParsedChannel.username.notin_(_bad),
+            func.lower(ParsedChannel.username).notin_(_bad),
         )
     if only_unchecked:
         # «Непроверенные» — те, по кому вердикта ещё нет вовсе.
         # Раньше этот фильтр жил только в браузере и потому врал: он видел
         # лишь загруженный кусок списка, а не всю базу.
         from models.channel_capability import ChannelCapability as _CC
-        q = q.where(ParsedChannel.username.notin_(
-            select(_CC.channel_username)))
+        q = q.where(func.lower(ParsedChannel.username).notin_(
+            select(func.lower(_CC.channel_username))))
     # По умолчанию — крупные сверху. Но паутинка приносит каналы от 50
     # тысяч, а на первой странице по размеру стоят от 420 тысяч: свежие
     # находки не видно вовсе, пока не долистаешь. Поэтому есть второй
@@ -257,14 +260,16 @@ async def list_parsed_channels(
     if usernames:
         try:
             from models.channel_capability import ChannelCapability
+            # Без учёта регистра — см. фильтры выше.
+            _want_low = {u.lower() for u in _want}
             _cq = select(ChannelCapability)
             if _by_page:
-                _cq = _cq.where(ChannelCapability.channel_username.in_(usernames))
+                _cq = _cq.where(func.lower(ChannelCapability.channel_username).in_(list(_want_low)))
             caps_r = await db.execute(_cq)
             for cc in caps_r.scalars().all():
-                if cc.channel_username not in _want:
+                if (cc.channel_username or "").lower() not in _want_low:
                     continue
-                caps_map[cc.channel_username] = {
+                caps_map[cc.channel_username.lower()] = {
                     "reason": cc.reason or "",
                     "commentable": cc.commentable,
                     "needs_approval": cc.needs_approval,
@@ -309,12 +314,12 @@ async def list_parsed_channels(
         "comments_deleted": verify_map.get(c.username, {}).get("comments_deleted", 0),
         "survival_rate":    verify_map.get(c.username, {}).get("survival_rate"),
         # Статус проверки на комментарии
-        "checked": c.username in caps_map,
-        "cap_commentable": caps_map.get(c.username, {}).get("commentable"),
-        "cap_reason": caps_map.get(c.username, {}).get("reason", ""),
-        "cap_needs_approval": caps_map.get(c.username, {}).get("needs_approval"),
-        "cap_join_to_send": caps_map.get(c.username, {}).get("join_to_send"),
-        "cap_checked_at": caps_map.get(c.username, {}).get("checked_at"),
+        "checked": (c.username or "").lower() in caps_map,
+        "cap_commentable": caps_map.get((c.username or "").lower(), {}).get("commentable"),
+        "cap_reason": caps_map.get((c.username or "").lower(), {}).get("reason", ""),
+        "cap_needs_approval": caps_map.get((c.username or "").lower(), {}).get("needs_approval"),
+        "cap_join_to_send": caps_map.get((c.username or "").lower(), {}).get("join_to_send"),
+        "cap_checked_at": caps_map.get((c.username or "").lower(), {}).get("checked_at"),
     } for c in channels]
 
 @router.get("/channels/stats")
@@ -342,14 +347,15 @@ async def parsed_channels_stats(
         return (await db.execute(
             select(func.count()).select_from(q.subquery()))).scalar() or 0
 
-    _bad = select(_CC.channel_username).where(
+    # Без учёта регистра: @NobyDa в базе и @nobyda в вердикте — один канал.
+    _bad = select(func.lower(_CC.channel_username)).where(
         _CC.commentable == False)  # noqa: E712
     with_comments = base.where(
         ParsedChannel.has_comments == True,  # noqa: E712
-        ParsedChannel.username.notin_(_bad),
+        func.lower(ParsedChannel.username).notin_(_bad),
     )
     unchecked = base.where(
-        ParsedChannel.username.notin_(select(_CC.channel_username)))
+        func.lower(ParsedChannel.username).notin_(select(func.lower(_CC.channel_username))))
 
     # Считаем по колонке самого подзапроса: ParsedChannel.subscribers
     # снаружи не связан с алиасом и дал бы декартово произведение.

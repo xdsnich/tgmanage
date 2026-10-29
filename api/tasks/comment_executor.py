@@ -42,7 +42,8 @@ def _val(x):
     return x.value if hasattr(x, 'value') else x
 
 
-async def _drop_channel(db, item, reason: str, только_если_никого=False):
+async def _drop_channel(db, item, reason: str, только_если_никого=False,
+                        в_реакции=False):
     """Убрать канал из realtime-кампании: писать туда мы не можем.
 
     Только для realtime. У плановой кампании канал закреплён за многими
@@ -77,6 +78,25 @@ async def _drop_channel(db, item, reason: str, только_если_никог�
             logger.info("[executor] @%s оставлен: участников ещё %d",
                         ch, остались)
             return
+
+    # Бан в чате — это запрет ПИСАТЬ нашим аккаунтам, а не конец канала.
+    # Чат живой, комментарии идут, и аккаунт без бана там по-прежнему
+    # может ставить реакции — каждая приводит человека в профиль. Раньше
+    # такие каналы гасились целиком: так пропало 556 штук. Теперь канал
+    # остаётся в кампании в режиме «только реакции», наблюдатель перестаёт
+    # звать туда писать, а обход ходит туда ставить реакции.
+    if в_реакции:
+        res = await db.execute(sa_text("""
+            UPDATE target_channels t SET mode = 'react'
+            FROM campaigns c
+            WHERE c.id = t.campaign_id AND t.campaign_id = :camp
+              AND c.campaign_type = 'realtime'
+              AND lower(t.username) = lower(:ch)
+              AND t.is_active AND t.mode = 'comment'"""),
+            {"camp": item.campaign_id, "ch": ch})
+        if res.rowcount:
+            logger.warning("[executor] @%s → только реакции: %s", ch, reason)
+        return
 
     res = await db.execute(sa_text("""
         UPDATE target_channels t SET is_active = false
@@ -333,8 +353,20 @@ async def _get_available_reactions(client, entity) -> list:
 # на один комментарий. За то же подключение он отмечается ещё в паре-тройке
 # каналов — охват втрое шире, след втрое тоньше, и за реакции не банят
 # (проверено дважды: два прогона по десять пар, ноль ограничений).
-TOUR_CHANNELS = int(os.getenv("RT_TOUR_CHANNELS", "3"))
+#
+# Главная цель обхода — каналы «только реакции»: там нашим аккаунтам
+# запретили писать, и без обхода они не дают ничего. Поэтому они идут
+# первыми, а обычные каналы добирают остаток.
+TOUR_CHANNELS_MIN = int(os.getenv("RT_TOUR_CHANNELS_MIN", "3"))
+TOUR_CHANNELS = int(os.getenv("RT_TOUR_CHANNELS", "4"))
 TOUR_PER_CHANNEL = int(os.getenv("RT_TOUR_PER_CHANNEL", "2"))
+# Счётчик по режимам за сутки — чтобы видеть, сколько реакций пришлось
+# именно на каналы, где писать нельзя.
+TOUR_MODE_KEY = "gramgpt:rt:reacts_mode:{day}"
+# Ошибки, после которых аккаунту в этом чате делать нечего: выгнали,
+# забанили или закрыли. Пару снимаем, чтобы обход сюда не возвращался.
+_ТУР_БАН = ("ChannelPrivateError", "UserBannedInChannelError",
+            "ChatWriteForbiddenError", "ChatAdminRequiredError")
 # Суточный потолок реакций на аккаунт. У Telegram он есть — мы поймали
 # ReactionsTooMany на acc#81, — поэтому считаем и свой.
 TOUR_DAY_LIMIT = int(os.getenv("RT_TOUR_DAY_LIMIT", "40"))
@@ -352,28 +384,76 @@ def _reacts_left(acc_id: int) -> int:
         return TOUR_DAY_LIMIT
 
 
-def _reacts_use(acc_id: int, n: int = 1):
+def _reacts_use(acc_id: int, n: int = 1, режим: str = None):
     try:
         from datetime import date
         from utils.redis_pool import get_redis
         r = get_redis()
-        k = TOUR_KEY.format(acc=acc_id, day=date.today().isoformat())
+        день = date.today().isoformat()
+        k = TOUR_KEY.format(acc=acc_id, day=день)
         r.incrby(k, n)
         r.expire(k, 172800)
+        if режим:
+            km = TOUR_MODE_KEY.format(day=день)
+            r.hincrby(km, режим, n)
+            r.expire(km, 8 * 86400)
     except Exception:
         pass
+
+
+def _emoji_order(msg, pool: list, n: int = 3) -> list:
+    """В каком порядке пробовать эмодзи на сообщении.
+
+    Сначала те, что на нём уже стоят: живой человек чаще жмёт готовую
+    реакцию, чем выбирает новую. Заодно это обходит ReactionsTooMany —
+    Telegram отвечает им, когда на сообщении уже максимум РАЗНЫХ реакций
+    и мы пытаемся добавить ещё одну новую. Уже стоящую добавить можно.
+    """
+    есть = []
+    try:
+        for rc in (msg.reactions.results or []):
+            e = getattr(rc.reaction, "emoticon", None)
+            if e and e in pool and e not in есть:
+                есть.append(e)
+    except Exception:
+        pass
+    random.shuffle(есть)
+    прочие = [e for e in pool if e not in есть]
+    random.shuffle(прочие)
+    return (есть + прочие)[:n]
+
+
+async def _снять_пару(account_id: int, канал: str):
+    """Аккаунту в этом чате делать нечего — больше сюда не водим."""
+    try:
+        from sqlalchemy import text as _t
+        from utils.db_pool import async_session as _S
+        async with _S() as db:
+            await db.execute(_t("""
+                UPDATE campaign_channel_assignments SET status = 'failed'
+                WHERE account_id = :a AND lower(channel_username) = lower(:ch)
+                  AND status = 'joined'"""), {"a": account_id, "ch": канал})
+            await db.commit()
+    except Exception:
+        logger.debug("[tour] не удалось снять пару", exc_info=True)
 
 
 async def _reaction_tour(client, account_id: int, кроме: str) -> str:
     """Пройтись реакциями по соседним каналам, не выходя из сессии.
 
-    Берём только те каналы, где аккаунт УЖЕ состоит: вступать на лету —
-    лишний след, да и вступление куда заметнее реакции. Из каждого берём
-    свежий пост, находим привязанный чат и отмечаем первые комментарии —
-    они выше всех, по ним и кликают.
+    Зачем. Аккаунт уже подключён и держит адрес десять минут, а тратит
+    его на один комментарий. За то же подключение он заходит ещё в 3-4
+    канала и ставит реакции под верхними комментариями — каждый автор
+    получает уведомление, открывает профиль и видит канал воронки.
 
-    Ошибки тут не страшны и не лечатся: канал мог закрыть чат, аккаунта
-    могли там забанить за прошлые комментарии. Просто идём дальше.
+    Куда. В первую очередь в каналы «только реакции»: там нашим
+    аккаунтам запретили писать, и кроме обхода трафика с них нет. Только
+    туда, где аккаунт УЖЕ состоит — вступать на лету лишний след. И
+    никогда туда, где ЭТОГО аккаунта забанили: бан на пару аккаунт-чат,
+    и забаненный не поставит даже реакцию. Сосед без бана — поставит.
+
+    Ошибки не страшны: канал мог закрыть чат. Идём дальше, а если
+    аккаунта выгнали — снимаем пару, чтобы не возвращаться.
     """
     import random as _r
     from sqlalchemy import text as _t
@@ -387,32 +467,61 @@ async def _reaction_tour(client, account_id: int, кроме: str) -> str:
     if осталось <= 0:
         return "суточный потолок реакций выбран"
 
+    нужно = _r.randint(TOUR_CHANNELS_MIN, max(TOUR_CHANNELS_MIN, TOUR_CHANNELS))
+
+    # Бан — по истории этой пары: «Channel private» (админ выгнал из
+    # чата) или «can't write» (запретили писать), и после него ни одного
+    # удачного комментария. Статусу 'joined' одному не верим: ночная
+    # подписка ставит его заново, потому что вступить в КАНАЛ можно и
+    # с баном в ЧАТЕ — так набралась тысяча ложных «подписан».
     async with _S() as db:
-        каналы = [x[0] for x in (await db.execute(_t("""
-            SELECT ca.channel_username
+        каналы = [(x[0], bool(x[1])) for x in (await db.execute(_t("""
+            SELECT ca.channel_username, bool_or(tc.mode = 'react') AS react
             FROM campaign_channel_assignments ca
             JOIN target_channels tc
               ON lower(tc.username) = lower(ca.channel_username)
-             AND tc.is_active
+             AND tc.is_active AND tc.mode IN ('comment', 'react')
             WHERE ca.account_id = :a AND ca.status = 'joined'
               AND lower(ca.channel_username) <> lower(:ex)
-            ORDER BY random() LIMIT :lim"""),
+              AND NOT EXISTS (
+                  SELECT 1 FROM comment_queue q
+                  WHERE q.account_id = ca.account_id
+                    AND lower(q.channel) = lower(ca.channel_username)
+                    AND q.status = 'failed'
+                    AND (q.error ILIKE 'Channel private%%'
+                         OR q.error ILIKE '%%can''t write%%')
+                    AND NOT EXISTS (
+                        SELECT 1 FROM comment_queue d
+                        WHERE d.account_id = q.account_id
+                          AND lower(d.channel) = lower(q.channel)
+                          AND d.status = 'done'
+                          AND d.executed_at > q.executed_at))
+            GROUP BY ca.channel_username
+            ORDER BY bool_or(tc.mode = 'react') DESC, random()
+            LIMIT :lim"""),
             {"a": account_id, "ex": (кроме or "").lstrip("@"),
-             "lim": TOUR_CHANNELS * 3})).all()]
+             "lim": нужно * 3})).all()]
     if not каналы:
         return "нет соседних каналов"
 
     посещено = поставлено = 0
-    for ch in каналы:
-        if посещено >= TOUR_CHANNELS or осталось <= 0:
+    по_режиму = {"react": 0, "comment": 0}
+    журнал = []
+    for ch, react in каналы:
+        if посещено >= нужно or осталось <= 0:
             break
+        режим = "react" if react else "comment"
         try:
             ent = await client.get_entity(ch)
+            # Свежий пост без комментариев — пустой заход. Берём самый
+            # новый из трёх, под которым уже кто-то написал.
             посты = await client.get_messages(ent, limit=3)
-            if not посты:
+            пост = next((p for p in посты
+                         if getattr(getattr(p, "replies", None), "replies", 0)), None)
+            if not пост:
                 continue
             disc = await client(GetDiscussionMessageRequest(
-                peer=ent, msg_id=посты[0].id))
+                peer=ent, msg_id=пост.id))
             if not (disc and disc.messages):
                 continue
             корень = disc.messages[0]
@@ -428,114 +537,122 @@ async def _reaction_tour(client, account_id: int, кроме: str) -> str:
             # Первые комментарии — самые верхние и самые кликаемые.
             комменты.reverse()
             сколько = min(TOUR_PER_CHANNEL, len(комменты), осталось)
+            тут = 0
+            выгнан = False
             for msg in комменты[:сколько]:
-                for emoji in _r.sample(разр, min(3, len(разр))):
+                for emoji in _emoji_order(msg, разр):
                     try:
                         await client(SendReactionRequest(
                             peer=чат, msg_id=msg.id,
                             reaction=[ReactionEmoji(emoticon=emoji)]))
-                        поставлено += 1
+                        тут += 1
                         осталось -= 1
-                        _reacts_use(account_id, 1)
+                        _reacts_use(account_id, 1, режим)
                         break
                     except ReactionInvalidError:
                         continue
-                    except Exception:
+                    except Exception as e:
+                        if type(e).__name__ in _ТУР_БАН:
+                            выгнан = True
+                        журнал.append("@%s:%s" % (ch, type(e).__name__))
                         break
+                if выгнан:
+                    break
                 await asyncio.sleep(_r.uniform(2, 6))
+            if выгнан:
+                await _снять_пару(account_id, ch)
+            поставлено += тут
+            по_режиму[режим] += тут
+            журнал.append("@%s[%s]%d" % (ch, режим[0], тут))
             await asyncio.sleep(_r.uniform(4, 12))
-        except Exception:
+        except Exception as e:
+            if type(e).__name__ in _ТУР_БАН:
+                await _снять_пару(account_id, ch)
+            журнал.append("@%s:%s" % (ch, type(e).__name__))
             continue
 
-    return "обошёл %d каналов, поставил %d реакций" % (посещено, поставлено)
+    return "обошёл %d каналов, поставил %d реакций (react %d, comment %d): %s" % (
+        посещено, поставлено, по_режиму["react"], по_режиму["comment"],
+        " ".join(журнал))
 
 
 async def _react_on_comments(client, channel_entity, post_id: int) -> tuple[str, str]:
-    """Ставит 2-12 реакций на комменты под постом с большим весом на
-    первые (топовые). Возвращает (status, detail).
+    """Ставит одну-две реакции на верхние комменты под постом.
 
-    Weighted pick: каждый следующий коммент в порядке от старого к
-    новому получает вес w = max(1.0, 4.0 - i * 0.4). Т.е. первые ~10
-    комментов сильно доминируют.
+    Объём набирается не здесь, а обходом соседних каналов: две реакции
+    под одним постом — это человек, двенадцать — это программа.
+
+    Возвращает (status, detail).
     """
-    from telethon.tl.functions.channels import GetFullChannelRequest
-    from telethon.tl.functions.messages import SendReactionRequest
+    from telethon.tl.functions.messages import (
+        SendReactionRequest, GetDiscussionMessageRequest)
     from telethon.tl.types import ReactionEmoji
+    from telethon.errors import ReactionInvalidError
 
-    # 1. Достаём linked discussion group
+    # 1. Корень обсуждения. Раньше брался linked_chat_id, а комментарии
+    # запрашивались по id поста в КАНАЛЕ — в группе у него свой номер, и
+    # Telegram отвечал MsgIdInvalid. Комментарий при этом уходил как ни в
+    # чём не бывало, поэтому поломку не было видно: 6065 удачных сессий
+    # прошли без единой реакции. GetDiscussionMessage отдаёт и группу, и
+    # настоящий id корня разом — так делает обход соседних каналов ниже.
     try:
-        full = await client(GetFullChannelRequest(channel_entity))
-        linked_id = getattr(full.full_chat, "linked_chat_id", 0) or 0
-        if not linked_id:
+        disc = await client(GetDiscussionMessageRequest(
+            peer=channel_entity, msg_id=post_id))
+        if not (disc and disc.messages):
             return "skip", "нет discussion-группы"
-        discussion = await client.get_entity(linked_id)
+        корень = disc.messages[0]
+        discussion = await client.get_entity(корень.peer_id)
     except Exception as e:
         return "skip", f"нет discussion ({type(e).__name__})"
 
-    # 2. Собираем комменты (последние ~40, потом reverse чтобы старые сверху)
-    comments = []
+    # 2. Комменты приходят новые → старые, разворачиваем: верхние первыми.
     try:
-        async for msg in client.iter_messages(discussion, reply_to=post_id, limit=40):
-            if msg and msg.id:
-                comments.append(msg)
+        comments = [c for c in await client.get_messages(
+            discussion, limit=40, reply_to=корень.id) if c.id != корень.id]
     except Exception as e:
-        return "skip", f"iter_messages fail ({type(e).__name__})"
+        return "skip", f"комменты не читаются ({type(e).__name__})"
     if not comments:
         return "skip", "0 комментов"
-
-    # iter_messages отдаёт новые → старые. Reverse чтобы первые (топовые) были comments[0].
     comments.reverse()
 
-    # 3. Доступные emoji этого канала
-    reactions_pool = await _get_available_reactions(client, channel_entity)
+    # 3. Разрешённые emoji спрашиваем у ГРУППЫ, а не у канала: реакции
+    # летят в группу, и набор у неё свой. Спрашивали у канала — отсюда
+    # пятая часть отказов на ровном месте.
+    reactions_pool = await _get_available_reactions(client, discussion)
     if not reactions_pool:
-        return "skip", "реакции отключены в канале"
+        return "skip", "реакции отключены в чате"
 
-    # 4. Сколько реакций поставить: 2-12
-    target_count = random.randint(2, min(12, len(comments)))
+    # 4. Одна-две, и обе из верхних шести — по ним и кликают живые люди.
+    target_count = min(random.randint(1, 2), len(comments))
+    верх = comments[:6]
+    выбор = random.sample(верх, min(target_count, len(верх)))
 
-    # 5. Weighted pick без повторов — топы получают ×3-4 вес
-    def _weight(i: int) -> float:
-        return max(1.0, 4.0 - i * 0.4)
-
-    # Собираем вероятность выбора без замены через weighted shuffle
-    indices = list(range(len(comments)))
-    picked = []
-    remaining_weights = [_weight(i) for i in indices]
-    while len(picked) < target_count and indices:
-        total = sum(remaining_weights)
-        if total <= 0:
-            break
-        r = random.uniform(0, total)
-        cumulative = 0.0
-        for idx, w in enumerate(remaining_weights):
-            cumulative += w
-            if r <= cumulative:
-                picked.append(indices[idx])
-                # remove
-                indices.pop(idx)
-                remaining_weights.pop(idx)
-                break
-
-    # 6. Собственно реакции + мини-паузы 1-4с между
     ok_count = 0
-    fail_count = 0
-    for idx in picked:
-        msg = comments[idx]
-        emoji = random.choice(reactions_pool)
-        try:
-            await client(SendReactionRequest(
-                peer=discussion, msg_id=msg.id,
-                reaction=[ReactionEmoji(emoticon=emoji)],
-            ))
-            ok_count += 1
-        except Exception:
-            fail_count += 1
+    отказы = []
+    for msg in выбор:
+        # Несколько эмодзи подряд: чат мог отвергнуть конкретный, но
+        # принять соседний. Уже стоящие на сообщении — первыми.
+        for emoji in _emoji_order(msg, reactions_pool):
+            try:
+                await client(SendReactionRequest(
+                    peer=discussion, msg_id=msg.id,
+                    reaction=[ReactionEmoji(emoticon=emoji)],
+                ))
+                ok_count += 1
+                break
+            except ReactionInvalidError:
+                continue
+            except Exception as e:
+                отказы.append(type(e).__name__)
+                break
+        else:
+            отказы.append("ReactionInvalid")
         await asyncio.sleep(random.uniform(1, 4))
 
     return "ok", (
-        f"Реакции на комменты: {ok_count} ok, {fail_count} fail, "
-        f"target={target_count}, пул={len(reactions_pool)} emoji"
+        "Реакции на комменты: %d ok, %d fail, target=%d, пул=%d emoji%s"
+        % (ok_count, len(отказы), target_count, len(reactions_pool),
+           (" [" + ",".join(sorted(set(отказы))) + "]") if отказы else "")
     )
 
 
@@ -841,7 +958,7 @@ async def _execute_queue_item(item, db):
                       AND status = 'joined'"""),
                     {"a": item.account_id, "ch": _ch})
                 await _drop_channel(db, item, "нет доступа",
-                                    только_если_никого=True)
+                                    только_если_никого=True, в_реакции=True)
             except Exception:
                 logger.debug("[executor] не удалось снять отметку о членстве",
                              exc_info=True)
@@ -874,7 +991,7 @@ async def _execute_queue_item(item, db):
                       AND status = 'joined'"""),
                     {"a": item.account_id, "ch": _ch})
                 await _drop_channel(db, item, "писать запрещено",
-                                    только_если_никого=True)
+                                    только_если_никого=True, в_реакции=True)
             except Exception:
                 logger.debug("[executor] не удалось снять пару", exc_info=True)
 
@@ -1080,7 +1197,35 @@ def dispatch_comments(self):
     return run_async(_dispatch_comments())
 
 
+# Жёсткий потолок на одну сессию комментинга. Celery с потоками не умеет
+# убивать зависшие задания (task_time_limit не работает на -P threads), и
+# одно повисшее на прокси подключение держит поток навсегда. 14.10 так
+# забились все 40 потоков — воркер «жив», но 5,5 ч ничего не обрабатывал.
+# wait_for отменяет корутину по дедлайну, finally внутри отпускает замки,
+# цикл run_async закрывается — поток освобождается.
+EXEC_HARD_TIMEOUT = int(os.getenv("EXEC_HARD_TIMEOUT_SEC", "480"))
+
+
+async def _execute_single_guarded(queue_id: int):
+    try:
+        return await asyncio.wait_for(_execute_single_comment(queue_id), EXEC_HARD_TIMEOUT)
+    except asyncio.TimeoutError:
+        logger.error("[single_comment] #%s завис дольше %dс — снято по таймауту",
+                     queue_id, EXEC_HARD_TIMEOUT)
+        try:
+            from sqlalchemy import text as _t
+            from utils.db_pool import async_session as _S
+            async with _S() as db:
+                await db.execute(_t("""UPDATE comment_queue SET status='failed',
+                    error='сессия зависла, снято по таймауту', executed_at=now()
+                    WHERE id=:i AND status IN ('scheduled','executing','dispatched')"""), {"i": queue_id})
+                await db.commit()
+        except Exception:
+            pass
+        return {"status": "timeout"}
+
+
 @celery_app.task(bind=True, name="tasks.comment_executor.execute_single_comment")
 def execute_single_comment(self, queue_id: int):
     """Один комментарий — параллельно с другими."""
-    return run_async(_execute_single_comment(queue_id))
+    return run_async(_execute_single_guarded(queue_id))

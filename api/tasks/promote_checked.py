@@ -54,12 +54,15 @@ async def _promote():
     async with Session() as db:
         # Пригодные: в гео-папку, с флагом «есть комментарии».
         # substring снимает префикс отстойника: new_ru → ru.
+        # Имена — без учёта регистра: вердикт мог записаться как @nobyda,
+        # а канал лежит как @NobyDa. 01.10 так застряли в отстойниках 1765
+        # проверенных каналов.
         good = await db.execute(sa_text("""
             UPDATE parsed_channels pc
             SET folder = substring(pc.folder from 5),
                 has_comments = true
             FROM channel_capabilities cc
-            WHERE cc.channel_username = pc.username
+            WHERE lower(cc.channel_username) = lower(pc.username)
               AND pc.folder LIKE 'new\\_%'
               AND cc.commentable
         """))
@@ -72,7 +75,7 @@ async def _promote():
             SET folder = 'unusable_' || substring(pc.folder from 5),
                 has_comments = false
             FROM channel_capabilities cc
-            WHERE cc.channel_username = pc.username
+            WHERE lower(cc.channel_username) = lower(pc.username)
               AND pc.folder LIKE 'new\\_%'
               AND NOT cc.commentable
         """))

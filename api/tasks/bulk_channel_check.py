@@ -56,6 +56,11 @@ MIN_SUBS = int(os.getenv("BULKCHK_MIN_SUBS", "0"))
 STATUSES = [x.strip() for x in
             os.getenv("BULKCHK_STATUSES", "quarantine").split(",")
             if x.strip()]
+# Кого не брать никогда: Жека (@jeka_opasniy и его номер) и Мария.
+EXCLUDE = [int(x) for x in os.getenv("BULKCHK_EXCLUDE", "48,95,217").split(",") if x.strip()]
+# Насколько замедлять адрес после флуда на нём и до какого предела.
+FLOOD_SLOWDOWN = float(os.getenv("BULKCHK_FLOOD_SLOWDOWN", "1.5"))
+FLOOD_SLOWDOWN_MAX = float(os.getenv("BULKCHK_FLOOD_SLOWDOWN_MAX", "3"))
 
 PROGRESS_KEY = "gramgpt:bulkchk:progress"
 STOP_KEY = "gramgpt:bulkchk:stop"
@@ -126,7 +131,9 @@ async def _take_channels(db, limit: int) -> list[str]:
     from sqlalchemy import text
     rows = (await db.execute(text("""
         SELECT pc.username FROM parsed_channels pc
-        LEFT JOIN channel_capabilities cc ON cc.channel_username = pc.username
+        -- Без учёта регистра: иначе канал с вердиктом @nobyda, лежащий в
+        -- базе как @NobyDa, считался непроверенным и тратил квоту повторно.
+        LEFT JOIN channel_capabilities cc ON lower(cc.channel_username) = lower(pc.username)
         WHERE cc.id IS NULL AND pc.username IS NOT NULL AND pc.username <> ''
           AND COALESCE(pc.subscribers, 0) >= :minsubs
         -- Сначала крупные. Раньше первым шёл has_comments, и наверх
@@ -152,17 +159,27 @@ async def _check_one(client, db, uname: str, acc_id: int) -> str:
     peer = None
     used_resolve = False
     try:
-        peer = await client.get_input_entity(uname)      # кэш сессии, без сети
+        # Тоже с таймаутом: если имени нет в кэше, Telethon молча идёт в
+        # сеть. 03.10 в 19:00 пропал интернет, этот запрос повис навсегда,
+        # и весь проход стоял до перезагрузки — ночной не начался вовсе.
+        peer = await asyncio.wait_for(client.get_input_entity(uname), 30)  # кэш сессии
+    except asyncio.TimeoutError:
+        raise ConnectionError("Telegram не ответил за 30 с")
     except Exception:
         peer = None
 
     try:
+        # Таймаут обязателен: 02.10 компьютер уснул, соединения молча
+        # умерли, и запросы без таймаута висели полтора часа — проверка
+        # стояла, хотя у аккаунтов оставалась квота.
         if peer is None:
-            peer = await client.get_entity(uname)         # резолв, тратит квоту
+            peer = await asyncio.wait_for(client.get_entity(uname), 60)   # резолв, тратит квоту
             used_resolve = True
-        full = await client(GetFullChannelRequest(channel=peer))
+        full = await asyncio.wait_for(client(GetFullChannelRequest(channel=peer)), 60)
     except FloodWaitError:
         raise
+    except asyncio.TimeoutError:
+        raise ConnectionError("Telegram не ответил за 60 с")
     except Exception as e:
         et = type(e).__name__
         if et in ("UsernameNotOccupiedError", "UsernameInvalidError", "ValueError"):
@@ -179,6 +196,18 @@ async def _check_one(client, db, uname: str, acc_id: int) -> str:
     caps = extract_caps_from_full(full, peer)
     await record_caps(db, uname, caps, account_id=acc_id, source="bulk_check")
     ok, why = verdict(caps)
+    # Число подписчиков приходит этим же ответом — пишем как есть: это
+    # цифра от самого Telegram, точнее карточки каталога. Флаг «с
+    # комментариями» держим в согласии с вердиктом: по нему фильтрует
+    # интерфейс и отбирает кампания.
+    from sqlalchemy import text as _t
+    members = getattr(getattr(full, "full_chat", None), "participants_count", None)
+    await db.execute(_t("""
+        UPDATE parsed_channels
+        SET subscribers = COALESCE(:m, subscribers), has_comments = :hc,
+            last_verification = now() AT TIME ZONE 'UTC'
+        WHERE lower(username) = lower(:u)"""),
+        {"m": int(members) if members else None, "hc": bool(ok), "u": uname})
     # ── Считаем КАЖДУЮ проверку, а не только сетевой резолв ──────────
     # Раньше квота росла лишь когда peer не нашёлся в кэше. В ночь на
     # 08.09 все 5768 проверок прошли из кэша — счётчик не сдвинулся ни
@@ -201,9 +230,13 @@ async def _worker_for_proxy(proxy_host: str, accounts: list, queue: asyncio.Queu
     from utils.db_pool import async_session as Session
     from utils.telegram import make_telethon_client
     from utils.account_lock import acquire_account_lock, release_account_lock
-    from utils.ip_throttle import acquire_ip_lock
-    from utils.account_health import is_resting, record_error
+    from utils.ip_throttle import acquire_ip_lock, refresh_ip_lock, release_ip_lock
+    from utils.account_health import is_resting, record_error, flood_remaining
     from telethon.errors import FloodWaitError
+
+    # Темп этого адреса. После флуда на нём — медленнее для всех следующих
+    # аккаунтов того же IP: лимит у Telegram во многом считается по адресу.
+    темп = 1.0
 
     for idx, acc_id in enumerate(accounts):
         if _stopped() or queue.empty():
@@ -212,11 +245,26 @@ async def _worker_for_proxy(proxy_host: str, accounts: list, queue: asyncio.Queu
         if left <= 0:
             logger.info(f"[bulkchk] acc#{acc_id}: суточная квота выбрана")
             continue
-        resting, why = is_resting(acc_id)
-        if resting:
-            logger.info(f"[bulkchk] acc#{acc_id}: отдыхает ({why})")
+        # Флуд — «не трогай Telegram вообще», такой аккаунт пропускаем.
+        # Остальной отдых (ограничение @SpamBot) запрещает ПИСАТЬ, а читать
+        # и проверять каналы не мешает — проверено 26.08 на acc#55 и acc#90.
+        # Раньше здесь пропускался любой отдых, и из работы выпадали все
+        # ограниченные аккаунты.
+        if flood_remaining(acc_id) > 0:
+            logger.info(f"[bulkchk] acc#{acc_id}: под флудом — пропуск")
             continue
-        if not acquire_account_lock(acc_id, ttl=3600):
+        resting, why = is_resting(acc_id)
+        if resting and any(w in (why or "").upper() for w in ("FLOOD", "PEER")):
+            logger.info(f"[bulkchk] acc#{acc_id}: отдыхает после флуда ({why})")
+            continue
+        # Аккаунт мог быть занят чем-то коротким — ждём до 10 минут, а не
+        # бросаем на сутки.
+        for _ in range(20):
+            if acquire_account_lock(acc_id, ttl=3600):
+                break
+            await asyncio.sleep(30)
+        else:
+            logger.info(f"[bulkchk] acc#{acc_id}: занят — пропуск")
             continue
 
 
@@ -239,19 +287,36 @@ async def _worker_for_proxy(proxy_host: str, accounts: list, queue: asyncio.Queu
             # с рабочими. Без этого замка проверка подключалась на адресе,
             # где в тот же момент шла сессия кампании, — а плановый движок
             # и realtime-очередь замок берут давно.
-            # Не отпускаем: ключ живёт своим TTL как остывание адреса.
-            if proxy and not acquire_ip_lock(proxy):
-                logger.info(f"[bulkchk] адрес {proxy.host} занят — acc#{acc_id} пропуск")
-                release_account_lock(acc_id)
-                continue
+            # С владельцем: без него после первого аккаунта адрес считался
+            # занятым ещё 10 минут, второй аккаунт приходил через 5 и
+            # пропускался — на каждом прокси работал один аккаунт из трёх.
+            # Ждём адрес до 15 минут, а не бросаем аккаунт.
+            if proxy:
+                for _ in range(30):
+                    if acquire_ip_lock(proxy, owner=acc_id):
+                        break
+                    await asyncio.sleep(30)
+                else:
+                    logger.info(f"[bulkchk] адрес {proxy.host} занят — acc#{acc_id} пропуск")
+                    release_account_lock(acc_id)
+                    continue
             client = make_telethon_client(acc, proxy)
             if not client:
                 release_account_lock(acc_id); continue
 
             done_here = 0
             try:
-                await client.connect()
-                if not await client.is_user_authorized():
+                # Мёртвая сессия (AuthKeyDuplicated, отозванный ключ) падает
+                # прямо на входе. Раньше исключение уходило наверх и роняло
+                # всю ветку адреса — соседи по прокси за день не работали.
+                try:
+                    await asyncio.wait_for(client.connect(), 45)
+                    authorized = await asyncio.wait_for(client.is_user_authorized(), 30)
+                except Exception as e:
+                    logger.warning(f"[bulkchk] acc#{acc_id}: вход не удался "
+                                   f"({type(e).__name__}) — пропускаю аккаунт")
+                    continue
+                if not authorized:
                     logger.warning(f"[bulkchk] acc#{acc_id}: не авторизован")
                     continue
                 logger.info(f"[bulkchk] {proxy_host} acc#{acc_id}: старт, квота {left}")
@@ -269,11 +334,22 @@ async def _worker_for_proxy(proxy_host: str, accounts: list, queue: asyncio.Queu
                             state["by_reason"][why] = state["by_reason"].get(why, 0) + 1
                     except FloodWaitError as fw:
                         record_error(acc_id, "", fw)
+                        темп = min(FLOOD_SLOWDOWN_MAX, темп * FLOOD_SLOWDOWN)
                         logger.warning(f"[bulkchk] acc#{acc_id}: FLOOD_WAIT {fw.seconds}с — "
-                                       f"аккаунт выходит, канал вернём в очередь")
+                                       f"аккаунт выходит, канал вернём в очередь; "
+                                       f"адрес {proxy_host} дальше медленнее ×{темп:.1f}")
                         await queue.put(uname)
                         async with lock:
                             state["floods"] += 1
+                        break
+                    except (ConnectionError, OSError) as e:
+                        # Связь умерла — аккаунт выходит, канал вернётся
+                        # в очередь, дальше идёт следующий аккаунт адреса.
+                        logger.warning(f"[bulkchk] acc#{acc_id}: связь потеряна "
+                                       f"({type(e).__name__}: {str(e)[:60]}) — выхожу")
+                        await queue.put(uname)
+                        async with lock:
+                            state["errors"] += 1
                         break
                     except Exception as e:
                         logger.debug(f"[bulkchk] @{uname}: {type(e).__name__}")
@@ -283,11 +359,18 @@ async def _worker_for_proxy(proxy_host: str, accounts: list, queue: asyncio.Queu
                     async with lock:
                         state["remaining"] = queue.qsize()
                     await _publish(state)
-                    await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+                    # Аккаунт держит адрес часами, а замок — 10 минут.
+                    # Продлеваем, иначе на тот же IP параллельно зайдёт
+                    # другая задача программы.
+                    if proxy and done_here % 3 == 0:
+                        refresh_ip_lock(proxy)
+                    await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX) * темп)
             finally:
-                try: await client.disconnect()
+                try: await asyncio.wait_for(client.disconnect(), 15)
                 except Exception: pass
                 release_account_lock(acc_id)
+                if proxy:
+                    release_ip_lock(proxy)
                 logger.info(f"[bulkchk] {proxy_host} acc#{acc_id}: сделано {done_here}")
 
         # пауза перед следующим аккаунтом ЭТОГО ЖЕ IP
@@ -320,8 +403,10 @@ async def _run_bulk_check(limit: int = None):
             SELECT p.host, a.id
             FROM accounts a JOIN proxies p ON p.id = a.proxy_id
             WHERE a.status::text = ANY(:st) AND p.is_valid
+              AND (p.expires_at IS NULL OR p.expires_at > now())
+              AND NOT (a.id = ANY(:ex))
             ORDER BY p.host, a.id
-        """), {"st": STATUSES})).all()
+        """), {"st": STATUSES, "ex": EXCLUDE})).all()
         by_proxy: dict[str, list[int]] = {}
         for host, acc_id in rows:
             by_proxy.setdefault(host, []).append(acc_id)
